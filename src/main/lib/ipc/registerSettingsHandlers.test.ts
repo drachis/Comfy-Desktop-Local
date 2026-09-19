@@ -53,6 +53,7 @@ vi.mock('../e2eOverrides', () => ({ recordIpcInvocation: vi.fn() }))
 vi.mock('../../settings', () => ({ AUTO_LAUNCH_NONE: 'none', AUTO_LAUNCH_LAST: 'last' }))
 
 import { applySettingSet, buildSettingsSections } from './registerSettingsHandlers'
+import { DEFAULT_UPDATE_REPO_URL } from '../forkUpdate'
 
 function resetMockSettings(): void {
   for (const key of Object.keys(mockSettings)) delete mockSettings[key]
@@ -105,6 +106,30 @@ describe('buildSettingsSections', () => {
       (s) => (s.fields as { id?: string }[] | undefined) ?? []
     )
     expect(fields.map((f) => f.id)).not.toContain('managerSecurityLevel')
+  })
+
+  it('offers opt-in update checks that default to off', () => {
+    const find = () =>
+      buildSettingsSections()
+        .flatMap((s) => (s.fields as { id?: string; value?: unknown }[] | undefined) ?? [])
+        .find((field) => field.id === 'autoCheckUpdates')
+
+    expect(find()).toMatchObject({ type: 'boolean', value: false })
+
+    mockSettings.autoCheckUpdates = true
+    expect(find()?.value).toBe(true)
+  })
+
+  it('exposes the update repository, defaulting to the fork', () => {
+    const find = () =>
+      buildSettingsSections()
+        .flatMap((s) => (s.fields as { id?: string; value?: unknown }[] | undefined) ?? [])
+        .find((field) => field.id === 'updateRepoUrl')
+
+    expect(find()).toMatchObject({ type: 'text', value: DEFAULT_UPDATE_REPO_URL })
+
+    mockSettings.updateRepoUrl = 'https://example.com/me/desktop.git'
+    expect(find()?.value).toBe('https://example.com/me/desktop.git')
   })
 
   it('offers a default-on preference for the multiple-instance warning', () => {

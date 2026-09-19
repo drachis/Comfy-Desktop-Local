@@ -14,6 +14,7 @@ import { updateTitleBarOverlay } from '../titleBarOverlay'
 import * as mainTelemetry from '../telemetry'
 import { detectFirstUseState } from '../firstUseDetection'
 import * as updater from '../updater'
+import { DEFAULT_UPDATE_REPO_URL } from '../forkUpdate'
 import { globalSettingsEvents } from '../globalSettingsEvents'
 import { recordIpcInvocation } from '../e2eOverrides'
 import type { SettingsSection } from '../../../types/ipc'
@@ -115,6 +116,21 @@ export function buildSettingsSections(
           label: i18n.t('settings.autoInstallUpdates'),
           type: 'boolean',
           value: s.autoInstallUpdates !== false
+        },
+        {
+          id: 'autoCheckUpdates',
+          label: i18n.t('settings.autoCheckUpdates'),
+          type: 'boolean',
+          value: s.autoCheckUpdates === true,
+          tooltip: i18n.t('settings.autoCheckUpdatesDescription')
+        },
+        {
+          id: 'updateRepoUrl',
+          label: i18n.t('settings.updateRepoUrl'),
+          type: 'text' as const,
+          value: s.updateRepoUrl || DEFAULT_UPDATE_REPO_URL,
+          placeholder: DEFAULT_UPDATE_REPO_URL,
+          tooltip: i18n.t('settings.updateRepoUrlDescription')
         },
         // onAppClose field hidden while docking-to-tray is disabled.
         ...(isChinese ? [chineseMirrorsField] : [])

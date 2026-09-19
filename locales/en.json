@@ -545,6 +545,10 @@
     "closeQuitDownloads": "Downloading",
     "autoUpdate": "Check for updates on startup",
     "autoInstallUpdates": "Automatically install Desktop updates",
+    "autoCheckUpdates": "Check for updates automatically",
+    "autoCheckUpdatesDescription": "Off by default. When off, updates are only checked when you click Check for updates.",
+    "updateRepoUrl": "Update repository",
+    "updateRepoUrlDescription": "Git repository that Check for updates pulls into the source checkout this app runs from.",
     "appBehavior": "App Behavior",
     "autoLaunchOnStartup": "Auto-launch on startup",
     "autoLaunchOnStartupDescription": "Pick an instance to launch automatically when Comfy Desktop opens. Defaults to None.",
@@ -603,6 +607,12 @@
     "upToDate": "You are running the latest version of Comfy Desktop.",
     "debUpToDate": "You are running the latest version. Updates for .deb installs are delivered through your system package manager (apt).",
     "debManagedShort": "System-managed updates"
+  },
+  "forkUpdate": {
+    "title": "Check for updates",
+    "upToDate": "Already up to date with {url}.",
+    "pulled": "Pulled new commits from {url} (now at {version}). Restart the app to run them.",
+    "failed": "Could not update from {url}.\n\n{error}"
   },
   "appUpdate": {
     "fallbackVersion": "this update",

@@ -545,6 +545,10 @@
     "closeQuitDownloads": "下载中",
     "autoUpdate": "启动时检查更新",
     "autoInstallUpdates": "自动安装桌面端更新",
+    "autoCheckUpdates": "自动检查更新",
+    "autoCheckUpdatesDescription": "默认关闭。关闭时，仅在点击“检查更新”时才会检查更新。",
+    "updateRepoUrl": "更新仓库",
+    "updateRepoUrlDescription": "“检查更新”会将该 Git 仓库拉取到当前应用运行所在的源码目录。",
     "appBehavior": "应用行为",
     "autoLaunchOnStartup": "启动时自动打开",
     "autoLaunchOnStartupDescription": "选择 Comfy Desktop 打开时自动启动的实例。默认为“无”。",
@@ -603,6 +607,12 @@
     "upToDate": "你正在运行最新版 Comfy Desktop。",
     "debUpToDate": "你正在运行最新版。.deb 安装的更新通过系统包管理器（apt）提供。",
     "debManagedShort": "系统管理的更新"
+  },
+  "forkUpdate": {
+    "title": "检查更新",
+    "upToDate": "已与 {url} 保持同步。",
+    "pulled": "已从 {url} 拉取新提交（当前为 {version}）。重启应用后生效。",
+    "failed": "无法从 {url} 更新。\n\n{error}"
   },
   "appUpdate": {
     "fallbackVersion": "此更新",

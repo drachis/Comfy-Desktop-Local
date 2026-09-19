@@ -31,6 +31,12 @@ export interface KnownSettings {
   /** When true (default), Desktop updates download and install silently; when
    *  false, the user is prompted before any download/install. */
   autoInstallUpdates?: boolean
+  /** Opt-in background update checks. Off unless explicitly `true`; a manual
+   *  "Check for updates" click always runs. */
+  autoCheckUpdates?: boolean
+  /** Git repository "Check for updates" pulls from a source checkout.
+   *  Absent means the default fork URL in `forkUpdate.ts`. */
+  updateRepoUrl?: string
   /** Opt-in auto-launch on Desktop startup. Values:
    *  - `'none'` (default) — land on the dashboard, current behavior.
    *  - `'last'` — launch the install with the largest `lastLaunchedAt`.
@@ -245,6 +251,12 @@ const SETTINGS_SCHEMA = {
       ]
     }
   },
+  autoCheckUpdates: {
+    nullable: false,
+    telemetry: { policy: 'value', toTelemetry: (raw) => raw === true }
+  },
+  // A repository URL can be private/identifying — presence only.
+  updateRepoUrl: { nullable: false, telemetry: { policy: 'presence' } },
   // Emit "auto-launch configured?" as a boolean; the raw value can be an
   // installation id (potentially identifying).
   autoLaunchOnStartup: { nullable: false, telemetry: { policy: 'presence' } },
@@ -650,7 +662,10 @@ export function get(key: string): unknown {
 }
 
 /** Keys whose values should be deleted when set to an empty or whitespace-only string. */
-const EMPTY_STRING_MEANS_UNSET: ReadonlySet<string> = new Set<KnownSettingKey>(['pypiMirror'])
+const EMPTY_STRING_MEANS_UNSET: ReadonlySet<string> = new Set<KnownSettingKey>([
+  'pypiMirror',
+  'updateRepoUrl'
+])
 
 /** Keys whose default value should be persisted as absence — `set(k, default)`
  *  drops the key so the file doesn't accumulate no-op writes. */

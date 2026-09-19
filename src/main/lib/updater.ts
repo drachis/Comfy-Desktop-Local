@@ -15,6 +15,7 @@ import {
 } from './startup-attempt-marker'
 import { clearQuitReason, getQuitReason, isSessionEnding, setQuitReason } from './quit-state'
 import { _broadcastToRenderer } from './ipc/shared'
+import { findSourceCheckout, isAutoCheckEnabled, runForkUpdate } from './forkUpdate'
 import { deriveAppChannel, emit as emitTelemetry } from './telemetry'
 import { buildErrorFields, errorTail } from '../../shared/errorEvent'
 
@@ -591,6 +592,9 @@ function bindUpdaterEvents(): void {
  *  denominator can use `session.started` instead. */
 const USER_INITIATED_CHECK_TRIGGERS = new Set(['manual-check', 'download-button'])
 
+/** Explicit "Check for Updates" clicks: settings button, IPC, and app menu. */
+const FORK_PULL_TRIGGERS = new Set(['manual-check', 'global-settings', 'app-menu'])
+
 async function checkForUpdate(
   source: string
 ): Promise<{ available: boolean; version?: string; error?: string }> {
@@ -664,6 +668,12 @@ async function checkForUpdate(
 export function runCheck(
   source: string
 ): Promise<{ available: boolean; version?: string; error?: string }> {
+  // From a source checkout there is no ToDesktop feed; a click pulls the
+  // configured repository instead.
+  if (FORK_PULL_TRIGGERS.has(source)) {
+    const checkout = findSourceCheckout()
+    if (checkout) return runForkUpdate(checkout)
+  }
   return checkForUpdate(source)
 }
 
@@ -1303,11 +1313,12 @@ export function register(): void {
   // arrive via the `app-update:state-changed` event.
   ipcMain.handle('get-app-update-state', () => getCurrentUpdateState())
 
-  // Issue #488 — always check on startup and periodically. The
-  // user-controllable `autoInstallUpdates` setting only gates whether
-  // a discovered update silently downloads + installs vs prompts the
-  // user; the check loop itself is no longer user-disablable.
+  // Background checks are opt-in (`autoCheckUpdates`, default off); the timers
+  // stay armed so enabling the setting takes effect without a restart.
+  // `autoInstallUpdates` separately gates whether a discovered update
+  // downloads + installs silently or prompts the user.
   const runAutoCheck = (): void => {
+    if (!isAutoCheckEnabled()) return
     runCheck('auto-check').catch(() => {})
   }
   setTimeout(runAutoCheck, 2000)
