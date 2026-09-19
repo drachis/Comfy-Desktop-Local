@@ -11,6 +11,7 @@ import {
 } from 'electron'
 import type { WebContentsView } from 'electron'
 import type { Tray } from 'electron'
+import './lib/devUserData'
 import path from 'path'
 import fs from 'fs'
 import { normaliseFirstUseMode } from '../shared/firstUseMode'
