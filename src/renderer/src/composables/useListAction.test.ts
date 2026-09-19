@@ -47,8 +47,15 @@ vi.mock('../lib/telemetry', () => ({
 }))
 
 const mockRunAction = vi.hoisted(() => vi.fn())
-;(globalThis as unknown as { window: { api: { runAction: typeof mockRunAction } } }).window = {
-  api: { runAction: mockRunAction }
+const mockOpenInstancePicker = vi.hoisted(() => vi.fn())
+;(
+  globalThis as unknown as {
+    window: {
+      api: { runAction: typeof mockRunAction; openInstancePicker: typeof mockOpenInstancePicker }
+    }
+  }
+).window = {
+  api: { runAction: mockRunAction, openInstancePicker: mockOpenInstancePicker }
 }
 
 import { useListAction } from './useListAction'
@@ -255,6 +262,65 @@ describe('useListAction.executeAction onGuardsPassed hook', () => {
     expect(mockModalAlert).toHaveBeenCalledOnce()
     expect(onGuardsPassed).not.toHaveBeenCalled()
     expect(showProgress).not.toHaveBeenCalled()
+  })
+
+  describe('launching an install that needs a setup step', () => {
+    const setupAction = { id: 'create-venv', label: 'Create Python environment' }
+    const blockedLaunch: ListAction = {
+      ...LAUNCH_ACTION,
+      enabled: false,
+      disabledMessage: 'No venv for this install'
+    }
+
+    beforeEach(() => {
+      mockDialogsConfirm.mockReset()
+      mockOpenInstancePicker.mockClear()
+    })
+
+    it('offers the setup action instead of a dead-end alert', async () => {
+      mockDialogsConfirm.mockResolvedValue(false)
+      const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+
+      await executeAction({ ...INSTALL, setupAction }, blockedLaunch)
+
+      expect(mockDialogsConfirm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'No venv for this install',
+          confirmLabel: 'Create Python environment',
+          showCancel: true
+        })
+      )
+      expect(mockModalAlert).not.toHaveBeenCalled()
+    })
+
+    it('opens Manage and fires the setup action when the user accepts', async () => {
+      mockDialogsConfirm.mockResolvedValue('primary')
+      const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+
+      await executeAction({ ...INSTALL, setupAction }, blockedLaunch)
+
+      expect(mockOpenInstancePicker).toHaveBeenCalledWith(
+        expect.objectContaining({ installationId: INSTALL.id, autoAction: 'create-venv' })
+      )
+    })
+
+    it('does nothing when the user cancels', async () => {
+      mockDialogsConfirm.mockResolvedValue(false)
+      const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+
+      await executeAction({ ...INSTALL, setupAction }, blockedLaunch)
+
+      expect(mockOpenInstancePicker).not.toHaveBeenCalled()
+    })
+
+    it('keeps the plain alert for an install with no setup action', async () => {
+      const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+
+      await executeAction(INSTALL, blockedLaunch)
+
+      expect(mockDialogsConfirm).not.toHaveBeenCalled()
+      expect(mockModalAlert).toHaveBeenCalledOnce()
+    })
   })
 
   it('does NOT fire onGuardsPassed when the busy guard cancels', async () => {

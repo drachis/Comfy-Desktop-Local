@@ -126,6 +126,10 @@ export function useInstallContextMenu(
         label: t('chooser.manageInstall')
       })
 
+      if (inst.setupAction) {
+        items.push({ id: 'setup-action', label: inst.setupAction.label })
+      }
+
       if (isInstalled(inst) && hasUpdateTag(inst)) {
         items.push({
           id: 'update',
@@ -274,6 +278,8 @@ export function useInstallContextMenu(
   async function triggerAction(id: string, inst: Installation): Promise<void> {
     if (id === 'manage') {
       opts.onManage?.(inst)
+    } else if (id === 'setup-action') {
+      if (inst.setupAction) opts.onManage?.(inst, { autoAction: inst.setupAction.id })
     } else if (id === 'update') {
       // Open the Update tab AND auto-fire the update so the modal runs.
       opts.onManage?.(inst, { initialTab: 'update', autoAction: 'update-comfyui' })

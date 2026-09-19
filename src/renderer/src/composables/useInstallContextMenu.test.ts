@@ -412,6 +412,29 @@ describe('useInstallContextMenu - copy-install routing', () => {
     expect(apiMock.runAction).not.toHaveBeenCalled()
   })
 
+  it('offers the setup action beside Manage, and only when it has one', () => {
+    const setupAction = { id: 'create-venv', label: 'Create Python environment' }
+
+    const withSetup = mountHarness(makeInstall({ setupAction }))
+    const without = mountHarness(makeInstall())
+
+    expect(findItem(withSetup.menu.ctxMenuItems.value, 'setup-action')?.label).toBe(
+      'Create Python environment'
+    )
+    expect(findItem(without.menu.ctxMenuItems.value, 'setup-action')).toBeUndefined()
+  })
+
+  it('setup-action routes through onManage with the action id so its prompt and progress run', async () => {
+    const onManage = vi.fn<(inst: Installation, options?: { autoAction?: string | null }) => void>()
+    const inst = makeInstall({ setupAction: { id: 'create-venv', label: 'Create' } })
+    const { menu } = mountHarnessWithManage(onManage)
+
+    await menu.triggerAction('setup-action', inst)
+
+    expect(onManage).toHaveBeenCalledWith(inst, { autoAction: 'create-venv' })
+    expect(apiMock.runAction).not.toHaveBeenCalled()
+  })
+
   it('update opens the Update tab AND auto-fires the update (matches the title-bar pill)', async () => {
     const onManage =
       vi.fn<

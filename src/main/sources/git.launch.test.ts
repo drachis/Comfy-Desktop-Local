@@ -126,6 +126,17 @@ describe('git create-venv action', () => {
     expect(action.prompt).toMatchObject({ field: 'torch', defaultValue: 'auto' })
   })
 
+  it('reports Create Python environment as the setup action only while it applies', () => {
+    expect(gitSource.getSetupAction!(makeInstall(tmp))).toEqual({
+      id: 'create-venv',
+      label: 'git.createVenv'
+    })
+
+    const venv = path.join(tmp, '.venv')
+    makeVenv(venv)
+    expect(gitSource.getSetupAction!(makeInstall(tmp, { venvPath: venv }))).toBeNull()
+  })
+
   it('shows the same action on the Manage screen', () => {
     const sections = gitSource.getDetailSections!(makeInstall(tmp)) as {
       actions?: { id: string }[]

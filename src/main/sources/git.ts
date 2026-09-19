@@ -268,6 +268,10 @@ export const gitSource: SourcePlugin = {
     return { ...base, venvDir: venvPath, promptName: path.basename(venvPath) }
   },
 
+  getSetupAction(installation: InstallationRecord): { id: string; label: string } | null {
+    return canCreateVenv(installation) ? { id: 'create-venv', label: t('git.createVenv') } : null
+  },
+
   getLaunchUnavailableMessage(installation: InstallationRecord): string | null {
     if (!resolveVenvPython(installation)) return t('git.noVenv')
     if (!findMainPy(installation.installPath)) return t('git.noMainPy')

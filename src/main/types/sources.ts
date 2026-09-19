@@ -140,6 +140,9 @@ export interface SourcePlugin {
 
   getDefaults?(): Record<string, unknown>
   getStatusTag?(installation: InstallationRecord): StatusTag | undefined
+  /** A setup action the install needs before it can launch, surfaced in the kebab menu and
+   *  the launch prompt. `id` is a detail-section action id; null when none applies. */
+  getSetupAction?(installation: InstallationRecord): { id: string; label: string } | null
   buildInstallation(selections: Record<string, FieldOption | undefined>): Record<string, unknown>
   getListPreview?(installation: InstallationRecord): string | null
   getLaunchCommand(installation: InstallationRecord): LaunchCommand | null

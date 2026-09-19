@@ -124,6 +124,8 @@ export interface Installation {
   workspaceId?: string
   version?: string
   statusTag?: { style: string; label: string; version?: string; detail?: string }
+  /** A one-time setup step this install needs before it can launch (e.g. building its venv). */
+  setupAction?: { id: string; label: string }
   seen?: boolean
   listPreview?: string
   launchMode?: string

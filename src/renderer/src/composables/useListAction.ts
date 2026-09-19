@@ -11,6 +11,7 @@ import {
   augmentMessageWithStopWarning,
   stopAndWaitForExit
 } from '../lib/stopWarning'
+import { resolvePickerTab } from '../lib/pickerTabs'
 import { REQUIRES_STOPPED } from '../types/ipc'
 import type { Installation, ListAction, ActionResult, ShowProgressOpts } from '../types/ipc'
 
@@ -47,6 +48,25 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
     }
 
     if (action.enabled === false && action.disabledMessage) {
+      // An install that only needs a setup step (e.g. a venv) gets a way to run it from here.
+      if (action.id === 'launch' && inst.setupAction) {
+        const choice = await dialogs.confirm({
+          title: action.label,
+          message: action.disabledMessage,
+          confirmLabel: inst.setupAction.label,
+          cancelLabel: t('common.cancel'),
+          tone: 'primary',
+          showCancel: true
+        })
+        if (choice === 'primary') {
+          window.api.openInstancePicker({
+            installationId: inst.id,
+            initialTab: resolvePickerTab(undefined, 'status'),
+            autoAction: inst.setupAction.id
+          })
+        }
+        return
+      }
       await modal.alert({ title: action.label, message: action.disabledMessage })
       return
     }

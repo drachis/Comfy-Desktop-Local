@@ -155,6 +155,7 @@ export function enrichInstallationsForRenderer(allInstalls: InstallationRecord[]
         ? undefined
         : (inst.version as string | undefined)
     const version = rawVersion === inst.sourceId ? undefined : rawVersion
+    const setupAction = source.getSetupAction?.(inst) ?? null
     return {
       ...inst,
       version,
@@ -163,7 +164,8 @@ export function enrichInstallationsForRenderer(allInstalls: InstallationRecord[]
       hasConsole: source.hasConsole !== false,
       ...(buildVersion ? { distributionVersion: buildVersion } : {}),
       ...(listPreview != null ? { listPreview } : {}),
-      ...(statusTag ? { statusTag } : {})
+      ...(statusTag ? { statusTag } : {}),
+      ...(setupAction ? { setupAction } : {})
     }
   })
   return { visible, enriched }
