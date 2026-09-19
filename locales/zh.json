@@ -1438,6 +1438,8 @@
     "newInstall": "新建实例",
     "addExistingInstall": "添加现有实例",
     "loadSnapshot": "加载快照",
+    "openInputFolder": "打开输入文件夹",
+    "openOutputFolder": "打开输出文件夹",
     "signIn": "登录",
     "globalSettings": "桌面端设置",
     "sendFeedback": "发送反馈",

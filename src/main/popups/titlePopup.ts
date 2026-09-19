@@ -1,3 +1,4 @@
+import { promises as fsp } from 'fs'
 import { ipcMain, shell, dialog, WebContentsView, BrowserWindow } from 'electron'
 import { POPUP_KIND } from '../../types/ipc'
 import type { PopupTheme, TitlePopupKind } from '../../types/ipc'
@@ -20,6 +21,7 @@ import * as settings from '../settings'
 import { defaultInstallDir } from '../lib/paths'
 import { convertLevelToZoomPercent } from '../lib/zoom'
 import { getAppLogDir } from '../lib/appLog'
+import { resolveInstallMediaDir, type MediaDirKind } from '../lib/installMediaDir'
 import {
   openPath as openPathHelper,
   getAppVersion,
@@ -794,6 +796,22 @@ export function buildTitlePopupMenuItems(entry: ComfyWindowEntry): TitlePopupMen
     { id: 'load-snapshot', label: 'Load Snapshot', labelKey: 'fileMenu.loadSnapshot' },
     { kind: 'separator' }
   ]
+  // The folders belong to an install, so the chooser host (no install) has none to open.
+  if (entry.installationId !== null) {
+    items.push(
+      {
+        id: 'open-input-folder',
+        label: 'Open Input Folder',
+        labelKey: 'fileMenu.openInputFolder'
+      },
+      {
+        id: 'open-output-folder',
+        label: 'Open Output Folder',
+        labelKey: 'fileMenu.openOutputFolder'
+      },
+      { kind: 'separator' }
+    )
+  }
   if (!isSignedInToCloud()) {
     items.push(
       { id: 'sign-in', label: 'Log in', labelKey: 'fileMenu.signIn' },
@@ -1935,6 +1953,16 @@ export function decideFlowMenuItemTarget(
     : { kind: 'open-chooser-host', panel: id }
 }
 
+async function openInstallMediaFolder(installationId: string, kind: MediaDirKind): Promise<void> {
+  const installation = await installations.get(installationId)
+  if (!installation) return
+  const dir = resolveInstallMediaDir(installation, kind)
+  // shell.openPath reports a missing folder via a returned string, not a throw,
+  // so create it up front or the click would silently do nothing.
+  await fsp.mkdir(dir, { recursive: true })
+  await openPathHelper(dir)
+}
+
 export function activateTitlePopupMenuItem(
   entry: TitlePopupEntry,
   id: string,
@@ -2029,6 +2057,13 @@ export function activateTitlePopupMenuItem(
     void signInToCloud().catch(() => {
       // Cancelled or failed handoff: the menu item re-arms on the next open.
     })
+  } else if (id === 'open-input-folder' || id === 'open-output-folder') {
+    if (parentEntry != null && parentEntry.installationId !== null) {
+      void openInstallMediaFolder(
+        parentEntry.installationId,
+        id === 'open-input-folder' ? 'input' : 'output'
+      )
+    }
   } else if (id === 'reset-zoom') {
     // Route through the shared reset so the title-bar pill picks up the
     // `comfy-titlebar:zoom-changed` push (that event fires only for

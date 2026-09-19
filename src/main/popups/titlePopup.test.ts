@@ -1,3 +1,6 @@
+import fs from 'fs'
+import type * as InstallationsModule from '../installations'
+import type * as SharedModule from '../lib/ipc/shared'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const devPlatformMocks = vi.hoisted(() => ({
@@ -10,6 +13,20 @@ const devPlatformMocks = vi.hoisted(() => ({
 vi.mock('../lib/ipc/registerDevPlatformHandlers', () => ({
   isSignedInToCloud: devPlatformMocks.isSignedInToCloud,
   signInToCloud: devPlatformMocks.signInToCloud
+}))
+
+const installationMocks = vi.hoisted(() => ({ get: vi.fn() }))
+const sharedMocks = vi.hoisted(() => ({ openPath: vi.fn(async () => '') }))
+
+vi.mock('../installations', async (importActual) => ({
+  ...(await importActual<typeof InstallationsModule>()),
+  get: installationMocks.get
+}))
+
+// Real openPath would launch the OS file manager.
+vi.mock('../lib/ipc/shared', async (importActual) => ({
+  ...(await importActual<typeof SharedModule>()),
+  openPath: sharedMocks.openPath
 }))
 
 // shared.ts (via registry.ts) loads electron at import, so mock it first.
@@ -59,8 +76,12 @@ import { comfyWindows, nextWindowKey, type ComfyWindowEntry } from '../host/regi
 import { applySettingSet } from '../lib/ipc/registerSettingsHandlers'
 import * as settings from '../settings'
 
+// Keeps the open-folder tests from creating real directories.
+const mkdirSpy = vi.spyOn(fs.promises, 'mkdir')
+
 beforeEach(() => {
   vi.clearAllMocks()
+  mkdirSpy.mockResolvedValue(undefined)
   // Signed out is the default: every assertion that does not say otherwise
   // describes a user who has not logged in yet.
   devPlatformMocks.isSignedInToCloud.mockReturnValue(false)
@@ -206,6 +227,8 @@ describe('buildTitlePopupMenuItems', () => {
       'new-install',
       'track',
       'load-snapshot',
+      'open-input-folder',
+      'open-output-folder',
       'sign-in',
       'settings',
       'feedback',
@@ -242,6 +265,8 @@ describe('buildTitlePopupMenuItems', () => {
       'new-install',
       'track',
       'load-snapshot',
+      'open-input-folder',
+      'open-output-folder',
       'sign-in',
       'settings',
       'feedback',
@@ -268,6 +293,26 @@ describe('buildTitlePopupMenuItems', () => {
     const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1' }))
     const ids = items.map((i) => i.id ?? null)
     expect(ids).not.toContain('return-to-dashboard')
+  })
+
+  it('offers Open Input/Output Folder on install hosts, in their own separated group', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1' }))
+    const inputIdx = items.findIndex((i) => i.id === 'open-input-folder')
+    expect(items[inputIdx - 1]?.kind).toBe('separator')
+    expect(items[inputIdx]?.label).toBe('Open Input Folder')
+    expect(items[inputIdx]?.labelKey).toBe('fileMenu.openInputFolder')
+    expect(items[inputIdx + 1]).toMatchObject({
+      id: 'open-output-folder',
+      label: 'Open Output Folder',
+      labelKey: 'fileMenu.openOutputFolder'
+    })
+    expect(items[inputIdx + 2]?.kind).toBe('separator')
+  })
+
+  it('omits Open Input/Output Folder on chooser hosts, which have no install', () => {
+    const ids = buildTitlePopupMenuItems(makeEntry({ installationId: null })).map((i) => i.id)
+    expect(ids).not.toContain('open-input-folder')
+    expect(ids).not.toContain('open-output-folder')
   })
 
   it('omits Reset Zoom on chooser hosts even if the dummy comfy view has a zoom level', () => {
@@ -379,6 +424,65 @@ describe('activateTitlePopupMenuItem', () => {
     )
 
     expect(devPlatformMocks.signInToCloud).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['open-input-folder', 'C:\\media\\in'],
+    ['open-output-folder', 'C:\\media\\out']
+  ])('%s opens the folder resolved for the host install', async (menuId, expected) => {
+    const host = makeEntry({ installationId: 'inst-1' })
+    comfyWindows.set(host.windowKey, host)
+    installationMocks.get.mockResolvedValue({
+      id: 'inst-1',
+      installPath: 'C:\\installs\\one',
+      useSharedInput: false,
+      useSharedOutput: false,
+      inputDir: 'C:\\media\\in',
+      outputDir: 'C:\\media\\out'
+    })
+
+    activateTitlePopupMenuItem(
+      makePopupEntry(host.windowKey),
+      menuId,
+      {} as unknown as TitlePopupHostBindings
+    )
+
+    await vi.waitFor(() => expect(sharedMocks.openPath).toHaveBeenCalledExactlyOnceWith(expected))
+    expect(installationMocks.get).toHaveBeenCalledExactlyOnceWith('inst-1')
+    // Created before opening, so a missing folder still opens instead of silently failing.
+    expect(mkdirSpy).toHaveBeenCalledExactlyOnceWith(expected, { recursive: true })
+    expect(mkdirSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      sharedMocks.openPath.mock.invocationCallOrder[0]!
+    )
+  })
+
+  it('ignores Open Input Folder on an install-less host', () => {
+    const host = makeEntry({ installationId: null })
+    comfyWindows.set(host.windowKey, host)
+
+    activateTitlePopupMenuItem(
+      makePopupEntry(host.windowKey),
+      'open-input-folder',
+      {} as unknown as TitlePopupHostBindings
+    )
+
+    expect(installationMocks.get).not.toHaveBeenCalled()
+    expect(sharedMocks.openPath).not.toHaveBeenCalled()
+  })
+
+  it('opens nothing when the host install record no longer exists', async () => {
+    const host = makeEntry({ installationId: 'gone' })
+    comfyWindows.set(host.windowKey, host)
+    installationMocks.get.mockResolvedValue(null)
+
+    activateTitlePopupMenuItem(
+      makePopupEntry(host.windowKey),
+      'open-output-folder',
+      {} as unknown as TitlePopupHostBindings
+    )
+
+    await vi.waitFor(() => expect(installationMocks.get).toHaveBeenCalledOnce())
+    expect(sharedMocks.openPath).not.toHaveBeenCalled()
   })
 
   it('swallows a cancelled or failed sign-in handoff', async () => {
