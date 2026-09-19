@@ -18,6 +18,7 @@ vi.mock('child_process', () => {
   ) => cb(null, mocks.pythonVersionOutput, '')
   return { execFile, default: { execFile } }
 })
+vi.mock('electron', () => ({ app: { isPackaged: false } }))
 vi.mock('./logged-process', () => ({
   runLoggedProcess: mocks.runLoggedProcess,
   formatProcessError: (message: string) => message
@@ -110,8 +111,74 @@ describe('createVenv', () => {
   })
 
   const venvDir = () => path.join(tmp, '.venv')
-  const run = (torchChoice = 'auto') =>
-    createVenv({ installPath: tmp, comfyDir: tmp, torchChoice, tools })
+  const run = (torchChoice = 'auto', bootstrapDir: string | null = null) =>
+    createVenv({ installPath: tmp, comfyDir: tmp, torchChoice, tools, bootstrapDir })
+
+  describe('with the Python bundled in Desktop', () => {
+    let bootstrap: string
+    const win = process.platform === 'win32'
+    const python = () =>
+      win ? path.join(bootstrap, 'python.exe') : path.join(bootstrap, 'bin', 'python3')
+    const uv = () => (win ? path.join(bootstrap, 'uv.exe') : path.join(bootstrap, 'bin', 'uv'))
+    const venvPython = () =>
+      win ? path.join(venvDir(), 'Scripts', 'python.exe') : path.join(venvDir(), 'bin', 'python')
+
+    beforeEach(() => {
+      bootstrap = fs.mkdtempSync(path.join(os.tmpdir(), 'bootstrap-'))
+      fs.mkdirSync(path.dirname(python()), { recursive: true })
+      fs.writeFileSync(python(), '')
+      fs.writeFileSync(uv(), '')
+    })
+
+    afterEach(() => {
+      fs.rmSync(bootstrap, { recursive: true, force: true })
+    })
+
+    it('builds the venv and installs with the bundled uv, not the system Python', async () => {
+      mocks.detectNvidiaDriverVersion.mockResolvedValue('570.1')
+
+      const result = await run('auto', bootstrap)
+
+      expect(result).toEqual({ ok: true, navigate: 'detail', venvPath: venvDir() })
+      const calls = mocks.runLoggedProcess.mock.calls.map(([cmd, args]) => [cmd, args])
+      expect(calls).toEqual([
+        [uv(), ['venv', '--python', python(), venvDir()]],
+        [
+          uv(),
+          [
+            'pip',
+            'install',
+            '--python',
+            venvPython(),
+            'torch',
+            'torchvision',
+            'torchaudio',
+            '--index-url',
+            'https://download.pytorch.org/whl/cu128'
+          ]
+        ],
+        [
+          uv(),
+          ['pip', 'install', '--python', venvPython(), '-r', path.join(tmp, 'requirements.txt')]
+        ]
+      ])
+    })
+
+    it('does not need a system Python at all', async () => {
+      mocks.pythonVersionOutput = 'Python 3.8.1'
+
+      expect(await run('auto', bootstrap)).toMatchObject({ ok: true })
+    })
+
+    it('falls back to a system Python when the bundled folder has no uv', async () => {
+      fs.rmSync(uv())
+
+      await run('auto', bootstrap)
+
+      expect(mocks.runLoggedProcess.mock.calls[0]![1]).toContain('venv')
+      expect(mocks.runLoggedProcess.mock.calls[0]![0]).not.toBe(uv())
+    })
+  })
 
   it('creates the venv, installs PyTorch, then the requirements, and reports the venv path', async () => {
     mocks.detectNvidiaDriverVersion.mockResolvedValue('570.1')

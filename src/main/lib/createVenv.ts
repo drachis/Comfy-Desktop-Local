@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { execFile } from 'child_process'
+import { app } from 'electron'
 import { runLoggedProcess, formatProcessError } from './logged-process'
 import { detectNvidiaDriverVersion } from './gpu'
 import { t } from './i18n'
@@ -82,6 +83,59 @@ export function resolveTorchIndex(choice: string, nvidiaPresent: boolean): Torch
   return { ok: false }
 }
 
+export interface BootstrapPython {
+  python: string
+  uv: string
+}
+
+/** The Python + uv shipped inside Comfy Desktop (resources/bootstrap-python). Null when absent. */
+export function findBootstrapPython(
+  dir: string | null = defaultBootstrapDir()
+): BootstrapPython | null {
+  if (!dir) return null
+  const win = process.platform === 'win32'
+  const python = win ? path.join(dir, 'python.exe') : path.join(dir, 'bin', 'python3')
+  const uv = win ? path.join(dir, 'uv.exe') : path.join(dir, 'bin', 'uv')
+  return fs.existsSync(python) && fs.existsSync(uv) ? { python, uv } : null
+}
+
+function defaultBootstrapDir(): string {
+  const osName =
+    process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux'
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'bootstrap-python')
+    : path.join(__dirname, '..', '..', 'bootstrap-python', `${osName}-${process.arch}`)
+}
+
+interface Command {
+  cmd: string
+  args: string[]
+}
+
+/** How to create a venv and install into it, for whichever Python is available. */
+interface Toolchain {
+  createVenv(venvDir: string): Command
+  pipInstall(venvPython: string, args: string[]): Command
+}
+
+/** The bundled Python has no `venv` module, but uv builds a venv from any interpreter. */
+function uvToolchain({ python, uv }: BootstrapPython): Toolchain {
+  return {
+    createVenv: (venvDir) => ({ cmd: uv, args: ['venv', '--python', python, venvDir] }),
+    pipInstall: (venvPython, args) => ({
+      cmd: uv,
+      args: ['pip', 'install', '--python', venvPython, ...args]
+    })
+  }
+}
+
+function systemToolchain(python: PythonCommand): Toolchain {
+  return {
+    createVenv: (venvDir) => ({ cmd: python.cmd, args: [...python.args, '-m', 'venv', venvDir] }),
+    pipInstall: (venvPython, args) => ({ cmd: venvPython, args: ['-m', 'pip', 'install', ...args] })
+  }
+}
+
 function venvPythonPath(venvDir: string): string {
   return process.platform === 'win32'
     ? path.join(venvDir, 'Scripts', 'python.exe')
@@ -94,6 +148,8 @@ export interface CreateVenvOptions {
   comfyDir: string
   torchChoice: string
   tools: Pick<ActionTools, 'sendProgress' | 'sendOutput'>
+  /** Override where Desktop's bundled Python lives; `null` means none. Defaults to the app's own. */
+  bootstrapDir?: string | null
 }
 
 /** Build `<installPath>/.venv` with PyTorch and ComfyUI's requirements. On success the record's `venvPath`. */
@@ -111,15 +167,22 @@ export async function createVenv(
   if (!torch.ok) return { ok: false, message: t('git.invalidTorchBackend') }
 
   tools.sendProgress('python', { percent: -1, status: t('git.findingPython') })
-  const python = await findBasePython()
-  if (!python) return { ok: false, message: t('git.pythonNotFound') }
+  const bootstrap =
+    opts.bootstrapDir === undefined ? findBootstrapPython() : findBootstrapPython(opts.bootstrapDir)
+  const systemPython = bootstrap ? null : await findBasePython()
+  const toolchain = bootstrap
+    ? uvToolchain(bootstrap)
+    : systemPython
+      ? systemToolchain(systemPython)
+      : null
+  if (!toolchain) return { ok: false, message: t('git.pythonNotFound') }
 
   const venvDir = path.join(installPath, '.venv')
-  const run = (cmd: string, args: string[]) =>
+  const run = ({ cmd, args }: Command) =>
     runLoggedProcess(cmd, args, { cwd: comfyDir, sendOutput: tools.sendOutput })
 
   tools.sendProgress('venv', { percent: -1, status: t('git.creatingVenv') })
-  const venv = await run(python.cmd, [...python.args, '-m', 'venv', venvDir])
+  const venv = await run(toolchain.createVenv(venvDir))
   if (venv.exitCode !== 0) {
     return {
       ok: false,
@@ -128,10 +191,10 @@ export async function createVenv(
   }
 
   const venvPython = venvPythonPath(venvDir)
-  const torchArgs = ['-m', 'pip', 'install', 'torch', 'torchvision', 'torchaudio']
+  const torchArgs = ['torch', 'torchvision', 'torchaudio']
   if (torch.indexUrl) torchArgs.push('--index-url', torch.indexUrl)
   tools.sendProgress('torch', { percent: -1, status: t('git.installingTorch') })
-  const torchResult = await run(venvPython, torchArgs)
+  const torchResult = await run(toolchain.pipInstall(venvPython, torchArgs))
   if (torchResult.exitCode !== 0) {
     return {
       ok: false,
@@ -143,7 +206,7 @@ export async function createVenv(
   }
 
   tools.sendProgress('requirements', { percent: -1, status: t('git.installingRequirements') })
-  const reqResult = await run(venvPython, ['-m', 'pip', 'install', '-r', requirements])
+  const reqResult = await run(toolchain.pipInstall(venvPython, ['-r', requirements]))
   if (reqResult.exitCode !== 0) {
     return {
       ok: false,
