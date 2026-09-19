@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { TID } from '../../../shared/testIds'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createI18n } from 'vue-i18n'
 import { createPinia, setActivePinia } from 'pinia'
@@ -92,6 +93,8 @@ interface MockSnapshot {
   pickerSelectionEpoch?: number
   selectedSettings?: unknown[] | null
   selectedSnapshots?: unknown | null
+  operatingInstallationIds?: string[]
+  installOperationStatus?: Record<string, unknown>
 }
 
 interface BridgeState {
@@ -190,6 +193,74 @@ describe('comfyTitlePopup/InstancePickerView', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     bridge = installMockBridge()
+  })
+
+  describe('installs with an operation in flight', () => {
+    const op = (overrides: Record<string, unknown> = {}) => ({
+      percent: -1,
+      status: 'Installing PyTorch',
+      done: false,
+      ok: null,
+      error: null,
+      cancellable: false,
+      title: 'Creating Python environment — Alpha',
+      actionId: 'create-venv',
+      ...overrides
+    })
+    const rowOp = (wrapper: Awaited<ReturnType<typeof mountPicker>>, id: string) =>
+      wrapper.find(`[data-testid="${TID.pickerRowOperation(id)}"]`)
+
+    it('shows a spinner beside only that install, labelled with what is really happening', async () => {
+      const wrapper = await mountPicker({
+        installs: [makeInstall({ id: 'a', name: 'Alpha' }), makeInstall({ id: 'b', name: 'Beta' })],
+        activeInstallationId: null,
+        runningInstallationIds: [],
+        operatingInstallationIds: ['a'],
+        installOperationStatus: { a: op() }
+      })
+
+      expect(rowOp(wrapper, 'a').exists()).toBe(true)
+      expect(rowOp(wrapper, 'a').attributes('aria-label')).toBe('Creating Python environment')
+      expect(rowOp(wrapper, 'b').exists()).toBe(false)
+    })
+
+    it('explains the operation when hovering anywhere on that row, not just the spinner', async () => {
+      const wrapper = await mountPicker({
+        installs: [makeInstall({ id: 'a', name: 'Alpha' }), makeInstall({ id: 'b', name: 'Beta' })],
+        activeInstallationId: null,
+        runningInstallationIds: [],
+        operatingInstallationIds: ['a'],
+        installOperationStatus: { a: op() }
+      })
+
+      const row = (id: string) => wrapper.get(`[data-testid="${TID.pickerRow(id)}"]`)
+      expect(row('a').attributes('title')).toBe('Creating Python environment')
+      expect(row('b').attributes('title')).toBeUndefined()
+    })
+
+    it('names a known action by its own label, not a generic update', async () => {
+      const wrapper = await mountPicker({
+        installs: [makeInstall({ id: 'a', name: 'Alpha' })],
+        activeInstallationId: null,
+        runningInstallationIds: [],
+        operatingInstallationIds: ['a'],
+        installOperationStatus: { a: op({ actionId: 'copy', title: 'Copy — Alpha' }) }
+      })
+
+      expect(rowOp(wrapper, 'a').attributes('aria-label')).toBe('Copying…')
+    })
+
+    it('stops spinning once the operation has finished', async () => {
+      const wrapper = await mountPicker({
+        installs: [makeInstall({ id: 'a', name: 'Alpha' })],
+        activeInstallationId: null,
+        runningInstallationIds: [],
+        operatingInstallationIds: [],
+        installOperationStatus: { a: op({ done: true, ok: true }) }
+      })
+
+      expect(rowOp(wrapper, 'a').exists()).toBe(false)
+    })
   })
 
   describe('structural shell', () => {

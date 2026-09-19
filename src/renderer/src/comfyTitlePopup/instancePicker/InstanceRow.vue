@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { LoaderCircle } from 'lucide-vue-next'
 import { installTypeMetaForInstall } from '../../lib/installTypeIcon'
 import { TID } from '../../../../shared/testIds'
 import type { Installation } from '../../types/ipc'
@@ -18,6 +19,8 @@ interface Props {
   updateAvailable?: boolean
   /** Background op in flight; spinner dot takes precedence over the other dots. */
   operating?: boolean
+  /** What the in-flight op is actually doing, for the spinner tooltip and screen readers. */
+  operationLabel?: string
   lastLaunchedShortLabel: string
 }
 
@@ -26,7 +29,8 @@ const props = withDefaults(defineProps<Props>(), {
   running: false,
   isCurrent: false,
   updateAvailable: false,
-  operating: false
+  operating: false,
+  operationLabel: undefined
 })
 
 const { t } = useI18n()
@@ -50,6 +54,7 @@ function handleClick(): void {
       tabindex="0"
       class="picker-row"
       :class="{ 'is-active': active, 'is-running': running }"
+      :title="operating ? operationLabel : undefined"
       :data-testid="TID.pickerRow(installation.id)"
       @click="handleClick"
       @keydown.enter="handleClick"
@@ -63,7 +68,16 @@ function handleClick(): void {
       </div>
       <div class="picker-row-body">
         <span class="picker-row-name">{{ installation.name }}</span>
-        <span v-if="isCurrent" class="picker-row-current-pill">
+        <span
+          v-if="operating"
+          class="picker-row-op"
+          role="status"
+          :aria-label="operationLabel || undefined"
+          :data-testid="TID.pickerRowOperation(installation.id)"
+        >
+          <LoaderCircle :size="14" class="picker-row-op-spinner" aria-hidden="true" />
+        </span>
+        <span v-else-if="isCurrent" class="picker-row-current-pill">
           {{ t('snapshots.current') }}
         </span>
         <span v-else-if="lastLaunchedShortLabel" class="picker-row-recency">
@@ -167,6 +181,14 @@ function handleClick(): void {
   box-sizing: content-box;
 }
 /* Spinner dot for in-flight background ops, drawn with a conic-gradient. */
+.picker-row-op {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--brand-accent, #f5c518);
+}
+.picker-row-op-spinner {
+  animation: op-dot-spin 0.9s linear infinite;
+}
 .picker-row-op-dot {
   position: absolute;
   bottom: -1px;

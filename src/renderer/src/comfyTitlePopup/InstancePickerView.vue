@@ -15,6 +15,7 @@ import Tooltip from '../components/ui/Tooltip.vue'
 import InstanceRow from './instancePicker/InstanceRow.vue'
 import { resolvePickerTab, type PickerTab } from '../lib/pickerTabs'
 import { resolveProgressRouting } from '../lib/pickerProgressRouting'
+import { operationInflightLabel } from '../lib/progressStatusLabel'
 import type {
   DetailSection,
   Installation,
@@ -266,6 +267,18 @@ const effectiveOperatingSet = computed(() => {
   for (const id of localOperationStatus.value.keys()) s.add(id)
   return s
 })
+
+/** What an in-flight op is doing to this install, or undefined when it is idle. */
+function rowOperationLabel(inst: Installation): string | undefined {
+  if (!effectiveOperatingSet.value.has(inst.id)) return undefined
+  const op =
+    props.snapshot.installOperationStatus?.[inst.id] ?? localOperationStatus.value.get(inst.id)
+  if (!op || op.done) return undefined
+  const label = operationInflightLabel(op, t)
+  // Titles are built as "<action> — <install name>"; the row already shows the name.
+  const suffix = ` — ${inst.name}`
+  return label.endsWith(suffix) ? label.slice(0, -suffix.length) : label
+}
 
 function isRowRunning(inst: Installation): boolean {
   return runningSet.value.has(inst.id)
@@ -573,6 +586,7 @@ async function handleExpandedNav(decision: NavDecision): Promise<void> {
               :is-current="isRowCurrent(inst)"
               :update-available="isRowUpdateAvailable(inst)"
               :operating="effectiveOperatingSet.has(inst.id)"
+              :operation-label="rowOperationLabel(inst)"
               :last-launched-short-label="lastLaunchedShortLabel(inst)"
               @select="handleSelect"
             />

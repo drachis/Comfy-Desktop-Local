@@ -4,6 +4,7 @@
 
 export const TID = {
   pickerRow: (installId: string) => `picker-row-${installId}`,
+  pickerRowOperation: (installId: string) => `picker-row-operation-${installId}`,
   pickerNewWindow: 'picker-new-window',
   /** Pin-bottom primary CTA (Start / Restart / Switch per `decideNavigation`). */
   pickerPrimaryCta: 'picker-primary-cta',
