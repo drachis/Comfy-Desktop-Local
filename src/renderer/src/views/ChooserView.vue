@@ -54,6 +54,8 @@ const emit = defineEmits<{
   pick: [installation: Installation]
   /** User triggered the new-install flow in the current dashboard scope. */
   'show-new-install': [workspaceId: string]
+  /** User asked to add an existing ComfyUI folder from the empty dashboard. */
+  'show-track': []
   /** A long-running action was kicked off from the inline Manage...
    *  DetailModal. Forwarded to PanelApp so it can wire the operation
    *  through `progressStore`. */
@@ -176,8 +178,22 @@ async function refreshWorkspace(): Promise<void> {
 
 const TILES_PER_ROW = 4
 
-/** Search-independent height reservation for New Instance plus scoped installs. */
-const clusterRows = computed(() => Math.ceil((1 + scopedInstallCount.value) / TILES_PER_ROW))
+/** New Instance / Add Existing live in the File menu; the dashboard only leads
+ *  with them while the scope has no local install to launch. */
+const showStarterTiles = computed(
+  () =>
+    !installationStore.installations.some(
+      (inst) => installationIsInSelectedScope(inst) && inst.sourceCategory === 'local'
+    )
+)
+const STARTER_TILE_COUNT = 2
+
+/** Search-independent height reservation for the starter tiles plus scoped installs. */
+const clusterRows = computed(() =>
+  Math.ceil(
+    ((showStarterTiles.value ? STARTER_TILE_COUNT : 0) + scopedInstallCount.value) / TILES_PER_ROW
+  )
+)
 
 // --- Manage / context menu ---
 // All Manage routes go through `window.api.openInstancePicker` (the
@@ -342,8 +358,13 @@ function handleNewInstallClick(): void {
   emit('show-new-install', selectedWorkspaceId.value)
 }
 
+function handleAddExistingClick(): void {
+  emit('show-track')
+}
+
 const gridHandlers = {
   'new-install': handleNewInstallClick,
+  'add-existing': handleAddExistingClick,
   pick: pickInstall,
   'open-card-menu': openCardMenu,
   'open-kebab-menu': openKebabMenu,
@@ -419,7 +440,7 @@ const gridHandlers = {
       <div v-else class="chooser-shelves">
         <section class="chooser-shelf">
           <ChooserFamilyGrid
-            show-new
+            :show-new="showStarterTiles"
             :installations="scopedVisibleInstalls"
             :show-free-runs-pill="showCloudFreeRunsPill"
             :show-why-cloud="showWhyCloud"

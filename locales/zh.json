@@ -33,6 +33,8 @@
     "createInstall": "创建实例",
     "newInstall": "新建实例",
     "newInstallDesc": "设置一个全新的 ComfyUI 环境。",
+    "addExisting": "添加现有实例",
+    "addExistingDesc": "使用此计算机上已有的 ComfyUI 文件夹。",
     "filterAll": "全部",
     "filterLocal": "本地",
     "filterCloud": "云端",

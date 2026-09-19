@@ -39,6 +39,8 @@ export interface ChooserHandoffApi {
   handleChooserPick: (installation: Installation, opts?: { isRestart?: boolean }) => Promise<void>
   /** Bound to ChooserView's `show-new-install` empty-state CTA. */
   handleChooserShowNewInstall: (workspaceId: string) => void
+  /** Bound to ChooserView's `show-track` empty-state CTA. */
+  handleChooserShowTrack: () => void
   /** Picker variant of `performChooserLaunch` without
    *  `prepareChooserHostHandoff`, so the install-backed host isn't
    *  swapped out; launch lands in a fresh window. */
@@ -160,6 +162,10 @@ export function useChooserHandoff(opts: ChooserHandoffOpts): ChooserHandoffApi {
     void opts.switchPanel('new-install', 'chooser', { workspaceId })
   }
 
+  function handleChooserShowTrack(): void {
+    void opts.switchPanel('track', 'chooser')
+  }
+
   onUnmounted(() => {
     pendingPickUnsub?.()
   })
@@ -169,6 +175,7 @@ export function useChooserHandoff(opts: ChooserHandoffOpts): ChooserHandoffApi {
     performChooserLaunch,
     handleChooserPick,
     handleChooserShowNewInstall,
+    handleChooserShowTrack,
     performPickerLaunch
   }
 }

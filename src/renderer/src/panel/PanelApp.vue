@@ -230,7 +230,7 @@ chooserHandoff = useChooserHandoff({
   showProgress: handleShowProgress,
   switchPanel
 })
-const { handleChooserPick, handleChooserShowNewInstall } = chooserHandoff
+const { handleChooserPick, handleChooserShowNewInstall, handleChooserShowTrack } = chooserHandoff
 
 // Boot-time restore: the host window is hidden until we tell main the outcome.
 // Use `performChooserLaunch` (NOT `handleChooserPick`) so a missing launch
@@ -600,6 +600,7 @@ onUnmounted(() => {
           <ChooserView
             @pick="handleChooserPick"
             @show-new-install="handleChooserShowNewInstall"
+            @show-track="handleChooserShowTrack"
             @show-progress="handleShowProgress"
           />
         </div>

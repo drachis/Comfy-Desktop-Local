@@ -63,9 +63,9 @@ vi.mock('./ComfyLifecycleView.vue', () => ({
 vi.mock('../views/ChooserView.vue', () => ({
   default: {
     name: 'ChooserView',
-    emits: ['pick', 'show-new-install'],
+    emits: ['pick', 'show-new-install', 'show-track'],
     template:
-      '<div data-testid="chooser-view"><button data-testid="chooser-new-install" @click="$emit(\'show-new-install\', \'workspace-1\')">New</button></div>'
+      '<div data-testid="chooser-view"><button data-testid="chooser-new-install" @click="$emit(\'show-new-install\', \'workspace-1\')">New</button><button data-testid="chooser-track" @click="$emit(\'show-track\')">Add</button></div>'
   }
 }))
 vi.mock('../views/InstallWizardModal.vue', () => ({
@@ -436,6 +436,16 @@ describe('PanelApp', () => {
       workspaceId: 'workspace-1'
     })
     expect(mockState.getSetting).not.toHaveBeenCalledWith('dashboardWorkspaceId')
+  })
+
+  it('opens the track takeover above the chooser body when show-track fires', async () => {
+    window.history.replaceState({}, '', '/?panel=chooser&firstUseCompleted=true')
+    const wrapper = mountPanel()
+    await flushPromises()
+    await wrapper.find('[data-testid="chooser-track"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="chooser-view"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="track-modal"]').exists()).toBe(true)
   })
 
   it('opens menu-driven New Instance in the persisted dashboard workspace', async () => {

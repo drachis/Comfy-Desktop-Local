@@ -50,6 +50,8 @@ const messages = {
     chooser: {
       newInstall: 'New Instance',
       newInstallDesc: 'Set up a fresh ComfyUI environment.',
+      addExisting: 'Add Existing Instance',
+      addExistingDesc: 'Use a ComfyUI folder that is already on this machine.',
       filterAll: 'All',
       filterLocal: 'Local',
       filterCloud: 'Cloud',
@@ -210,6 +212,45 @@ describe('ChooserView', () => {
     await flushPromises()
     await wrapper.find('.chooser-tile-new').trigger('click')
     expect(wrapper.emitted('show-new-install')).toEqual([['personal']])
+  })
+
+  it('renders the Add Existing tile beside New Instance when the user has zero installs', async () => {
+    installMockApi([])
+    const wrapper = mountChooser()
+    await flushPromises()
+    expect(wrapper.text()).toContain('Add Existing Instance')
+  })
+
+  it('emits show-track when the Add Existing tile is clicked', async () => {
+    installMockApi([])
+    const wrapper = mountChooser()
+    await flushPromises()
+    await wrapper.get('.chooser-tile-add').trigger('click')
+    expect(wrapper.emitted('show-track')).toEqual([[]])
+  })
+
+  it('hides New Instance and Add Existing once a local install exists', async () => {
+    installMockApi([makeInstall({ id: 'local-1', name: 'My Local' })])
+    const wrapper = mountChooser()
+    await flushPromises()
+    expect(wrapper.text()).toContain('My Local')
+    expect(wrapper.text()).not.toContain('New Instance')
+    expect(wrapper.text()).not.toContain('Add Existing Instance')
+  })
+
+  it('keeps the starter tiles when the only install is a cloud one', async () => {
+    installMockApi([
+      makeInstall({
+        id: 'cloud',
+        name: 'Comfy Cloud',
+        sourceCategory: 'cloud',
+        sourceLabel: 'Cloud'
+      })
+    ])
+    const wrapper = mountChooser()
+    await flushPromises()
+    expect(wrapper.text()).toContain('New Instance')
+    expect(wrapper.text()).toContain('Add Existing Instance')
   })
 
   it('renders a cloud install through the same tile component as local installs', async () => {

@@ -33,6 +33,8 @@
     "createInstall": "Create instance",
     "newInstall": "New Instance",
     "newInstallDesc": "Set up a fresh ComfyUI environment.",
+    "addExisting": "Add Existing Instance",
+    "addExistingDesc": "Use a ComfyUI folder that is already on this machine.",
     "filterAll": "All",
     "filterLocal": "Local",
     "filterCloud": "Cloud",

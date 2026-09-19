@@ -1,14 +1,14 @@
 <script setup lang="ts">
 /** One grid of installed instances for the selected dashboard scope. */
 import { useI18n } from 'vue-i18n'
-import { Plus } from 'lucide-vue-next'
+import { FolderOpen, Plus } from 'lucide-vue-next'
 import ChooserInstallTile from './ChooserInstallTile.vue'
 import type { Installation } from '../../types/ipc'
 
 const props = withDefaults(
   defineProps<{
     installations: Installation[]
-    /** Lead with the New Install tile. */
+    /** Lead with the New Instance and Add Existing tiles. */
     showNew?: boolean
     showFreeRunsPill?: boolean
     showWhyCloud?: boolean
@@ -25,6 +25,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   'new-install': []
+  'add-existing': []
   pick: [installation: Installation]
   'open-card-menu': [event: MouseEvent, installation: Installation]
   'open-kebab-menu': [event: MouseEvent, installation: Installation]
@@ -80,6 +81,18 @@ function unlockTileSize(el: Element): void {
       <div class="chooser-tile-icon"><Plus :size="32" /></div>
       <div class="chooser-tile-name">{{ t('chooser.newInstall') }}</div>
       <div class="chooser-tile-meta">{{ t('chooser.newInstallDesc') }}</div>
+    </button>
+
+    <button
+      v-if="props.showNew"
+      key="__add"
+      type="button"
+      class="chooser-tile chooser-tile-new chooser-tile-add"
+      @click="emit('add-existing')"
+    >
+      <div class="chooser-tile-icon"><FolderOpen :size="32" /></div>
+      <div class="chooser-tile-name">{{ t('chooser.addExisting') }}</div>
+      <div class="chooser-tile-meta">{{ t('chooser.addExistingDesc') }}</div>
     </button>
 
     <ChooserInstallTile
