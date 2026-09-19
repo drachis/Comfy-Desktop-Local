@@ -10,7 +10,8 @@ import {
   MoreVertical
 } from 'lucide-vue-next'
 import { useSessionStore } from '../../stores/sessionStore'
-import { progressOpKindForActionId } from '../../lib/progressOpKind'
+import { isLongRunningActionId, progressOpKindForActionId } from '../../lib/progressOpKind'
+import { operationInflightLabel } from '../../lib/progressStatusLabel'
 import { installTypeMetaForInstall } from '../../lib/installTypeIcon'
 import { installPathLabel } from '../../lib/installPathLabel'
 import Tooltip from '../../components/ui/Tooltip.vue'
@@ -58,6 +59,14 @@ const isUpdating = computed(() => {
   const op = sessionStore.operationInstances.get(inst.value.id)
   return op != null && progressOpKindForActionId(op.actionId) === 'update'
 })
+/* Any other long-running operation (creating a Python environment, copying,
+ * migrating, ...). Updates keep their own pill above; this covers the rest so
+ * the tile says what is really happening and cannot be launched meanwhile. */
+const blockingOperation = computed(() => {
+  if (isUpdating.value) return null
+  const op = sessionStore.operationInstances.get(inst.value.id)
+  return op && isLongRunningActionId(op.actionId) ? op : null
+})
 const hasError = computed(() => sessionStore.errorInstances.has(inst.value.id))
 
 /* Backend-flagged problem states (failed install, interrupted delete, missing
@@ -70,14 +79,20 @@ const dangerTag = computed(() =>
 const statusClasses = computed<Record<string, boolean>>(() => ({
   'chooser-tile-running': isRunning.value && !isStopping.value,
   'chooser-tile-stopping': isStopping.value,
-  'chooser-tile-updating': isUpdating.value,
+  'chooser-tile-updating': isUpdating.value || blockingOperation.value != null,
   'chooser-tile-errored': hasError.value || dangerTag.value != null
 }))
 
 /* Lifecycle → top-right status pill (dot + label). Stopping wins over
  * launching wins over running; an idle tile gets no pill. An errored
  * tile shows the clickable error badge instead (see template). */
-const statusPill = computed<{ label: string; dotClass: string; spinning?: boolean } | null>(() => {
+const statusPill = computed<{
+  label: string
+  /** Already-translated text; used instead of `label` when the copy depends on the operation. */
+  text?: string
+  dotClass: string
+  spinning?: boolean
+} | null>(() => {
   if (props.isPromotingToWorkspace)
     return {
       label: 'devPlatform.workspace.promoting',
@@ -87,6 +102,13 @@ const statusPill = computed<{ label: string; dotClass: string; spinning?: boolea
   if (isUpdating.value)
     return {
       label: 'instancePicker.progressUpdating',
+      dotClass: 'chooser-tile-status--updating',
+      spinning: true
+    }
+  if (blockingOperation.value)
+    return {
+      label: '',
+      text: operationInflightLabel({ actionId: blockingOperation.value.actionId }, t),
       dotClass: 'chooser-tile-status--updating',
       spinning: true
     }
@@ -177,7 +199,7 @@ const actionPill = computed(() => {
 })
 
 function handleClick(): void {
-  if (isStopping.value || isUpdating.value) return
+  if (isStopping.value || isUpdating.value || blockingOperation.value) return
   emit('pick', inst.value)
 }
 
@@ -197,8 +219,8 @@ function triggerInstallAction(action: 'update' | 'migrate'): void {
 <template>
   <div
     role="button"
-    :tabindex="isUpdating ? -1 : 0"
-    :aria-disabled="isUpdating || undefined"
+    :tabindex="isUpdating || blockingOperation ? -1 : 0"
+    :aria-disabled="isUpdating || blockingOperation != null || undefined"
     class="chooser-tile chooser-tile--install"
     :class="statusClasses"
     :data-testid="TID.dashboardTile(inst.id)"
@@ -248,7 +270,7 @@ function triggerInstallAction(action: 'update' | 'migrate'): void {
           aria-hidden="true"
         />
         <span v-else class="chooser-tile-status-dot" aria-hidden="true" />
-        {{ t(statusPill.label) }}
+        {{ statusPill.text ?? t(statusPill.label) }}
       </span>
       <button
         v-else-if="dangerTag"

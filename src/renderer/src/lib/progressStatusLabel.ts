@@ -60,6 +60,8 @@ export function operationInflightLabel(op: OperationLabelDescriptor, t: TLike): 
       return tt('instancePicker.progressDeletingSnapshot', 'Deleting snapshot…')
     case 'migrate-to-standalone':
       return tt('instancePicker.progressMigrating', 'Migrating…')
+    case 'create-venv':
+      return tt('instancePicker.progressCreatingEnv', 'Creating Python environment…')
     default:
       return op.title || tt('instancePicker.progressWorking', 'Working…')
   }
@@ -91,6 +93,8 @@ export function operationSuccessLabel(op: OperationLabelDescriptor, t: TLike): s
       return tt('instancePicker.progressSnapshotDeleted', 'Snapshot deleted')
     case 'migrate-to-standalone':
       return tt('instancePicker.progressMigrated', 'Migration complete')
+    case 'create-venv':
+      return tt('instancePicker.progressEnvCreated', 'Python environment created')
     default:
       return tt('instancePicker.progressDone', 'Done')
   }

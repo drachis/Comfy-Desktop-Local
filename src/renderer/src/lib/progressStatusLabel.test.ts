@@ -93,3 +93,12 @@ describe('operationSuccessLabel', () => {
     expect(operationSuccessLabel({ actionId: 'mystery' }, t)).toBe('Done')
   })
 })
+
+describe('create-venv labels', () => {
+  it('names the environment being created rather than a generic or update label', () => {
+    expect(operationInflightLabel({ actionId: 'create-venv' }, t)).toBe(
+      'Creating Python environment…'
+    )
+    expect(operationSuccessLabel({ actionId: 'create-venv' }, t)).toBe('Python environment created')
+  })
+})

@@ -1397,7 +1397,8 @@
     "willStopRunning": "{name} is running and will be stopped first.",
     "folderPermissionDenied": "macOS denied access to \"{path}\". Please open System Settings → Privacy & Security → Files and Folders, grant access to Comfy Desktop, then retry.",
     "recoveryFailed": "ComfyUI recovery failed: {message}",
-    "executableNotFound": "Executable not found: {cmd}"
+    "executableNotFound": "Executable not found: {cmd}",
+    "launchBlockedByOperation": "{name} is busy ({operation}). Launch it once that has finished."
   },
   "tooltips": {
     "pytorchStack": "Official PyTorch builds tested with this installation type. Switching replaces torch, torchvision, and torchaudio; the rest of your environment is kept.",
@@ -1581,7 +1582,9 @@
     "progressMigrated": "Migration complete",
     "progressWorking": "Working…",
     "progressError": "Something went wrong",
-    "progressCancelled": "Cancelled"
+    "progressCancelled": "Cancelled",
+    "progressCreatingEnv": "Creating Python environment…",
+    "progressEnvCreated": "Python environment created"
   },
   "installShowcase": {
     "cloud": {

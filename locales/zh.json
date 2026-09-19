@@ -1397,7 +1397,8 @@
     "willStopRunning": "{name} 正在运行，将先被停止。",
     "folderPermissionDenied": "macOS 拒绝访问“{path}”。请打开系统设置 → 隐私与安全性 → 文件和文件夹，授予 Comfy Desktop 访问权限，然后重试。",
     "recoveryFailed": "ComfyUI 恢复失败：{message}",
-    "executableNotFound": "找不到可执行文件：{cmd}"
+    "executableNotFound": "找不到可执行文件：{cmd}",
+    "launchBlockedByOperation": "{name} 正忙（{operation}）。请在其完成后再启动。"
   },
   "tooltips": {
     "pytorchStack": "经过官方测试、适用于此安装类型的 PyTorch 构建。切换将替换 torch、torchvision 和 torchaudio；环境的其余部分保持不变。",
@@ -1581,7 +1582,9 @@
     "progressMigrated": "迁移完成",
     "progressWorking": "正在处理…",
     "progressError": "出现了问题",
-    "progressCancelled": "已取消"
+    "progressCancelled": "已取消",
+    "progressCreatingEnv": "正在创建 Python 环境…",
+    "progressEnvCreated": "Python 环境已创建"
   },
   "installShowcase": {
     "cloud": {

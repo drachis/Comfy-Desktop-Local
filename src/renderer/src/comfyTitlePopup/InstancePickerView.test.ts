@@ -220,7 +220,7 @@ describe('comfyTitlePopup/InstancePickerView', () => {
       })
 
       expect(rowOp(wrapper, 'a').exists()).toBe(true)
-      expect(rowOp(wrapper, 'a').attributes('aria-label')).toBe('Creating Python environment')
+      expect(rowOp(wrapper, 'a').attributes('aria-label')).toBe('Creating Python environment…')
       expect(rowOp(wrapper, 'b').exists()).toBe(false)
     })
 
@@ -234,7 +234,7 @@ describe('comfyTitlePopup/InstancePickerView', () => {
       })
 
       const row = (id: string) => wrapper.get(`[data-testid="${TID.pickerRow(id)}"]`)
-      expect(row('a').attributes('title')).toBe('Creating Python environment')
+      expect(row('a').attributes('title')).toBe('Creating Python environment…')
       expect(row('b').attributes('title')).toBeUndefined()
     })
 

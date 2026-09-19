@@ -5,7 +5,12 @@ import { useActionGuard } from './useActionGuard'
 import { useLocalInstanceGuard } from './useLocalInstanceGuard'
 import { useSessionStore } from '../stores/sessionStore'
 import { emitTelemetryAction, toErrorBucket } from '../lib/telemetry'
-import { progressOpKindForActionId, destroysInstanceForActionId } from '../lib/progressOpKind'
+import {
+  progressOpKindForActionId,
+  destroysInstanceForActionId,
+  isLongRunningActionId
+} from '../lib/progressOpKind'
+import { operationInflightLabel } from '../lib/progressStatusLabel'
 import {
   IN_PLACE_RELAUNCH,
   augmentMessageWithStopWarning,
@@ -68,6 +73,20 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
         return
       }
       await modal.alert({ title: action.label, message: action.disabledMessage })
+      return
+    }
+
+    // A launch must not race a long operation on the same install (for example while its
+    // Python environment is being created), whichever window started that operation.
+    const runningOp = sessionStore.operationInstances?.get(inst.id)
+    if (action.id === 'launch' && runningOp && isLongRunningActionId(runningOp.actionId)) {
+      await modal.alert({
+        title: action.label,
+        message: t('errors.launchBlockedByOperation', {
+          name: inst.name || 'ComfyUI',
+          operation: operationInflightLabel({ actionId: runningOp.actionId }, t)
+        })
+      })
       return
     }
 

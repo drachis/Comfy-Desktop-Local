@@ -30,10 +30,12 @@ vi.mock('./useLocalInstanceGuard', () => ({
 
 const sessionState = vi.hoisted(() => ({
   running: new Set<string>(),
-  errorCleared: [] as string[]
+  errorCleared: [] as string[],
+  operations: new Map<string, { actionId: string }>()
 }))
 vi.mock('../stores/sessionStore', () => ({
   useSessionStore: () => ({
+    operationInstances: sessionState.operations,
     isRunning: (id: string) => sessionState.running.has(id),
     clearErrorInstance: (id: string) => {
       sessionState.errorCleared.push(id)
@@ -262,6 +264,37 @@ describe('useListAction.executeAction onGuardsPassed hook', () => {
     expect(mockModalAlert).toHaveBeenCalledOnce()
     expect(onGuardsPassed).not.toHaveBeenCalled()
     expect(showProgress).not.toHaveBeenCalled()
+  })
+
+  describe('launching while another operation is running on the install', () => {
+    beforeEach(() => {
+      sessionState.operations.clear()
+    })
+
+    it('refuses, and says what the install is busy with', async () => {
+      sessionState.operations.set(INSTALL.id, { actionId: 'create-venv' })
+      const showProgress = vi.fn()
+      const { executeAction } = useListAction('chooser', { showProgress })
+
+      await executeAction(INSTALL, LAUNCH_ACTION)
+
+      expect(mockModalAlert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Creating Python environment')
+        })
+      )
+      expect(showProgress).not.toHaveBeenCalled()
+      expect(mockCheckBeforeLaunch).not.toHaveBeenCalled()
+    })
+
+    it('does not treat the launch itself or a quick action as blocking', async () => {
+      sessionState.operations.set(INSTALL.id, { actionId: 'rename' })
+      const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+
+      await executeAction(INSTALL, LAUNCH_ACTION)
+
+      expect(mockCheckBeforeLaunch).toHaveBeenCalled()
+    })
   })
 
   describe('launching an install that needs a setup step', () => {

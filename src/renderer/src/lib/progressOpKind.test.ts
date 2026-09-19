@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { progressOpKindForActionId } from './progressOpKind'
+import { isLongRunningActionId, progressOpKindForActionId } from './progressOpKind'
 
 describe('progressOpKindForActionId', () => {
   it('classifies update actions as update ops', () => {
@@ -22,4 +22,20 @@ describe('progressOpKindForActionId', () => {
     expect(progressOpKindForActionId('install-instance')).toBe('install')
     expect(progressOpKindForActionId('rename')).toBe('generic')
   })
+})
+
+describe('isLongRunningActionId', () => {
+  it.each(['create-venv', 'copy', 'delete', 'migrate-to-standalone', 'update-comfyui'])(
+    'treats %s as long running',
+    (id) => {
+      expect(isLongRunningActionId(id)).toBe(true)
+    }
+  )
+
+  it.each(['launch', 'rename', 'open-folder', 'remove', 'check-update'])(
+    'treats %s as quick, so it never blocks or flashes a busy state',
+    (id) => {
+      expect(isLongRunningActionId(id)).toBe(false)
+    }
+  )
 })

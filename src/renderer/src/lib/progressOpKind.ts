@@ -29,6 +29,20 @@ export function progressOpKindForActionId(actionId: string): ProgressOpKind {
   }
 }
 
+/** Actions that finish almost instantly, so they never warrant a busy indicator or a launch block. */
+const QUICK_ACTION_IDS: ReadonlySet<string> = new Set([
+  'launch',
+  'rename',
+  'open-folder',
+  'remove',
+  'check-update'
+])
+
+/** True for actions worth showing as in progress and blocking a launch while they run. */
+export function isLongRunningActionId(actionId: string): boolean {
+  return !QUICK_ACTION_IDS.has(actionId)
+}
+
 /** Whether the action removes the install from the registry on success. */
 export function destroysInstanceForActionId(actionId: string): boolean {
   return actionId === 'delete'

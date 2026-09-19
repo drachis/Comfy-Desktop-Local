@@ -254,6 +254,66 @@ describe('ChooserView', () => {
     expect(wrapper.find(`[data-testid="${TID.dashboardTilePath('cloud')}"]`).exists()).toBe(false)
   })
 
+  describe('an install with a long operation in flight', () => {
+    const tileFor = (wrapper: ReturnType<typeof mountChooser>, id: string) =>
+      wrapper.get(`[data-testid="${TID.dashboardTile(id)}"]`)
+
+    it('shows what is happening on the tile and does not launch when clicked', async () => {
+      installMockApi([makeInstall({ id: 'venv-1', name: 'Needs Env' })])
+      const wrapper = mountChooser()
+      await flushPromises()
+      useSessionStore().operationInstances.set('venv-1', { actionId: 'create-venv' })
+      await flushPromises()
+
+      const tile = tileFor(wrapper, 'venv-1')
+      expect(tile.text()).toContain('Creating Python environment')
+      expect(tile.find('.chooser-tile-status-spinner').exists()).toBe(true)
+      expect(tile.attributes('aria-disabled')).toBe('true')
+
+      await tile.trigger('click')
+      expect(wrapper.emitted('pick')).toBeUndefined()
+    })
+
+    it('leaves other installs launchable', async () => {
+      installMockApi([
+        makeInstall({ id: 'venv-1', name: 'Needs Env' }),
+        makeInstall({ id: 'other', name: 'Other' })
+      ])
+      const wrapper = mountChooser()
+      await flushPromises()
+      useSessionStore().operationInstances.set('venv-1', { actionId: 'create-venv' })
+      await flushPromises()
+
+      await tileFor(wrapper, 'other').trigger('click')
+
+      expect((wrapper.emitted('pick')?.[0]?.[0] as Installation).id).toBe('other')
+    })
+
+    it('ignores quick actions such as a rename so the tile does not flash busy', async () => {
+      installMockApi([makeInstall({ id: 'a', name: 'Alpha' })])
+      const wrapper = mountChooser()
+      await flushPromises()
+      useSessionStore().operationInstances.set('a', { actionId: 'rename' })
+      await flushPromises()
+
+      expect(tileFor(wrapper, 'a').find('.chooser-tile-status-spinner').exists()).toBe(false)
+      expect(tileFor(wrapper, 'a').attributes('aria-disabled')).toBeUndefined()
+    })
+
+    it('goes back to normal once the operation ends', async () => {
+      installMockApi([makeInstall({ id: 'a', name: 'Alpha' })])
+      const wrapper = mountChooser()
+      await flushPromises()
+      const store = useSessionStore()
+      store.operationInstances.set('a', { actionId: 'create-venv' })
+      await flushPromises()
+      store.operationInstances.delete('a')
+      await flushPromises()
+
+      expect(tileFor(wrapper, 'a').find('.chooser-tile-status-spinner').exists()).toBe(false)
+    })
+  })
+
   it('hides New Instance and Add Existing once a local install exists', async () => {
     installMockApi([makeInstall({ id: 'local-1', name: 'My Local' })])
     const wrapper = mountChooser()
