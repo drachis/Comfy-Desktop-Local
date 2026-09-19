@@ -12,6 +12,7 @@ import {
 import { useSessionStore } from '../../stores/sessionStore'
 import { progressOpKindForActionId } from '../../lib/progressOpKind'
 import { installTypeMetaForInstall } from '../../lib/installTypeIcon'
+import { installPathLabel } from '../../lib/installPathLabel'
 import Tooltip from '../../components/ui/Tooltip.vue'
 import TruncatedText from '../../components/TruncatedText.vue'
 import { TID } from '../../../../shared/testIds'
@@ -129,6 +130,11 @@ const sourceLabel = computed(() => {
       : inst.value.listPreview || inst.value.sourceLabel
   return raw ? raw.replace(/^https?:\/\//, '') : raw
 })
+
+/** Build tiles are identified by the build, so only path-backed installs show one. */
+const pathLabel = computed(() =>
+  isFromBuild.value ? '' : installPathLabel(inst.value.installPath)
+)
 
 /** Labelled ("Build v7") so it can't be read as the ComfyUI version beside it. */
 const trailingFact = computed(() =>
@@ -291,6 +297,13 @@ function triggerInstallAction(action: 'update' | 'migrate'): void {
           </button>
         </Tooltip>
       </div>
+      <span
+        v-if="pathLabel"
+        class="chooser-tile-meta-line chooser-tile-path"
+        :title="inst.installPath"
+        :data-testid="TID.dashboardTilePath(inst.id)"
+        >{{ pathLabel }}</span
+      >
       <div v-if="metaLine || actionPill" class="chooser-tile-footer">
         <TruncatedText v-if="metaLine" class="chooser-tile-meta-line" :text="metaLine">
           <span v-if="leadingFact" class="chooser-tile-meta-source">{{ leadingFact }}</span>
@@ -332,6 +345,12 @@ function triggerInstallAction(action: 'update' | 'migrate'): void {
 }
 .chooser-tile-name-row :deep(.tooltip-wrap) {
   flex: 0 0 auto;
+}
+
+.chooser-tile-path {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .chooser-tile-why-cloud {

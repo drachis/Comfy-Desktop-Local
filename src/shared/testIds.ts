@@ -17,6 +17,7 @@ export const TID = {
 
   dashboardTile: (installId: string) => `dashboard-tile-${installId}`,
   dashboardTileKebab: (installId: string) => `dashboard-tile-kebab-${installId}`,
+  dashboardTilePath: (installId: string) => `dashboard-tile-path-${installId}`,
   dashboardTileWhyCloud: (installId: string) => `dashboard-tile-why-cloud-${installId}`,
 
   /** A single item in the shared `ContextMenu`. `id` matches `ContextMenuItem.id`. */

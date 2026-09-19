@@ -229,6 +229,31 @@ describe('ChooserView', () => {
     expect(wrapper.emitted('show-track')).toEqual([[]])
   })
 
+  it('shows the folder above the install on the tile, with the full path on hover', async () => {
+    installMockApi([
+      makeInstall({ id: 'local-1', name: 'My Local', installPath: 'O:\\AI\\Comfy\\ComfyUI_2' })
+    ])
+    const wrapper = mountChooser()
+    await flushPromises()
+    const path = wrapper.get(`[data-testid="${TID.dashboardTilePath('local-1')}"]`)
+    expect(path.text()).toBe('…\\Comfy\\ComfyUI_2')
+    expect(path.attributes('title')).toBe('O:\\AI\\Comfy\\ComfyUI_2')
+  })
+
+  it('shows no path line for an install without a folder', async () => {
+    installMockApi([
+      makeInstall({
+        id: 'cloud',
+        name: 'Comfy Cloud',
+        sourceCategory: 'cloud',
+        sourceLabel: 'Cloud'
+      })
+    ])
+    const wrapper = mountChooser()
+    await flushPromises()
+    expect(wrapper.find(`[data-testid="${TID.dashboardTilePath('cloud')}"]`).exists()).toBe(false)
+  })
+
   it('hides New Instance and Add Existing once a local install exists', async () => {
     installMockApi([makeInstall({ id: 'local-1', name: 'My Local' })])
     const wrapper = mountChooser()
