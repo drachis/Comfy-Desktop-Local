@@ -159,6 +159,14 @@ export const desktop: SourcePlugin = {
     if (!hasModels || !hasUser) return null
     if (hasStandaloneEnv) return null
     if (!hasVenv) return null
+    // A Legacy Desktop data folder holds no ComfyUI source (that lives in the app itself);
+    // a folder with main.py is a runnable ComfyUI checkout and belongs to another source.
+    if (
+      fs.existsSync(path.join(dirPath, 'main.py')) ||
+      fs.existsSync(path.join(dirPath, 'ComfyUI', 'main.py'))
+    ) {
+      return null
+    }
 
     return {
       launchMode: 'external',

@@ -94,6 +94,16 @@ describe('desktop.probeInstallation', () => {
     expect(await desktop.probeInstallation(dir)).toBeNull()
   })
 
+  it.each([['main.py'], [path.join('ComfyUI', 'main.py')]])(
+    'returns null when the folder holds ComfyUI source (%s), so it is not Legacy Desktop data',
+    async (source) => {
+      const dir = '/home/test/installs/my-comfy'
+      stubDir(dir, ['models', 'user', '.venv', source])
+
+      expect(await desktop.probeInstallation(dir)).toBeNull()
+    }
+  )
+
   it('returns null when .venv is missing', async () => {
     const dir = '/home/test/Documents/ComfyUI'
     stubDir(dir, ['models', 'user'])

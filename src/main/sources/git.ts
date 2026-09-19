@@ -106,6 +106,16 @@ function findMainPy(dirPath: string): string | null {
   return null
 }
 
+/** ComfyUI's own version from `comfyui_version.py`, for folders with no git history to read. */
+function readComfyVersion(mainPy: string): string | null {
+  try {
+    const src = fs.readFileSync(path.join(path.dirname(mainPy), 'comfyui_version.py'), 'utf-8')
+    return src.match(/__version__\s*=\s*["']([^"']+)["']/)?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
 export const gitSource: SourcePlugin = {
   id: 'git',
   get label() {
@@ -288,30 +298,37 @@ export const gitSource: SourcePlugin = {
 
   probeInstallation(dirPath: string): Record<string, unknown> | null {
     const gitDir = resolveGitDir(dirPath)
-    if (!gitDir) return null
+    const mainPy = findMainPy(dirPath)
+    // A plain ComfyUI folder (zip download, copied tree) has no .git but runs the same way.
+    if (!gitDir && !mainPy) return null
     const info: Record<string, unknown> = { version: 'unknown', repo: '', branch: '', commit: '' }
 
-    // Extract branch name from HEAD
-    try {
-      const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim()
-      const branchMatch = head.match(/^ref: refs\/heads\/(.+)$/)
-      if (branchMatch && branchMatch[1]) {
-        info.branch = branchMatch[1]
+    if (gitDir) {
+      // Extract branch name from HEAD
+      try {
+        const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim()
+        const branchMatch = head.match(/^ref: refs\/heads\/(.+)$/)
+        if (branchMatch && branchMatch[1]) {
+          info.branch = branchMatch[1]
+        }
+      } catch {
+        // ignore — partial info is fine
       }
-    } catch {
-      // ignore — partial info is fine
-    }
 
-    // Resolve commit SHA via readGitHead (handles refs, packed-refs, detached HEAD)
-    const commit = readGitHead(dirPath)
-    if (commit) {
-      info.commit = commit
-      info.version = commit.slice(0, 8)
-    }
+      // Resolve commit SHA via readGitHead (handles refs, packed-refs, detached HEAD)
+      const commit = readGitHead(dirPath)
+      if (commit) {
+        info.commit = commit
+        info.version = commit.slice(0, 8)
+      }
 
-    // Read remote URL via readGitRemoteUrl (handles credential redaction)
-    const remoteUrl = readGitRemoteUrl(dirPath)
-    if (remoteUrl) info.repo = remoteUrl
+      // Read remote URL via readGitRemoteUrl (handles credential redaction)
+      const remoteUrl = readGitRemoteUrl(dirPath)
+      if (remoteUrl) info.repo = remoteUrl
+    } else if (mainPy) {
+      const comfyVersion = readComfyVersion(mainPy)
+      if (comfyVersion) info.version = comfyVersion
+    }
 
     const venv = findVenv(dirPath)
     if (venv) {
