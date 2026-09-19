@@ -21,7 +21,6 @@ import type {
   ActionResult,
   ActionTools,
   LaunchCommand,
-  StatusTag,
   TerminalEnv
 } from '../types/sources'
 
@@ -206,13 +205,6 @@ export const gitSource: SourcePlugin = {
     const canLaunch = installed && unavailable === null
     const disabledMsg = !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
     return [launchAction(canLaunch, disabledMsg)]
-  },
-
-  getStatusTag(installation: InstallationRecord): StatusTag | undefined {
-    if (installation.status === 'installed') {
-      return { label: t('migrate.migrateToStandalonePill'), style: 'migrate' }
-    }
-    return undefined
   },
 
   getDetailSections(installation: InstallationRecord): Record<string, unknown>[] {

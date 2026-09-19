@@ -118,9 +118,8 @@ export const portable: SourcePlugin = {
       const version = info.releaseName || info.latestTag || ''
       return { label: t('portable.updateAvailableTag', { version }), style: 'update', version }
     }
-    if (installation.status === 'installed') {
-      return { label: t('migrate.migrateToStandalonePill'), style: 'migrate' }
-    }
+    // No Migrate pill: a portable install launches as-is. "Migrate to Standalone" stays an
+    // opt-in action in its Manage actions.
     return undefined
   },
 
