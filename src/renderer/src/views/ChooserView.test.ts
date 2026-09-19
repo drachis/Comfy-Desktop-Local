@@ -725,13 +725,16 @@ describe('ChooserView', () => {
     expect(names).toContain('Unassigned Studio')
     expect(names).toContain('Personal Studio')
     expect(names).not.toContain('Workspace Studio')
-    expect(wrapper.get('[data-testid="devplatform-workspace-selector"]').text()).toContain(
-      'Personal'
-    )
-    expect(wrapper.get('.chooser-workspace-controls').classes()).toContain(
-      'chooser-workspace-controls--no-refresh'
-    )
+    expect(wrapper.find('[data-testid="devplatform-workspace-selector"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="chooser-workspace-refresh"]').exists()).toBe(false)
+  })
+
+  it('shows no sign-in button or account chip while signed out', async () => {
+    installMockApi([makeInstall({ id: 'a', name: 'Alpha' })])
+    const wrapper = mountChooser()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="devplatform-account-signin"]').exists()).toBe(false)
+    expect(wrapper.find('.chooser-account').exists()).toBe(false)
   })
 
   it('renders the dashboard as one left-aligned instance grid', async () => {

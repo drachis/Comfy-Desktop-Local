@@ -380,7 +380,7 @@ const gridHandlers = {
   <BrandBackground v-show="props.visible" class="chooser-bg">
     <div class="chooser-view chooser-view--workspace" :style="{ '--rows': clusterRows }">
       <!-- Signed-in account identity, pinned outside the centered content column. -->
-      <div class="chooser-account">
+      <div v-if="authStore.isSignedIn" class="chooser-account">
         <DevPlatformAccountChip />
       </div>
 
@@ -402,7 +402,10 @@ const gridHandlers = {
           class="chooser-workspace-controls"
           :class="{ 'chooser-workspace-controls--no-refresh': !authStore.isSignedIn }"
         >
-          <DevPlatformWorkspaceSelector v-model="selectedWorkspaceModel" />
+          <DevPlatformWorkspaceSelector
+            v-if="authStore.isSignedIn"
+            v-model="selectedWorkspaceModel"
+          />
           <button
             v-if="authStore.isSignedIn"
             type="button"
@@ -419,7 +422,7 @@ const gridHandlers = {
             />
           </button>
         </div>
-        <div class="chooser-workspace-divider" aria-hidden="true" />
+        <div v-if="authStore.isSignedIn" class="chooser-workspace-divider" aria-hidden="true" />
         <div class="chooser-workspace-count">
           <span>{{ t('devPlatform.workspace.instanceCountLabel') }}</span>
           <strong>{{ scopedInstallCount }}</strong>
