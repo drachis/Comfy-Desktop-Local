@@ -40,3 +40,6 @@ docs/telemetry.md
 __pycache__/
 *.pyc
 coverage/
+
+# Generated locally by pnpm 12 (build-script approvals); not part of the project
+pnpm-workspace.yaml
