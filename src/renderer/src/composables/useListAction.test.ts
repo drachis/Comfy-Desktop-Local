@@ -13,6 +13,11 @@ vi.mock('./useModal', () => ({
   useModal: () => ({ confirm: mockModalConfirm, alert: mockModalAlert })
 }))
 
+const mockDialogsConfirm = vi.hoisted(() => vi.fn())
+vi.mock('./useDialogs', () => ({
+  useDialogs: () => ({ confirm: mockDialogsConfirm })
+}))
+
 const mockCheckBeforeAction = vi.hoisted(() => vi.fn())
 vi.mock('./useActionGuard', () => ({
   useActionGuard: () => ({ checkBeforeAction: mockCheckBeforeAction })
@@ -73,6 +78,7 @@ describe('useListAction — desktop launch interceptor', () => {
   beforeEach(() => {
     sessionState.running.clear()
     sessionState.errorCleared.length = 0
+    mockDialogsConfirm.mockReset()
     mockModalConfirm.mockReset()
     mockModalAlert.mockReset()
     mockCheckBeforeAction.mockReset().mockResolvedValue(true)
@@ -80,8 +86,8 @@ describe('useListAction — desktop launch interceptor', () => {
     mockRunAction.mockReset()
   })
 
-  it('on confirm: emits show-progress with an apiCall that chains migrate → launch', async () => {
-    mockModalConfirm.mockResolvedValueOnce(true)
+  it('on migrate: emits show-progress with an apiCall that chains migrate → launch', async () => {
+    mockDialogsConfirm.mockResolvedValueOnce('primary')
     mockRunAction
       .mockResolvedValueOnce({ ok: true, newInstallationId: 'inst-adopted-1' }) // migrate-to-standalone
       .mockResolvedValueOnce({ ok: true }) // launch on adopted
@@ -91,9 +97,13 @@ describe('useListAction — desktop launch interceptor', () => {
 
     await executeAction(makeInstall({ adopted: false }), launchAction)
 
-    expect(mockModalConfirm).toHaveBeenCalledWith(
+    // Migrating is offered as an option next to launching the original app, never forced.
+    expect(mockDialogsConfirm).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: 'desktop.migrateBeforeLaunchTitle'
+        title: 'desktop.migrateBeforeLaunchTitle',
+        confirmLabel: 'desktop.migrateBeforeLaunchConfirm',
+        secondaryLabel: 'desktop.launchLegacyApp',
+        showCancel: true
       })
     )
     expect(showProgress).toHaveBeenCalledOnce()
@@ -104,8 +114,27 @@ describe('useListAction — desktop launch interceptor', () => {
     expect(apiResult).toEqual({ ok: true })
   })
 
+  it('on launch-as-is: skips migration and runs the normal launch on the same install', async () => {
+    mockDialogsConfirm.mockResolvedValueOnce('secondary')
+    mockRunAction.mockResolvedValueOnce({ ok: true })
+    const showProgress = vi.fn()
+    const { executeAction } = useListAction('chooser', { showProgress })
+
+    await executeAction(makeInstall({ adopted: false }), {
+      ...launchAction,
+      showProgress: true,
+      progressTitle: 'Launch'
+    })
+
+    expect(showProgress).toHaveBeenCalledOnce()
+    const opts = showProgress.mock.calls[0]![0] as { apiCall: () => Promise<unknown> }
+    await opts.apiCall()
+    expect(mockRunAction).toHaveBeenCalledOnce()
+    expect(mockRunAction).toHaveBeenCalledWith('inst-1', 'launch')
+  })
+
   it('on cancel: emits nothing — neither migrate nor launch run', async () => {
-    mockModalConfirm.mockResolvedValueOnce(false)
+    mockDialogsConfirm.mockResolvedValueOnce(false)
     const showProgress = vi.fn()
     const { executeAction } = useListAction('chooser', { showProgress })
 
@@ -125,7 +154,7 @@ describe('useListAction — desktop launch interceptor', () => {
       progressTitle: 'Launch'
     })
 
-    expect(mockModalConfirm).not.toHaveBeenCalled()
+    expect(mockDialogsConfirm).not.toHaveBeenCalled()
     expect(showProgress).toHaveBeenCalledOnce()
     const opts = showProgress.mock.calls[0]![0] as { apiCall: () => Promise<unknown> }
     void opts.apiCall()
@@ -141,12 +170,12 @@ describe('useListAction — desktop launch interceptor', () => {
       showProgress: true
     })
 
-    expect(mockModalConfirm).not.toHaveBeenCalled()
+    expect(mockDialogsConfirm).not.toHaveBeenCalled()
     expect(showProgress).toHaveBeenCalledOnce()
   })
 
   it('apiCall short-circuits if migrate fails — does not attempt launch', async () => {
-    mockModalConfirm.mockResolvedValueOnce(true)
+    mockDialogsConfirm.mockResolvedValueOnce('primary')
     mockRunAction.mockResolvedValueOnce({ ok: false, message: 'no-legacy-install' })
 
     const showProgress = vi.fn()

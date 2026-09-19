@@ -1,5 +1,6 @@
 import { useI18n } from 'vue-i18n'
 import { useModal } from './useModal'
+import { useDialogs } from './useDialogs'
 import { useActionGuard } from './useActionGuard'
 import { useLocalInstanceGuard } from './useLocalInstanceGuard'
 import { useSessionStore } from '../stores/sessionStore'
@@ -30,6 +31,7 @@ export interface ListActionInvocationHooks {
 export function useListAction(uiSurface: string, callbacks: ListActionCallbacks) {
   const { t } = useI18n()
   const modal = useModal()
+  const dialogs = useDialogs()
   const actionGuard = useActionGuard()
   const localInstanceGuard = useLocalInstanceGuard()
   const sessionStore = useSessionStore()
@@ -95,17 +97,21 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
       }
     }
 
-    // Launching a not-yet-adopted Legacy Desktop install runs a
-    // migrate-then-launch chain (adoption is the prerequisite). Skips
-    // onGuardsPassed since the launch targets the freshly-adopted install.
+    // A not-yet-adopted Legacy Desktop install offers a choice: migrate (adopt it in place, then
+    // launch inside Comfy Desktop) or launch the original app as-is. Migrating is optional. Skips
+    // onGuardsPassed on the migrate path since the launch targets the freshly-adopted install.
     if (action.id === 'launch' && inst.sourceId === 'desktop' && !inst.adopted) {
-      const confirmed = await modal.confirm({
+      const choice = await dialogs.confirm({
         title: t('desktop.migrateBeforeLaunchTitle'),
         message: t('desktop.migrateBeforeLaunchMessage'),
+        hint: t('desktop.migrateBeforeLaunchHint'),
         confirmLabel: t('desktop.migrateBeforeLaunchConfirm'),
-        confirmStyle: 'primary'
+        secondaryLabel: t('desktop.launchLegacyApp'),
+        cancelLabel: t('common.cancel'),
+        tone: 'primary',
+        showCancel: true
       })
-      if (!confirmed) {
+      if (choice === false) {
         emitTelemetryAction('comfy.desktop.action.result', {
           action_id: action.id,
           result: 'cancelled',
@@ -113,25 +119,28 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
         })
         return
       }
-      sessionStore.clearErrorInstance(inst.id)
-      emitTelemetryAction('comfy.desktop.action.invoked', {
-        action_id: action.id,
-        ...telemetryContext
-      })
-      callbacks.showProgress({
-        installationId: inst.id,
-        title: `${t('desktop.migrating')} — ${inst.name}`,
-        apiCall: async () => {
-          const migrateResult = await window.api.runAction(inst.id, 'migrate-to-standalone')
-          if (!migrateResult.ok || !migrateResult.newInstallationId) return migrateResult
-          // Launch the adopted install in the same overlay (continuous flow).
-          return window.api.runAction(migrateResult.newInstallationId, 'launch')
-        },
-        cancellable: true,
-        triggersInstanceStart: true,
-        opKind: 'launch'
-      })
-      return
+      if (choice === 'primary') {
+        sessionStore.clearErrorInstance(inst.id)
+        emitTelemetryAction('comfy.desktop.action.invoked', {
+          action_id: action.id,
+          ...telemetryContext
+        })
+        callbacks.showProgress({
+          installationId: inst.id,
+          title: `${t('desktop.migrating')} — ${inst.name}`,
+          apiCall: async () => {
+            const migrateResult = await window.api.runAction(inst.id, 'migrate-to-standalone')
+            if (!migrateResult.ok || !migrateResult.newInstallationId) return migrateResult
+            // Launch the adopted install in the same overlay (continuous flow).
+            return window.api.runAction(migrateResult.newInstallationId, 'launch')
+          },
+          cancellable: true,
+          triggersInstanceStart: true,
+          opKind: 'launch'
+        })
+        return
+      }
+      // 'secondary': fall through to the normal launch, which starts the original Desktop app.
     }
 
     // Past all cancel-paths; cancel-sensitive side effects go in this hook.

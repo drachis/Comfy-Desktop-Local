@@ -83,6 +83,11 @@ export const desktop: SourcePlugin = {
     }
   },
 
+  getLaunchUnavailableMessage(installation: InstallationRecord): string | null {
+    const execPath = (installation.desktopExePath as string | undefined) || findDesktopExecutable()
+    return execPath && fs.existsSync(execPath) ? null : t('desktop.legacyAppMissing')
+  },
+
   getTerminalEnv(installation: InstallationRecord): TerminalEnv {
     // A legacy Desktop (v1) install keeps its venv at `<installPath>/.venv`
     // (Legacy Desktop pip-installs its own uv there) and has no bundled

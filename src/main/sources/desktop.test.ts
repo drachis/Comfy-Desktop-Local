@@ -62,6 +62,29 @@ describe('desktop.getLaunchCommand', () => {
   })
 })
 
+describe('desktop.getLaunchUnavailableMessage', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const install = (desktopExePath: string) =>
+    ({ desktopExePath }) as unknown as Parameters<typeof desktop.getLaunchCommand>[0]
+
+  it('explains that the original app is missing when its executable does not exist', () => {
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false)
+
+    expect(desktop.getLaunchUnavailableMessage!(install('/missing/ComfyUI.app'))).toBe(
+      'desktop.legacyAppMissing'
+    )
+  })
+
+  it('reports nothing when the original app is present', () => {
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true)
+
+    expect(desktop.getLaunchUnavailableMessage!(install('/Applications/ComfyUI.app'))).toBeNull()
+  })
+})
+
 describe('desktop.probeInstallation', () => {
   let existsSyncSpy: MockInstance
 
