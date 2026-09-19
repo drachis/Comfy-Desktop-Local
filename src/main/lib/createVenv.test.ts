@@ -114,19 +114,16 @@ describe('createVenv', () => {
   const run = (torchChoice = 'auto', bootstrapDir: string | null = null) =>
     createVenv({ installPath: tmp, comfyDir: tmp, torchChoice, tools, bootstrapDir })
 
-  describe('with the Python bundled in Desktop', () => {
+  describe('with the uv bundled in Desktop', () => {
     let bootstrap: string
     const win = process.platform === 'win32'
-    const python = () =>
-      win ? path.join(bootstrap, 'python.exe') : path.join(bootstrap, 'bin', 'python3')
     const uv = () => (win ? path.join(bootstrap, 'uv.exe') : path.join(bootstrap, 'bin', 'uv'))
     const venvPython = () =>
       win ? path.join(venvDir(), 'Scripts', 'python.exe') : path.join(venvDir(), 'bin', 'python')
 
     beforeEach(() => {
       bootstrap = fs.mkdtempSync(path.join(os.tmpdir(), 'bootstrap-'))
-      fs.mkdirSync(path.dirname(python()), { recursive: true })
-      fs.writeFileSync(python(), '')
+      fs.mkdirSync(path.dirname(uv()), { recursive: true })
       fs.writeFileSync(uv(), '')
     })
 
@@ -134,7 +131,7 @@ describe('createVenv', () => {
       fs.rmSync(bootstrap, { recursive: true, force: true })
     })
 
-    it('builds the venv and installs with the bundled uv, not the system Python', async () => {
+    it('builds the venv from a full managed Python, never the trimmed bundled one, then verifies it', async () => {
       mocks.detectNvidiaDriverVersion.mockResolvedValue('570.1')
 
       const result = await run('auto', bootstrap)
@@ -142,7 +139,7 @@ describe('createVenv', () => {
       expect(result).toEqual({ ok: true, navigate: 'detail', venvPath: venvDir() })
       const calls = mocks.runLoggedProcess.mock.calls.map(([cmd, args]) => [cmd, args])
       expect(calls).toEqual([
-        [uv(), ['venv', '--python', python(), venvDir()]],
+        [uv(), ['venv', '--managed-python', '--python', '3.12', '--clear', venvDir()]],
         [
           uv(),
           [
@@ -160,7 +157,8 @@ describe('createVenv', () => {
         [
           uv(),
           ['pip', 'install', '--python', venvPython(), '-r', path.join(tmp, 'requirements.txt')]
-        ]
+        ],
+        [venvPython(), ['-c', 'import torch']]
       ])
     })
 
@@ -187,7 +185,7 @@ describe('createVenv', () => {
 
     expect(result).toEqual({ ok: true, navigate: 'detail', venvPath: venvDir() })
     const calls = mocks.runLoggedProcess.mock.calls.map(([cmd, args]) => [cmd, args])
-    expect(calls).toHaveLength(3)
+    expect(calls).toHaveLength(4)
     expect(calls[0]![1]).toEqual([
       ...(process.platform === 'win32' ? ['-3'] : []),
       '-m',
@@ -205,6 +203,21 @@ describe('createVenv', () => {
       'https://download.pytorch.org/whl/cu128'
     ])
     expect(calls[2]![1]).toEqual(['-m', 'pip', 'install', '-r', path.join(tmp, 'requirements.txt')])
+    expect(calls[3]![1]).toEqual(['-c', 'import torch'])
+  })
+
+  it('fails at creation, not at launch, when PyTorch cannot be imported in the new venv', async () => {
+    const ok = { exitCode: 0, stdout: '', stderr: '' }
+    mocks.runLoggedProcess
+      .mockResolvedValueOnce(ok)
+      .mockResolvedValueOnce(ok)
+      .mockResolvedValueOnce(ok)
+      .mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: 'No module named unittest' })
+
+    const result = await run()
+
+    expect(result).toMatchObject({ ok: false, message: 'git.envVerifyFailed' })
+    expect(result.venvPath).toBeUndefined()
   })
 
   it('uses the default PyPI wheels when no NVIDIA GPU is found', async () => {

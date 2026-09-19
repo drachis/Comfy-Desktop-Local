@@ -83,20 +83,18 @@ export function resolveTorchIndex(choice: string, nvidiaPresent: boolean): Torch
   return { ok: false }
 }
 
-export interface BootstrapPython {
-  python: string
-  uv: string
-}
+/** The full CPython that uv downloads for the venv (3.12 has the widest custom node support). */
+export const MANAGED_PYTHON_VERSION = '3.12'
 
-/** The Python + uv shipped inside Comfy Desktop (resources/bootstrap-python). Null when absent. */
-export function findBootstrapPython(
-  dir: string | null = defaultBootstrapDir()
-): BootstrapPython | null {
+/**
+ * The uv shipped inside Comfy Desktop (resources/bootstrap-python), or null when absent.
+ * Only uv is used from that folder: its bundled Python is a trimmed build with no unittest or
+ * sqlite3, so PyTorch cannot import in a venv made from it.
+ */
+export function findBundledUv(dir: string | null = defaultBootstrapDir()): string | null {
   if (!dir) return null
-  const win = process.platform === 'win32'
-  const python = win ? path.join(dir, 'python.exe') : path.join(dir, 'bin', 'python3')
-  const uv = win ? path.join(dir, 'uv.exe') : path.join(dir, 'bin', 'uv')
-  return fs.existsSync(python) && fs.existsSync(uv) ? { python, uv } : null
+  const uv = process.platform === 'win32' ? path.join(dir, 'uv.exe') : path.join(dir, 'bin', 'uv')
+  return fs.existsSync(uv) ? uv : null
 }
 
 function defaultBootstrapDir(): string {
@@ -118,10 +116,13 @@ interface Toolchain {
   pipInstall(venvPython: string, args: string[]): Command
 }
 
-/** The bundled Python has no `venv` module, but uv builds a venv from any interpreter. */
-function uvToolchain({ python, uv }: BootstrapPython): Toolchain {
+/** uv fetches a managed Python if needed; `--clear` replaces a venv that is already there. */
+function uvToolchain(uv: string): Toolchain {
   return {
-    createVenv: (venvDir) => ({ cmd: uv, args: ['venv', '--python', python, venvDir] }),
+    createVenv: (venvDir) => ({
+      cmd: uv,
+      args: ['venv', '--managed-python', '--python', MANAGED_PYTHON_VERSION, '--clear', venvDir]
+    }),
     pipInstall: (venvPython, args) => ({
       cmd: uv,
       args: ['pip', 'install', '--python', venvPython, ...args]
@@ -148,7 +149,7 @@ export interface CreateVenvOptions {
   comfyDir: string
   torchChoice: string
   tools: Pick<ActionTools, 'sendProgress' | 'sendOutput'>
-  /** Override where Desktop's bundled Python lives; `null` means none. Defaults to the app's own. */
+  /** Override where Desktop's bundled uv lives; `null` means none. Defaults to the app's own. */
   bootstrapDir?: string | null
 }
 
@@ -167,14 +168,9 @@ export async function createVenv(
   if (!torch.ok) return { ok: false, message: t('git.invalidTorchBackend') }
 
   tools.sendProgress('python', { percent: -1, status: t('git.findingPython') })
-  const bootstrap =
-    opts.bootstrapDir === undefined ? findBootstrapPython() : findBootstrapPython(opts.bootstrapDir)
-  const systemPython = bootstrap ? null : await findBasePython()
-  const toolchain = bootstrap
-    ? uvToolchain(bootstrap)
-    : systemPython
-      ? systemToolchain(systemPython)
-      : null
+  const uv = opts.bootstrapDir === undefined ? findBundledUv() : findBundledUv(opts.bootstrapDir)
+  const systemPython = uv ? null : await findBasePython()
+  const toolchain = uv ? uvToolchain(uv) : systemPython ? systemToolchain(systemPython) : null
   if (!toolchain) return { ok: false, message: t('git.pythonNotFound') }
 
   const venvDir = path.join(installPath, '.venv')
@@ -214,6 +210,15 @@ export async function createVenv(
         t('git.requirementsInstallFailed', { code: reqResult.exitCode }),
         reqResult
       )
+    }
+  }
+
+  tools.sendProgress('verify', { percent: -1, status: t('git.verifyingEnv') })
+  const verify = await run({ cmd: venvPython, args: ['-c', 'import torch'] })
+  if (verify.exitCode !== 0) {
+    return {
+      ok: false,
+      message: formatProcessError(t('git.envVerifyFailed', { code: verify.exitCode }), verify)
     }
   }
 

@@ -145,3 +145,66 @@ describe('git create-venv action', () => {
     expect(sections.flatMap((s) => s.actions ?? []).map((a) => a.id)).toContain('create-venv')
   })
 })
+
+describe('git venv built from the trimmed bootstrap Python', () => {
+  let tmp: string
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'git-trimmed-venv-'))
+    fs.writeFileSync(path.join(tmp, 'main.py'), '')
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
+  function makeVenvWithHome(home: string): string {
+    const venv = path.join(tmp, '.venv')
+    makeVenv(venv)
+    fs.writeFileSync(
+      path.join(venv, 'pyvenv.cfg'),
+      `home = ${home}
+implementation = CPython
+`
+    )
+    return venv
+  }
+
+  const trimmedHome = path.join('C:', 'Apps', 'Comfy Desktop', 'resources', 'bootstrap-python')
+
+  it('explains the venv cannot run PyTorch instead of failing at launch', () => {
+    const venv = makeVenvWithHome(trimmedHome)
+
+    expect(gitSource.getLaunchUnavailableMessage!(makeInstall(tmp, { venvPath: venv }))).toBe(
+      'git.venvNeedsRebuild'
+    )
+  })
+
+  it('offers Recreate Python environment as the setup action', () => {
+    const venv = makeVenvWithHome(trimmedHome)
+
+    expect(gitSource.getSetupAction!(makeInstall(tmp, { venvPath: venv }))).toEqual({
+      id: 'create-venv',
+      label: 'git.recreateVenv'
+    })
+  })
+
+  it('leaves a venv built from a normal Python alone', () => {
+    const venv = makeVenvWithHome(path.join('C:', 'Python312'))
+    const install = makeInstall(tmp, { venvPath: venv })
+
+    expect(gitSource.getSetupAction!(install)).toBeNull()
+    expect(gitSource.getLaunchUnavailableMessage!(install)).toBeNull()
+  })
+
+  it('lets a working install recreate its environment from Manage on purpose', () => {
+    const venv = makeVenvWithHome(path.join('C:', 'Python312'))
+    const sections = gitSource.getDetailSections!(makeInstall(tmp, { venvPath: venv })) as {
+      actions?: { id: string; label: string }[]
+    }[]
+
+    expect(sections.flatMap((s) => s.actions ?? [])).toContainEqual(
+      expect.objectContaining({ id: 'create-venv', label: 'git.recreateVenv' })
+    )
+  })
+})

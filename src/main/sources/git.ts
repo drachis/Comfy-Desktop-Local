@@ -87,29 +87,49 @@ function resolveVenvPython(installation: InstallationRecord): string | null {
   return null
 }
 
-/** A tracked ComfyUI folder that can't launch only because it has no venv yet. */
-function canCreateVenv(installation: InstallationRecord): boolean {
-  return (
-    installation.status === 'installed' &&
-    !resolveVenvPython(installation) &&
-    findMainPy(installation.installPath) !== null
-  )
+/** True when the venv was built from Desktop's trimmed bootstrap Python, which lacks stdlib
+ *  modules (unittest, sqlite3) that PyTorch needs, so it can never launch ComfyUI. */
+function venvUsesTrimmedPython(installation: InstallationRecord): boolean {
+  const venvPath = installation.venvPath as string | undefined
+  if (!venvPath) return false
+  try {
+    const cfg = fs.readFileSync(path.join(venvPath, 'pyvenv.cfg'), 'utf-8')
+    const home = cfg.match(/^home\s*=\s*(.+)$/m)?.[1] ?? ''
+    return /[\\/]bootstrap-python([\\/]|\s*$)/i.test(home)
+  } catch {
+    return false
+  }
 }
 
-function createVenvAction(): Record<string, unknown> {
+type VenvSetup = 'create' | 'recreate' | null
+
+/** Which setup step a tracked ComfyUI folder needs before it can launch, if any. */
+function venvSetupNeeded(installation: InstallationRecord): VenvSetup {
+  if (installation.status !== 'installed' || findMainPy(installation.installPath) === null) {
+    return null
+  }
+  if (!resolveVenvPython(installation)) return 'create'
+  return venvUsesTrimmedPython(installation) ? 'recreate' : null
+}
+
+function createVenvAction(recreate: boolean, highlight: boolean): Record<string, unknown> {
   return {
     id: 'create-venv',
-    label: t('git.createVenv'),
-    style: 'primary',
+    label: recreate ? t('git.recreateVenv') : t('git.createVenv'),
+    style: highlight ? 'primary' : 'default',
     enabled: true,
     showProgress: true,
     progressTitle: t('git.creatingVenv'),
     prompt: {
       field: 'torch',
-      title: t('git.createVenvTitle'),
-      message: t('git.createVenvMessage'),
+      title: recreate ? t('git.recreateVenvConfirmTitle') : t('git.createVenvTitle'),
+      message: recreate
+        ? `${t('git.recreateVenvConfirmMessage')}
+
+${t('git.createVenvMessage')}`
+        : t('git.createVenvMessage'),
       defaultValue: TORCH_BACKEND_AUTO,
-      confirmLabel: t('git.createVenvConfirm'),
+      confirmLabel: recreate ? t('git.recreateVenv') : t('git.createVenvConfirm'),
       required: true
     }
   }
@@ -269,11 +289,17 @@ export const gitSource: SourcePlugin = {
   },
 
   getSetupAction(installation: InstallationRecord): { id: string; label: string } | null {
-    return canCreateVenv(installation) ? { id: 'create-venv', label: t('git.createVenv') } : null
+    const setup = venvSetupNeeded(installation)
+    if (!setup) return null
+    return {
+      id: 'create-venv',
+      label: setup === 'recreate' ? t('git.recreateVenv') : t('git.createVenv')
+    }
   },
 
   getLaunchUnavailableMessage(installation: InstallationRecord): string | null {
     if (!resolveVenvPython(installation)) return t('git.noVenv')
+    if (venvUsesTrimmedPython(installation)) return t('git.venvNeedsRebuild')
     if (!findMainPy(installation.installPath)) return t('git.noMainPy')
     return null
   },
@@ -283,9 +309,10 @@ export const gitSource: SourcePlugin = {
     const unavailable = gitSource.getLaunchUnavailableMessage!(installation)
     const canLaunch = installed && unavailable === null
     const disabledMsg = !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
+    const setup = venvSetupNeeded(installation)
     return [
       launchAction(canLaunch, disabledMsg),
-      ...(canCreateVenv(installation) ? [createVenvAction()] : [])
+      ...(setup ? [createVenvAction(setup === 'recreate', true)] : [])
     ]
   },
 
@@ -293,6 +320,7 @@ export const gitSource: SourcePlugin = {
     const installed = installation.status === 'installed'
     const unavailable = gitSource.getLaunchUnavailableMessage!(installation)
     const canLaunch = installed && unavailable === null
+    const setup = venvSetupNeeded(installation)
 
     const venvPath = installation.venvPath as string | undefined
 
@@ -345,7 +373,9 @@ export const gitSource: SourcePlugin = {
             canLaunch,
             !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
           ),
-          ...(canCreateVenv(installation) ? [createVenvAction()] : []),
+          ...(installed && findMainPy(installation.installPath)
+            ? [createVenvAction(setup !== 'create', setup !== null)]
+            : []),
           renameAction(installation.name),
           openFolderAction(installation.installPath),
           {
