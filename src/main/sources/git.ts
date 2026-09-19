@@ -115,6 +115,52 @@ function readComfyVersion(mainPy: string): string | null {
   }
 }
 
+/** What Add Existing Instance records for a folder: git details when there is a repo, else the
+ *  ComfyUI version, plus any venv sitting next to it. Every field is best-effort. */
+function readTrackInfo(
+  dirPath: string,
+  gitDir: string | null,
+  mainPy: string | null
+): Record<string, unknown> {
+  const info: Record<string, unknown> = { version: 'unknown', repo: '', branch: '', commit: '' }
+
+  if (gitDir) {
+    // Extract branch name from HEAD
+    try {
+      const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim()
+      const branchMatch = head.match(/^ref: refs\/heads\/(.+)$/)
+      if (branchMatch && branchMatch[1]) {
+        info.branch = branchMatch[1]
+      }
+    } catch {
+      // ignore — partial info is fine
+    }
+
+    // Resolve commit SHA via readGitHead (handles refs, packed-refs, detached HEAD)
+    const commit = readGitHead(dirPath)
+    if (commit) {
+      info.commit = commit
+      info.version = commit.slice(0, 8)
+    }
+
+    // Read remote URL via readGitRemoteUrl (handles credential redaction)
+    const remoteUrl = readGitRemoteUrl(dirPath)
+    if (remoteUrl) info.repo = remoteUrl
+  } else if (mainPy) {
+    const comfyVersion = readComfyVersion(mainPy)
+    if (comfyVersion) info.version = comfyVersion
+  }
+
+  const venv = findVenv(dirPath)
+  if (venv) {
+    info.venvPath = venv
+    info.venvName = path.basename(venv)
+  }
+  info.launchMode = DEFAULT_GIT_SETTINGS.launchMode
+  info.browserPartition = DEFAULT_GIT_SETTINGS.browserPartition
+  return info
+}
+
 export const gitSource: SourcePlugin = {
   id: 'git',
   get label() {
@@ -285,43 +331,11 @@ export const gitSource: SourcePlugin = {
     const mainPy = findMainPy(dirPath)
     // A plain ComfyUI folder (zip download, copied tree) has no .git but runs the same way.
     if (!gitDir && !mainPy) return null
-    const info: Record<string, unknown> = { version: 'unknown', repo: '', branch: '', commit: '' }
+    return readTrackInfo(dirPath, gitDir, mainPy)
+  },
 
-    if (gitDir) {
-      // Extract branch name from HEAD
-      try {
-        const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim()
-        const branchMatch = head.match(/^ref: refs\/heads\/(.+)$/)
-        if (branchMatch && branchMatch[1]) {
-          info.branch = branchMatch[1]
-        }
-      } catch {
-        // ignore — partial info is fine
-      }
-
-      // Resolve commit SHA via readGitHead (handles refs, packed-refs, detached HEAD)
-      const commit = readGitHead(dirPath)
-      if (commit) {
-        info.commit = commit
-        info.version = commit.slice(0, 8)
-      }
-
-      // Read remote URL via readGitRemoteUrl (handles credential redaction)
-      const remoteUrl = readGitRemoteUrl(dirPath)
-      if (remoteUrl) info.repo = remoteUrl
-    } else if (mainPy) {
-      const comfyVersion = readComfyVersion(mainPy)
-      if (comfyVersion) info.version = comfyVersion
-    }
-
-    const venv = findVenv(dirPath)
-    if (venv) {
-      info.venvPath = venv
-      info.venvName = path.basename(venv)
-    }
-    info.launchMode = DEFAULT_GIT_SETTINGS.launchMode
-    info.browserPartition = DEFAULT_GIT_SETTINGS.browserPartition
-    return info
+  buildManualTrackInfo(dirPath: string): Record<string, unknown> {
+    return readTrackInfo(dirPath, resolveGitDir(dirPath), findMainPy(dirPath))
   },
 
   async handleAction(

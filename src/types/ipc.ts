@@ -553,6 +553,9 @@ export interface ModelsField {
 // --- Probe types ---
 export interface ProbeResult {
   sourceLabel: string
+  /** False for a type offered as a manual choice because detection did not recognize the folder.
+   *  Absent means detected. Never persisted onto the install record. */
+  detected?: boolean
   version?: string
   repo?: string
   branch?: string

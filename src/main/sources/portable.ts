@@ -350,6 +350,16 @@ export const portable: SourcePlugin = {
     }
   },
 
+  buildManualTrackInfo(): Record<string, unknown> {
+    return {
+      version: 'unknown',
+      asset: '',
+      launchArgs: DEFAULT_LAUNCH_ARGS,
+      launchMode: 'window',
+      browserPartition: 'unique'
+    }
+  },
+
   async handleAction(
     actionId: string,
     installation: InstallationRecord,

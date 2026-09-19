@@ -159,6 +159,9 @@ export interface SourcePlugin {
   probeInstallation(
     dirPath: string
   ): Record<string, unknown> | null | Promise<Record<string, unknown> | null>
+  /** Record to track a folder as this type when `probeInstallation` did not recognize it. Defining it
+   *  offers the type in Add Existing Instance as a manual choice; the install may not launch. */
+  buildManualTrackInfo?(dirPath: string): Record<string, unknown>
   handleAction(
     actionId: string,
     installation: InstallationRecord,

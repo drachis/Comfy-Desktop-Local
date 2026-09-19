@@ -37,6 +37,7 @@ import * as releaseCache from '../release-cache'
 import { runStartupReleaseChecks } from '../release-cache-startup'
 import { _broadcastToRenderer } from './shared'
 import { hasGitDir } from '../git'
+import { probeInstallDir } from '../probeInstallDir'
 import { parseUrl } from '../util'
 import { restoreSnapshotIntoInstallation } from '../standaloneMigration'
 import * as mainTelemetry from '../telemetry'
@@ -242,18 +243,9 @@ export function registerInstallationHandlers(): void {
     await installations.reorder(orderedIds)
   })
 
-  ipcMain.handle('probe-installation', async (_event, dirPath: string) => {
-    const results: Record<string, unknown>[] = []
-    for (const source of sources) {
-      if (source.probeInstallation) {
-        const data = await source.probeInstallation(dirPath)
-        if (data) {
-          results.push({ sourceId: source.id, sourceLabel: source.label, ...data })
-        }
-      }
-    }
-    return results
-  })
+  ipcMain.handle('probe-installation', (_event, dirPath: string) =>
+    probeInstallDir(sources, dirPath)
+  )
 
   ipcMain.handle('track-installation', async (_event, data: Record<string, unknown>) => {
     const duplicate = await findDuplicatePath(data.installPath as string)

@@ -70,4 +70,18 @@ describe('git probeInstallation', () => {
 
     expect(await gitSource.probeInstallation!(tmp)).toBeNull()
   })
+
+  it('builds a manual record for a folder detection did not recognize', () => {
+    fs.mkdirSync(path.join(tmp, 'venv'))
+    fs.writeFileSync(path.join(tmp, 'venv', 'pyvenv.cfg'), '')
+
+    expect(gitSource.buildManualTrackInfo!(tmp)).toMatchObject({
+      version: 'unknown',
+      repo: '',
+      branch: '',
+      commit: '',
+      venvPath: path.join(tmp, 'venv'),
+      launchMode: 'window'
+    })
+  })
 })

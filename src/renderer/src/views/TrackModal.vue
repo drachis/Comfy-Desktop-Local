@@ -114,9 +114,8 @@ async function probe(dirPath: string): Promise<void> {
   // Stale response from an earlier path — drop it.
   if (generation !== probeGeneration) return
   probeResults.value = results
-  if (results.length > 0) {
-    selectedProbe.value = results[0] ?? null
-  }
+  // Manual-only types (`detected: false`) are choices, never a default: the user opts in.
+  selectedProbe.value = results.find(isDetected) ?? null
 }
 
 function onProbeSelect(value: string): void {
@@ -125,8 +124,15 @@ function onProbeSelect(value: string): void {
   venvOverride.value = null
 }
 
+function isDetected(probe: ProbeResult): boolean {
+  return probe.detected !== false
+}
+
 const probeOptions = computed<BaseSelectOption[]>(() =>
-  probeResults.value.map((r, i) => ({ value: String(i), label: r.sourceLabel }))
+  probeResults.value.map((r, i) => ({
+    value: String(i),
+    label: isDetected(r) ? r.sourceLabel : `${r.sourceLabel} (${t('track.notDetectedSuffix')})`
+  }))
 )
 
 const selectedProbeValue = computed(() => {
@@ -137,9 +143,20 @@ const selectedProbeValue = computed(() => {
 
 const selectPlaceholder = computed(() => {
   if (probing.value) return t('track.detecting')
-  if (probeResults.value.length > 0) return ''
+  if (probeResults.value.length > 0)
+    return probeResults.value.some(isDetected) ? '' : t('track.pickType')
   return trackPath.value ? t('track.noDetected') : t('track.browseDirFirst')
 })
+
+/** Nothing to choose between when there is no result, or exactly one that was already detected. */
+const selectDisabled = computed(
+  () =>
+    probing.value ||
+    probeResults.value.length === 0 ||
+    (probeResults.value.length === 1 && isDetected(probeResults.value[0]!))
+)
+
+const forcedType = computed(() => !!selectedProbe.value && !isDetected(selectedProbe.value))
 
 interface DetailFieldEntry {
   label: string
@@ -193,6 +210,7 @@ async function handleSave(): Promise<void> {
   const name = trackName.value.trim() || DEFAULT_INSTALL_NAME
 
   const rawProbe = JSON.parse(JSON.stringify(toRaw(selectedProbe.value))) as Record<string, unknown>
+  delete rawProbe.detected
   if (venvOverride.value !== null) {
     rawProbe.venvPath = venvOverride.value
   }
@@ -284,11 +302,15 @@ defineExpose({ open })
               :model-value="selectedProbeValue"
               :options="probeOptions"
               :placeholder="selectPlaceholder"
-              :disabled="probing || probeResults.length <= 1"
+              :disabled="selectDisabled"
               :aria-label="$t('track.detectedType')"
               @update:model-value="onProbeSelect"
             />
           </div>
+
+          <p v-if="forcedType" class="track-hint" data-testid="track-forced-type-hint">
+            {{ $t('track.notDetectedWarning') }}
+          </p>
 
           <div v-if="detailFields.length > 0" class="brand-summary">
             <div v-for="field in detailFields" :key="field.label" class="brand-summary__row">

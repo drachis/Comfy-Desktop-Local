@@ -3,6 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createI18n } from 'vue-i18n'
 
 import TrackModal from './TrackModal.vue'
+import { BaseSelect } from '../components/ui'
 import type { ProbeResult } from '../types/ipc'
 
 /**
@@ -37,6 +38,9 @@ const messages = {
       browseDirFirst: 'Browse to a directory first',
       detecting: 'Detecting',
       noDetected: 'No known install detected',
+      notDetectedSuffix: 'not detected',
+      pickType: 'Nothing detected. Choose a type',
+      notDetectedWarning: 'Does not look like this type; may not launch.',
       trackInstallation: 'Track Install',
       cannotTrack: 'Cannot Track',
       version: 'Version',
@@ -215,6 +219,74 @@ describe('TrackModal — missing venv explanation', () => {
     })
 
     expect(wrapper.find('[data-testid="track-venv-hint"]').exists()).toBe(false)
+  })
+})
+
+describe('TrackModal — manual type choice', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const manualGit: ProbeResult = {
+    sourceId: 'git',
+    sourceLabel: 'Git Clone',
+    detected: false,
+    version: 'unknown'
+  }
+
+  async function browseWithResults(results: ProbeResult[]) {
+    const api = installMockApi({
+      browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI'),
+      probeInstallation: vi.fn().mockResolvedValue(results)
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    await wrapper.get('button.brand-tertiary').trigger('click')
+    await flushPromises()
+    return { api, wrapper }
+  }
+
+  it('does not pre-select a manual-only type, so Track Install stays disabled', async () => {
+    const { wrapper } = await browseWithResults([manualGit])
+
+    expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+    const select = wrapper.findComponent(BaseSelect)
+    expect(select.props('placeholder')).toBe('Nothing detected. Choose a type')
+    expect(select.props('disabled')).toBe(false)
+  })
+
+  it('labels manual types as not detected in the dropdown', async () => {
+    const { wrapper } = await browseWithResults([gitProbe, { ...manualGit, sourceId: 'portable' }])
+
+    const labels = (wrapper.findComponent(BaseSelect).props('options') as { label: string }[]).map(
+      (o) => o.label
+    )
+    expect(labels).toEqual(['Git', 'Git Clone (not detected)'])
+  })
+
+  it('still pre-selects a detected type ahead of manual ones', async () => {
+    const { wrapper } = await browseWithResults([gitProbe, manualGit])
+
+    expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-testid="track-forced-type-hint"]').exists()).toBe(false)
+  })
+
+  it('warns and enables tracking once the user picks a manual type, without saving the flag', async () => {
+    const { api, wrapper } = await browseWithResults([manualGit])
+
+    wrapper.findComponent(BaseSelect).vm.$emit('update:modelValue', '0')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="track-forced-type-hint"]').text()).toContain('may not launch')
+    expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
+
+    await trackButton(wrapper).trigger('click')
+    await flushPromises()
+
+    const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
+    expect(data).toMatchObject({ sourceId: 'git', installPath: '/Users/jo/ComfyUI' })
+    expect(data).not.toHaveProperty('detected')
   })
 })
 
