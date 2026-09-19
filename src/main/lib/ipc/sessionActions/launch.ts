@@ -932,7 +932,10 @@ async function runLaunch(
   const launchStartedAt = Date.now()
   const launchCmdRaw = source.getLaunchCommand(inst)
   if (!launchCmdRaw) {
-    return { ok: false, message: i18n.t('errors.noEnvFound') }
+    return {
+      ok: false,
+      message: source.getLaunchUnavailableMessage?.(inst) ?? i18n.t('errors.noEnvFound')
+    }
   }
   const launchCmd = launchCmdRaw
 

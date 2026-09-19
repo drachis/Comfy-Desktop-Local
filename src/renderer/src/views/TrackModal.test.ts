@@ -23,7 +23,11 @@ const messages = {
       namePlaceholder: 'e.g. ComfyUI Main',
       backToDashboard: 'Back to Dashboard'
     },
-    git: { venv: 'Virtual Environment', venvNotFound: 'Not found' },
+    git: {
+      venv: 'Virtual Environment',
+      venvNotFound: 'Not found',
+      venvHint: 'No venv found. Browse to one or set it in Manage.'
+    },
     track: {
       grandTitle: 'Add Existing Instance',
       grandSubtitle: 'Add an existing local ComfyUI checkout.',
@@ -170,6 +174,47 @@ describe('TrackModal — browse-only install directory', () => {
 
     expect(api.probeInstallation).toHaveBeenCalledWith('/tmp/not-comfy')
     expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+  })
+})
+
+describe('TrackModal — missing venv explanation', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function browseWithProbe(probe: ProbeResult) {
+    installMockApi({
+      browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI'),
+      probeInstallation: vi.fn().mockResolvedValue([probe])
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    await wrapper.get('button.brand-tertiary').trigger('click')
+    await flushPromises()
+    return wrapper
+  }
+
+  it('explains how to fix a Git-type folder that has no venv', async () => {
+    const wrapper = await browseWithProbe(gitProbe)
+
+    expect(wrapper.get('[data-testid="track-venv-hint"]').text()).toContain('No venv found')
+  })
+
+  it('omits the explanation once a venv was detected', async () => {
+    const wrapper = await browseWithProbe({ ...gitProbe, venvPath: '/Users/jo/ComfyUI/.venv' })
+
+    expect(wrapper.find('[data-testid="track-venv-hint"]').exists()).toBe(false)
+  })
+
+  it('does not show the venv field or hint for types that manage their own environment', async () => {
+    const wrapper = await browseWithProbe({
+      sourceId: 'standalone',
+      sourceLabel: 'Standalone',
+      version: 'v0.1.0'
+    })
+
+    expect(wrapper.find('[data-testid="track-venv-hint"]').exists()).toBe(false)
   })
 })
 

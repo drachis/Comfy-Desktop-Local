@@ -846,13 +846,14 @@
     "commit": "提交",
     "venv": "虚拟环境",
     "venvNotFound": "未找到虚拟环境。",
+    "venvHint": "此文件夹中未找到虚拟环境。你可以现在点击“浏览”选择一个，也可以稍后在“管理 > 设置”中设置。该环境需已安装 ComfyUI 的依赖（例如：python -m venv .venv，然后 pip install -r requirements.txt）。",
     "venvDetected": "检测到：{path}",
     "gitPull": "Git Pull",
     "gitPulling": "正在运行 git pull…",
     "gitPullComplete": "git pull 完成。",
     "gitPullFailed": "git pull 失败（退出代码 {code}）。",
     "gitNotFound": "找不到 git。请安装 git 后重试。",
-    "noVenv": "未配置虚拟环境。无法启动。",
+    "noVenv": "此实例未设置 Python 虚拟环境，因此无法启动。请在“管理 > 设置”中将“虚拟环境”设为已安装 ComfyUI 依赖的 venv。创建方法：在 ComfyUI 文件夹中运行 python -m venv .venv，安装 PyTorch，然后运行 pip install -r requirements.txt。",
     "noMainPy": "在此目录中找不到 ComfyUI main.py。"
   },
   "remote": {

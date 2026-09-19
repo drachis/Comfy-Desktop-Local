@@ -846,13 +846,14 @@
     "commit": "Commit",
     "venv": "Virtual Environment",
     "venvNotFound": "No virtual environment found.",
+    "venvHint": "No virtual environment was found in this folder. Browse to one now, or set it later in Manage > Settings. It needs ComfyUI's requirements installed (for example: python -m venv .venv, then pip install -r requirements.txt).",
     "venvDetected": "Detected: {path}",
     "gitPull": "Git Pull",
     "gitPulling": "Running git pull…",
     "gitPullComplete": "Git pull complete.",
     "gitPullFailed": "Git pull failed (exit code {code}).",
     "gitNotFound": "Could not find git. Please install git and try again.",
-    "noVenv": "No virtual environment configured. Cannot launch.",
+    "noVenv": "No Python virtual environment is set for this install, so it can't launch. In Manage > Settings, set Virtual Environment to a venv that has ComfyUI's requirements installed. To make one: run python -m venv .venv in the ComfyUI folder, install PyTorch, then pip install -r requirements.txt.",
     "noMainPy": "Cannot find ComfyUI main.py in this directory."
   },
   "remote": {

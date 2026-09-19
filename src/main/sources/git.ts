@@ -194,18 +194,17 @@ export const gitSource: SourcePlugin = {
     return { ...base, venvDir: venvPath, promptName: path.basename(venvPath) }
   },
 
+  getLaunchUnavailableMessage(installation: InstallationRecord): string | null {
+    if (!resolveVenvPython(installation)) return t('git.noVenv')
+    if (!findMainPy(installation.installPath)) return t('git.noMainPy')
+    return null
+  },
+
   getListActions(installation: InstallationRecord): Record<string, unknown>[] {
     const installed = installation.status === 'installed'
-    const hasVenv = !!resolveVenvPython(installation)
-    const hasMain = !!findMainPy(installation.installPath)
-    const canLaunch = installed && hasVenv && hasMain
-    const disabledMsg = !canLaunch
-      ? !hasVenv
-        ? t('git.noVenv')
-        : !hasMain
-          ? t('git.noMainPy')
-          : t('errors.installNotReady')
-      : undefined
+    const unavailable = gitSource.getLaunchUnavailableMessage!(installation)
+    const canLaunch = installed && unavailable === null
+    const disabledMsg = !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
     return [launchAction(canLaunch, disabledMsg)]
   },
 
@@ -218,9 +217,8 @@ export const gitSource: SourcePlugin = {
 
   getDetailSections(installation: InstallationRecord): Record<string, unknown>[] {
     const installed = installation.status === 'installed'
-    const hasVenv = !!resolveVenvPython(installation)
-    const hasMain = !!findMainPy(installation.installPath)
-    const canLaunch = installed && hasVenv && hasMain
+    const unavailable = gitSource.getLaunchUnavailableMessage!(installation)
+    const canLaunch = installed && unavailable === null
 
     const venvPath = installation.venvPath as string | undefined
 
@@ -271,13 +269,7 @@ export const gitSource: SourcePlugin = {
         actions: [
           launchAction(
             canLaunch,
-            !canLaunch
-              ? !hasVenv
-                ? t('git.noVenv')
-                : !hasMain
-                  ? t('git.noMainPy')
-                  : t('errors.installNotReady')
-              : undefined
+            !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
           ),
           renameAction(installation.name),
           openFolderAction(installation.installPath),

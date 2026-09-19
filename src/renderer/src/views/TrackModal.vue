@@ -308,6 +308,9 @@ defineExpose({ open })
                 {{ $t('common.browse') }}
               </button>
             </div>
+            <p v-if="!effectiveVenvPath" class="track-hint" data-testid="track-venv-hint">
+              {{ $t('git.venvHint') }}
+            </p>
           </div>
         </div>
 
@@ -360,6 +363,13 @@ defineExpose({ open })
 .track-label {
   font-size: 13px;
   color: var(--neutral-200);
+}
+
+.track-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--neutral-400);
 }
 
 .track-path-row {

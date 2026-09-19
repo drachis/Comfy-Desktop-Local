@@ -143,6 +143,8 @@ export interface SourcePlugin {
   buildInstallation(selections: Record<string, FieldOption | undefined>): Record<string, unknown>
   getListPreview?(installation: InstallationRecord): string | null
   getLaunchCommand(installation: InstallationRecord): LaunchCommand | null
+  /** Why `getLaunchCommand` returns null, in words the user can act on; null when launchable. */
+  getLaunchUnavailableMessage?(installation: InstallationRecord): string | null
   /**
    * Resolve how the interactive Console should activate this install's shell.
    * Return `null` to use the standalone default (`ComfyUI/.venv` + bundled uv).
