@@ -11,6 +11,7 @@ import {
   renameAction
 } from '../lib/actions'
 import { resolveGitDir, readGitHead, readGitRemoteUrl } from '../lib/git'
+import { createVenv, TORCH_BACKEND_AUTO } from '../lib/createVenv'
 import { parseArgs, extractPort } from '../lib/util'
 import { t } from '../lib/i18n'
 import { buildLaunchSettingsFields } from './common/launchSettingsFields'
@@ -84,6 +85,34 @@ function resolveVenvPython(installation: InstallationRecord): string | null {
   const pythonPath = getVenvPython(venvPath)
   if (fs.existsSync(pythonPath)) return pythonPath
   return null
+}
+
+/** A tracked ComfyUI folder that can't launch only because it has no venv yet. */
+function canCreateVenv(installation: InstallationRecord): boolean {
+  return (
+    installation.status === 'installed' &&
+    !resolveVenvPython(installation) &&
+    findMainPy(installation.installPath) !== null
+  )
+}
+
+function createVenvAction(): Record<string, unknown> {
+  return {
+    id: 'create-venv',
+    label: t('git.createVenv'),
+    style: 'primary',
+    enabled: true,
+    showProgress: true,
+    progressTitle: t('git.creatingVenv'),
+    prompt: {
+      field: 'torch',
+      title: t('git.createVenvTitle'),
+      message: t('git.createVenvMessage'),
+      defaultValue: TORCH_BACKEND_AUTO,
+      confirmLabel: t('git.createVenvConfirm'),
+      required: true
+    }
+  }
 }
 
 function findGit(): Promise<string | null> {
@@ -250,7 +279,10 @@ export const gitSource: SourcePlugin = {
     const unavailable = gitSource.getLaunchUnavailableMessage!(installation)
     const canLaunch = installed && unavailable === null
     const disabledMsg = !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
-    return [launchAction(canLaunch, disabledMsg)]
+    return [
+      launchAction(canLaunch, disabledMsg),
+      ...(canCreateVenv(installation) ? [createVenvAction()] : [])
+    ]
   },
 
   getDetailSections(installation: InstallationRecord): Record<string, unknown>[] {
@@ -309,6 +341,7 @@ export const gitSource: SourcePlugin = {
             canLaunch,
             !canLaunch ? (unavailable ?? t('errors.installNotReady')) : undefined
           ),
+          ...(canCreateVenv(installation) ? [createVenvAction()] : []),
           renameAction(installation.name),
           openFolderAction(installation.installPath),
           {
@@ -341,9 +374,24 @@ export const gitSource: SourcePlugin = {
   async handleAction(
     actionId: string,
     installation: InstallationRecord,
-    _actionData: Record<string, unknown> | undefined,
-    { sendProgress, sendOutput }: ActionTools
+    actionData: Record<string, unknown> | undefined,
+    { sendProgress, sendOutput, update }: ActionTools
   ): Promise<ActionResult> {
+    if (actionId === 'create-venv') {
+      const mainPy = findMainPy(installation.installPath)
+      if (!mainPy) return { ok: false, message: t('git.noMainPy') }
+      const torchChoice =
+        typeof actionData?.torch === 'string' ? actionData.torch : TORCH_BACKEND_AUTO
+      const { venvPath, ...result } = await createVenv({
+        installPath: installation.installPath,
+        comfyDir: path.dirname(mainPy),
+        torchChoice,
+        tools: { sendProgress, sendOutput }
+      })
+      if (result.ok && venvPath) await update({ venvPath, venvName: path.basename(venvPath) })
+      return result
+    }
+
     if (actionId === 'git-pull') {
       const gitPath = await findGit()
       if (!gitPath) {

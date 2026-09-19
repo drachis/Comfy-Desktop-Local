@@ -85,3 +85,52 @@ describe('git launch availability', () => {
     expect(launch).toMatchObject({ id: 'launch', enabled: true })
   })
 })
+
+describe('git create-venv action', () => {
+  let tmp: string
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'git-create-venv-'))
+    fs.writeFileSync(path.join(tmp, 'main.py'), '')
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
+  const actionIds = (install: InstallationRecord) =>
+    gitSource.getListActions!(install).map((a) => a.id)
+
+  it('offers Create Python environment when the folder has no venv', () => {
+    expect(actionIds(makeInstall(tmp))).toContain('create-venv')
+  })
+
+  it('does not offer it once a venv exists', () => {
+    const venv = path.join(tmp, '.venv')
+    makeVenv(venv)
+
+    expect(actionIds(makeInstall(tmp, { venvPath: venv }))).not.toContain('create-venv')
+  })
+
+  it('does not offer it when there is no main.py to build an environment for', () => {
+    fs.rmSync(path.join(tmp, 'main.py'))
+
+    expect(actionIds(makeInstall(tmp))).not.toContain('create-venv')
+  })
+
+  it('asks which PyTorch backend to use, defaulting to auto', () => {
+    const action = gitSource.getListActions!(makeInstall(tmp)).find(
+      (a) => a.id === 'create-venv'
+    ) as { prompt: { field: string; defaultValue: string } }
+
+    expect(action.prompt).toMatchObject({ field: 'torch', defaultValue: 'auto' })
+  })
+
+  it('shows the same action on the Manage screen', () => {
+    const sections = gitSource.getDetailSections!(makeInstall(tmp)) as {
+      actions?: { id: string }[]
+    }[]
+
+    expect(sections.flatMap((s) => s.actions ?? []).map((a) => a.id)).toContain('create-venv')
+  })
+})
