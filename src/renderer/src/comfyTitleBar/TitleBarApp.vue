@@ -859,7 +859,7 @@ onUnmounted(() => {
         </button>
       </Transition>
       <button
-        v-if="!isFirstUseLockdown"
+        v-if="!isFirstUseLockdown && !isInstallLess"
         type="button"
         class="title-menu-button title-menu-button--icon title-announcement-button"
         v-bind="tooltipAttrs(t('titleBar.announcementTooltip'), t('titleBar.announcement'))"
@@ -869,7 +869,7 @@ onUnmounted(() => {
         <span v-if="announcementUnread" class="title-announcement-dot" aria-hidden="true" />
       </button>
       <button
-        v-if="!isFirstUseLockdown"
+        v-if="!isFirstUseLockdown && !isInstallLess"
         type="button"
         class="title-menu-button title-menu-button--icon title-feedback-button"
         v-bind="tooltipAttrs(t('titleBar.feedbackTooltip'), t('titleBar.feedback'))"

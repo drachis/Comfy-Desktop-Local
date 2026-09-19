@@ -964,6 +964,17 @@ describe('TitleBarApp', () => {
     expect(wrapper.find('.title-feedback-button').exists()).toBe(true)
   })
 
+  it('hides the notifications and Send Feedback buttons on the install-less dashboard host', async () => {
+    bridgeState = installMockBridge({ installationId: null })
+    vi.resetModules()
+    const { default: TitleBarApp } = await import('./TitleBarApp.vue')
+    const wrapper = mount(TitleBarApp)
+    await flushPromises()
+    expect(wrapper.find('.title-feedback-button').exists()).toBe(false)
+    expect(wrapper.find('.title-announcement-button').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('renders the downloads tray on install-less (chooser-host) windows too — downloads are global, not per-install', async () => {
     bridgeState = installMockBridge({ installationId: null })
     vi.resetModules()
