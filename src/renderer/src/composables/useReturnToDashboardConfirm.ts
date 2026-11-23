@@ -4,15 +4,14 @@ import type { Installation } from '../types/ipc'
 
 export type ReturnToDashboardReason = 'in_flight' | 'crashed' | 'stopped' | 'running'
 
-/**
- * Confirms returning to the dashboard from an install-backed host.
- * An in-flight operation always prompts (returning cancels it), even when the
- * installation record is unavailable - an install-in-progress record has
- * status 'installing' and is hidden from the renderer list, so it resolves to
- * null here. Otherwise local installs are prompted (because returning stops
- * ComfyUI); cloud/remote installs resolve immediately since detach does not
- * interrupt them.
- */
+export async function keepsComfyRunningWhenWindowCloses(): Promise<boolean> {
+  try {
+    return (await window.api.getSetting('keepComfyRunningWhenWindowCloses')) !== false
+  } catch {
+    return true
+  }
+}
+
 export function useReturnToDashboardConfirm() {
   const { t } = useI18n()
   const modal = useModal()
@@ -25,18 +24,16 @@ export function useReturnToDashboardConfirm() {
       return modal.confirm({
         title: t('overlay.cancelCurrentTitle'),
         message: t('overlay.cancelMessage'),
-        confirmLabel: t('overlay.cancelConfirm'),
-        confirmStyle: 'danger'
+        confirmLabel: t('overlay.cancelConfirm')
       })
     }
     if (!installation || installation.sourceCategory !== 'local') return true
-    // Idle states have nothing to stop, so skip the prompt.
     if (reason === 'stopped' || reason === 'crashed') return true
+    if (await keepsComfyRunningWhenWindowCloses()) return true
     return modal.confirm({
       title: t('dashboard.confirmStopLocal.title'),
       message: t('dashboard.confirmStopLocal.message'),
-      confirmLabel: t('dashboard.confirmStopLocal.confirmLabel'),
-      confirmStyle: 'danger'
+      confirmLabel: t('dashboard.confirmStopLocal.confirmLabel')
     })
   }
 

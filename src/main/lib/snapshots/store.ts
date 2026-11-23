@@ -12,13 +12,9 @@ import type { Snapshot, SnapshotEntry } from './types'
 import type { InstallationRecord } from '../../installations'
 import type { ComfyVersion } from '../version'
 
-// --- Constants ---
-
 const SNAPSHOTS_DIR = path.join('.launcher', 'snapshots')
 const MANIFEST_FILE = 'manifest.json'
 const AUTO_SNAPSHOT_LIMIT = 200
-
-// --- Per-install mutex ---
 
 const _locks = new Map<string, Promise<void>>()
 
@@ -39,16 +35,10 @@ async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// --- Helpers ---
-
 export function snapshotsDir(installPath: string): string {
   return path.join(installPath, SNAPSHOTS_DIR)
 }
 
-/**
- * Validate and resolve a snapshot filename to an absolute path.
- * Returns null if the filename is invalid or escapes the snapshots directory.
- */
 function resolveSnapshotPath(installPath: string, filename: string): string | null {
   if (!filename || filename !== path.basename(filename)) return null
   if (!filename.endsWith('.json')) return null
@@ -78,8 +68,6 @@ export function formatTimestamp(date: Date): string {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}_${pad(date.getMilliseconds(), 3)}`
 }
 
-// --- Core functions ---
-
 export async function captureState(
   installPath: string,
   installation: InstallationRecord
@@ -90,12 +78,6 @@ export async function captureState(
   const customNodes = await scanCustomNodes(comfyuiDir)
 
   let pipPackages: Record<string, string> = {}
-  // `getActiveUvPath` is adopted-aware: returns the uv pip-installed
-  // into the legacy `.venv` for adopted installs, and the standalone-env
-  // uv otherwise. Using the plain `getUvPath(installPath)` here meant
-  // adopted installs (which have no standalone-env) failed `fs.existsSync`
-  // and skipped the freeze, leaving every boot snapshot with `0 packages`
-  // in the UI for freshly-migrated installs (issue #855).
   const uvPath = getActiveUvPath(installation)
   const pythonPath = getActivePythonPath(installation)
   if (fs.existsSync(uvPath) && pythonPath) {
@@ -107,9 +89,6 @@ export async function captureState(
   }
 
   const cv = installation.comfyVersion as ComfyVersion | undefined
-  // Only carry forward stored version metadata when the commit matches.
-  // If the user made external changes (manual git pull, etc.), the stored
-  // baseTag/commitsAhead are stale and should not be baked into the snapshot.
   const commitMatches = cv?.commit === commit
   return {
     comfyui: {
@@ -132,10 +111,8 @@ export function statesMatch(
   a: Snapshot,
   b: Omit<Snapshot, 'createdAt' | 'trigger' | 'label' | 'version'>
 ): boolean {
-  // ComfyUI version/commit
   if (a.comfyui.ref !== b.comfyui.ref || a.comfyui.commit !== b.comfyui.commit) return false
 
-  // Custom nodes — compare by nodeKey (type:dirName)
   if (a.customNodes.length !== b.customNodes.length) return false
   const aNodes = new Map(a.customNodes.map((n) => [nodeKey(n), n]))
   for (const bn of b.customNodes) {
@@ -150,7 +127,6 @@ export function statesMatch(
       return false
   }
 
-  // Pip packages
   const aKeys = Object.keys(a.pipPackages)
   const bKeys = Object.keys(b.pipPackages)
   if (aKeys.length !== bKeys.length) return false
@@ -158,9 +134,6 @@ export function statesMatch(
     if (a.pipPackages[key] !== b.pipPackages[key]) return false
   }
 
-  // PyTorch stack identity — a pure stack change must not be deduped away.
-  // Compared by identity (not observedAt, which changes on every capture and
-  // would defeat dedupe entirely for observed stacks).
   if (!torchStacksMatch(a.torchStack, b.torchStack)) return false
 
   return true
@@ -170,7 +143,6 @@ function torchStacksMatch(
   a: SnapshotTorchStack | undefined,
   b: SnapshotTorchStack | undefined
 ): boolean {
-  // v1 snapshots carry no stack record; only identical absence matches.
   if (!a || !b) return !a && !b
   if (a.kind !== b.kind) return false
   if (a.kind === 'managed' && b.kind === 'managed') {
@@ -179,9 +151,6 @@ function torchStacksMatch(
     )
   }
   if (a.kind === 'observed' && b.kind === 'observed') {
-    // Full tuple, with missing (pre-tuple record) distinct from null
-    // (recorded absent) — an upgrade to a fuller record must not be deduped
-    // away, or the only restorable capture of the tuple could be lost.
     return (
       a.torchVersion === b.torchVersion &&
       a.torchvisionVersion === b.torchvisionVersion &&
@@ -241,7 +210,6 @@ export async function listSnapshots(installPath: string): Promise<SnapshotEntry[
       })
     )
     const entries = results.filter((e): e is SnapshotEntry => e !== null)
-    // Sort newest first
     entries.sort((a, b) => b.snapshot.createdAt.localeCompare(a.snapshot.createdAt))
     return entries
   } catch {
@@ -262,17 +230,10 @@ export async function deleteSnapshot(installPath: string, filename: string): Pro
   await fs.promises.unlink(filePath)
 }
 
-/** Recompute snapshot count from disk. */
 export async function getSnapshotCount(installPath: string): Promise<number> {
   return (await listSnapshots(installPath)).length
 }
 
-/**
- * After saving a restart snapshot, check if the immediately previous snapshot
- * was an intermediate restart from the same Manager install sequence (same nodes
- * and ComfyUI version, only pip packages differ). If so, delete it — the new
- * snapshot supersedes it with the fully-installed state.
- */
 async function deduplicateRestartSnapshot(
   installPath: string,
   justSavedFilename: string
@@ -285,17 +246,14 @@ async function deduplicateRestartSnapshot(
   const saved = entries[savedIdx]!
   const prev = entries[savedIdx + 1]!
 
-  // Only deduplicate against unlabeled restart snapshots
   if (prev.snapshot.trigger !== 'restart' || prev.snapshot.label) return undefined
 
-  // ComfyUI version must match
   if (
     prev.snapshot.comfyui.ref !== saved.snapshot.comfyui.ref ||
     prev.snapshot.comfyui.commit !== saved.snapshot.comfyui.commit
   )
     return undefined
 
-  // Custom nodes must match exactly (same set, same versions)
   if (prev.snapshot.customNodes.length !== saved.snapshot.customNodes.length) return undefined
   const prevNodes = new Map(prev.snapshot.customNodes.map((n) => [nodeKey(n), n]))
   for (const node of saved.snapshot.customNodes) {
@@ -310,41 +268,18 @@ async function deduplicateRestartSnapshot(
       return undefined
   }
 
-  // Previous snapshot is an intermediate restart — remove it
   await deleteSnapshot(installPath, prev.filename)
   return prev.filename
 }
 
-/**
- * Emit `comfy.desktop.snapshot.created` for every successful snapshot write.
- *
- * Centralized here (instead of inside `writeSnapshot`) because the wrapper
- * functions own the `InstallationRecord` (for `installation_id`) and the
- * dedup outcome (for `deduplicated_previous`). `writeSnapshot` is kept
- * pure so it can be reused by future callers without touching telemetry.
- *
- * `telemetry.emit` no-ops when consent is off / SDK uninitialized, so this
- * is safe to call unconditionally and from unit tests.
- */
 function emitSnapshotCreated(opts: {
   installation: InstallationRecord
   trigger: Snapshot['trigger']
   customNodesCount: number
   pipPackagesCount: number
   hasLabel: boolean
-  /**
-   * True when `captureSnapshotIfChanged` collapsed the previous restart
-   * snapshot into this one (the only path that can ever trip dedup-on-create).
-   * Direct `saveSnapshot` callers always pass `false`.
-   */
   deduplicatedPrevious: boolean
 }): void {
-  // Skip the boot-trigger emit — it fires on every restart for every
-  // user (537 events / 235 users in 30d), and the signal duplicates
-  // session.started. The other triggers (manual / pre-update / post-
-  // update / restart / post-restore) carry real product intent and
-  // stay on. `manual` in particular is what we use to measure actual
-  // user-initiated snapshotting.
   if (opts.trigger === 'boot') return
   telemetry.emit('comfy.desktop.snapshot.created', {
     installation_id: opts.installation.id,
@@ -364,7 +299,6 @@ export async function captureSnapshotIfChanged(
   return withLock(installPath, async () => {
     const current = await captureState(installPath, installation)
 
-    // Load last snapshot for comparison
     const lastFilename = installation.lastSnapshot as string | undefined
     if (lastFilename && trigger === 'boot') {
       try {
@@ -372,15 +306,11 @@ export async function captureSnapshotIfChanged(
         if (statesMatch(last, current)) {
           return { saved: false }
         }
-      } catch {
-        // Last snapshot unreadable — save a new one
-      }
+      } catch {}
     }
 
     const filename = await writeSnapshot(installPath, { ...current, trigger, label: null })
 
-    // Deduplicate: if this is a restart snapshot, remove the previous intermediate
-    // restart that captured state before pip packages were installed.
     let deduplicated: string | undefined
     if (trigger === 'restart') {
       deduplicated = await deduplicateRestartSnapshot(installPath, filename).catch(() => undefined)
@@ -395,7 +325,6 @@ export async function captureSnapshotIfChanged(
       deduplicatedPrevious: deduplicated !== undefined
     })
 
-    // Prune old auto snapshots
     await pruneAutoSnapshots(installPath, AUTO_SNAPSHOT_LIMIT).catch(() => {})
 
     return { saved: true, filename, deduplicated }
@@ -423,67 +352,39 @@ export async function saveSnapshot(
   })
 }
 
-/**
- * Stricter "does this snapshot represent the live state" check than
- * `statesMatch`, which intentionally ignores `updateChannel` and
- * `pythonVersion`. For the post-restore "is the top snapshot still accurate?"
- * decision those two are user-visible state we don't want to collapse, so we
- * compare them too.
- */
 function snapshotRepresentsCurrentState(
   snapshot: Snapshot,
-  current: Omit<Snapshot, 'createdAt' | 'trigger' | 'label' | 'version'>
+  current: Omit<Snapshot, 'createdAt' | 'trigger' | 'label' | 'version'>,
+  label?: string
 ): boolean {
   return (
     statesMatch(snapshot, current) &&
     (snapshot.updateChannel || 'stable') === (current.updateChannel || 'stable') &&
-    (snapshot.pythonVersion || '') === (current.pythonVersion || '')
+    (snapshot.pythonVersion || '') === (current.pythonVersion || '') &&
+    (snapshot.label || null) === (label || null)
   )
 }
 
-/**
- * Repair safety-net: guarantee the newest snapshot reflects the actual live
- * environment.
- *
- * This is NOT the primary fix for the #1137 "failed restore shows the unapplied
- * target as Latest" bug — that is solved by never committing an imported target
- * to history until the restore succeeds (see exportImport.ts / AGENTS.md). After
- * a normal failed restore the previous in-history snapshot already represents
- * the rolled-back live state, so this is a no-op.
- *
- * It only does real work in genuine edge cases where the on-disk state is novel
- * and no existing snapshot matches it: an install with no prior snapshot, or a
- * partial restore with no source rollback (e.g. fresh-install migration). In
- * those cases it writes a fresh `post-restore` snapshot of the live state so the
- * top of the timeline is accurate again.
- *
- * Returns the filename representing the live state — either the newly written
- * snapshot (`saved: true`) or the existing matching top snapshot (`saved:
- * false`) — so the caller can refresh `installation.lastSnapshot`.
- */
 export async function ensureCurrentSnapshotOnTop(
   installPath: string,
-  installation: InstallationRecord
+  installation: InstallationRecord,
+  label?: string
 ): Promise<{ saved: boolean; filename?: string }> {
   return withLock(installPath, async () => {
     const current = await captureState(installPath, installation)
     const [top] = await listSnapshots(installPath)
 
-    if (top && snapshotRepresentsCurrentState(top.snapshot, current)) {
+    if (top && snapshotRepresentsCurrentState(top.snapshot, current, label)) {
       return { saved: false, filename: top.filename }
     }
 
-    // Snapshots are ordered by `createdAt`. The stale top is often a freshly
-    // imported snapshot whose timestamp is the same millisecond as — or, for a
-    // multi-snapshot import, slightly ahead of — now, so stamp this one strictly
-    // after it to guarantee it lands on top.
     const topTime = top ? Date.parse(top.snapshot.createdAt) : NaN
     const writeAt = Number.isFinite(topTime)
       ? new Date(Math.max(Date.now(), topTime + 1))
       : new Date()
     const filename = await writeSnapshot(
       installPath,
-      { ...current, trigger: 'post-restore', label: null },
+      { ...current, trigger: 'post-restore', label: label || null },
       writeAt
     )
     emitSnapshotCreated({
@@ -491,7 +392,7 @@ export async function ensureCurrentSnapshotOnTop(
       trigger: 'post-restore',
       customNodesCount: current.customNodes.length,
       pipPackagesCount: Object.keys(current.pipPackages).length,
-      hasLabel: false,
+      hasLabel: !!label,
       deduplicatedPrevious: false
     })
     return { saved: true, filename }

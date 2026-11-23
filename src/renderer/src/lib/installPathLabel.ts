@@ -1,5 +1,3 @@
-/** Short tail of an install path for tiles: the install folder and the folder
- *  above it, with a leading ellipsis when more of the path is hidden. */
 export function installPathLabel(installPath: string | undefined): string {
   if (!installPath) return ''
   const sep = installPath.includes('\\') ? '\\' : '/'

@@ -1,7 +1,7 @@
-// @vitest-environment node
 import http from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { startLoopbackListener, type LoopbackListener } from './loopback'
+import { SignInFailure } from './signInFailure'
 
 function get(url: string): Promise<{ status: number; body: string; contentType?: string }> {
   return new Promise((resolve, reject) => {
@@ -24,8 +24,6 @@ function get(url: string): Promise<{ status: number; body: string; contentType?:
       .on('error', reject)
   })
 }
-/** Drain queued IO callbacks and microtasks so any already-settled promise
- *  has run its handlers; no wall-clock wait. */
 const drain = (): Promise<void> => new Promise((r) => setImmediate(r))
 
 describe('loopback listener', () => {
@@ -60,11 +58,8 @@ describe('loopback listener', () => {
     const invalidResponse = await get(`${listener.redirectUri}?state=WRONG&code=x`)
     expect(invalidResponse.status).toBe(400)
     expect(invalidResponse.body).toContain('Invalid sign-in response')
-    // Any settlement happens in the same synchronous handler that sends the
-    // response, so once the 400 has arrived a drain is enough for a (wrong)
-    // settlement's then-handlers to run.
     await drain()
-    expect(settled).toBe(false) // an outsider could not abort our sign-in
+    expect(settled).toBe(false)
 
     await get(`${listener.redirectUri}?state=st&code=real`)
     expect(await codeP).toEqual({ code: 'real' })
@@ -78,5 +73,47 @@ describe('loopback listener', () => {
     expect(response.body).toContain('Sign-in unsuccessful')
     expect(response.body).toContain('try signing in again')
     await expect(codeP).rejects.toThrow(/access_denied/)
+  })
+
+  it.for([
+    { query: 'error=access_denied', reason: 'cancelled', oauthError: 'access_denied' },
+    { query: 'error=server_error', reason: 'idp_error', oauthError: 'server_error' },
+    { query: '', reason: 'idp_error', oauthError: undefined }
+  ])('reports a callback with $query as $reason', async ({ query, reason, oauthError }) => {
+    listener = await startLoopbackListener({ expectedState: 'st', timeoutMs: 5000 })
+    const codeP = listener.waitForCode()
+    await get(`${listener.redirectUri}?state=st&${query}`)
+    await expect(codeP).rejects.toMatchObject({ name: 'SignInFailure', reason, oauthError })
+  })
+
+  it('reports a callback that never comes as a timeout', async () => {
+    listener = await startLoopbackListener({ expectedState: 'st', timeoutMs: 20 })
+    await expect(listener.waitForCode()).rejects.toMatchObject({
+      name: 'SignInFailure',
+      reason: 'timeout'
+    })
+  })
+  it('stops listening with the reason the app gave for ending the wait', async () => {
+    const abort = new AbortController()
+    listener = await startLoopbackListener({
+      expectedState: 'st',
+      timeoutMs: 5000,
+      signal: abort.signal
+    })
+    const redirectUri = listener.redirectUri
+
+    abort.abort(new SignInFailure('Sign-in restarted from Comfy Desktop', 'restarted'))
+
+    await expect(listener.waitForCode()).rejects.toMatchObject({ reason: 'restarted' })
+    await expect(get(`${redirectUri}?state=st&code=late`)).rejects.toThrow()
+  })
+
+  it('refuses to start for a sign-in that was already ended', async () => {
+    const abort = new AbortController()
+    abort.abort(new SignInFailure('Sign-in restarted from Comfy Desktop', 'restarted'))
+
+    await expect(
+      startLoopbackListener({ expectedState: 'st', timeoutMs: 5000, signal: abort.signal })
+    ).rejects.toMatchObject({ reason: 'restarted' })
   })
 })

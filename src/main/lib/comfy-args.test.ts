@@ -1,4 +1,3 @@
-// @vitest-environment node
 import { execFile } from 'child_process'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { readGitHead } from './git'
@@ -12,11 +11,14 @@ vi.mock('./git', () => ({ readGitHead: vi.fn() }))
 
 import {
   clearSchemaCache,
+  dropValuelessArgs,
   filterUnsupportedArgs,
   getComfyArgsSchema,
+  peekComfyArgsSchema,
   parseHelpOutput,
   validateArgs
 } from './comfy-args'
+import type { ComfyArgsSchema } from './comfy-args'
 
 const mockedExecFile = vi.mocked(execFile)
 const mockedReadGitHead = vi.mocked(readGitHead)
@@ -71,21 +73,17 @@ describe('parseHelpOutput', () => {
     const schema = parseHelpOutput(SAMPLE_HELP)
     const byName = new Map(schema.args.map((a) => [a.name, a]))
 
-    // Boolean flags
     expect(byName.get('enable-manager')?.type).toBe('boolean')
     expect(byName.get('cuda-malloc')?.type).toBe('boolean')
     expect(byName.get('force-fp32')?.type).toBe('boolean')
     expect(byName.get('gpu-only')?.type).toBe('boolean')
     expect(byName.get('use-ck-attention')?.type).toBe('boolean')
 
-    // Value flag
     expect(byName.get('port')?.type).toBe('value')
     expect(byName.get('port')?.metavar).toBe('PORT')
 
-    // Optional-value flag
     expect(byName.get('listen')?.type).toBe('optional-value')
 
-    // -h/--help should be excluded
     expect(byName.has('h')).toBe(false)
     expect(byName.has('help')).toBe(false)
   })
@@ -110,7 +108,6 @@ options:
     expect(byName.get('fast')?.type).toBe('multi-value')
     expect(byName.get('whitelist-custom-nodes')?.type).toBe('multi-value')
 
-    // A single-value flag in the same exclusive group stays a plain value flag.
     expect(byName.get('cache-lru')?.type).toBe('value')
   })
 
@@ -132,19 +129,16 @@ options:
     const schema = parseHelpOutput(SAMPLE_HELP)
     const byName = new Map(schema.args.map((a) => [a.name, a]))
 
-    // cuda-malloc and disable-cuda-malloc should be in the same group
     const g1 = byName.get('cuda-malloc')?.exclusiveGroup
     const g2 = byName.get('disable-cuda-malloc')?.exclusiveGroup
     expect(g1).toBeDefined()
     expect(g1).toBe(g2)
 
-    // VRAM group
     const vramNames = ['gpu-only', 'highvram', 'normalvram', 'lowvram', 'novram', 'cpu']
     const vramGroups = vramNames.map((n) => byName.get(n)?.exclusiveGroup)
     expect(vramGroups.every((g) => g !== undefined)).toBe(true)
     expect(new Set(vramGroups).size).toBe(1)
 
-    // force-fp32 and force-fp16 should be exclusive
     expect(byName.get('force-fp32')?.exclusiveGroup).toBe(byName.get('force-fp16')?.exclusiveGroup)
 
     const ckAttentionGroup = byName.get('use-ck-attention')?.exclusiveGroup
@@ -236,15 +230,12 @@ options:
     const schema = parseHelpOutput(helpWithFeatureFlags)
     const argNames = new Set(schema.args.map((a) => a.name))
 
-    // Hidden from the suggestion list
     expect(argNames.has('feature-flag')).toBe(false)
     expect(argNames.has('list-feature-flags')).toBe(false)
 
-    // But still recognized so user-typed values pass filterUnsupportedArgs
     expect(schema.knownFlags.has('feature-flag')).toBe(true)
     expect(schema.knownFlags.has('list-feature-flags')).toBe(true)
 
-    // Surrounding args unaffected
     expect(argNames.has('port')).toBe(true)
     expect(argNames.has('enable-manager')).toBe(true)
   })
@@ -274,6 +265,19 @@ describe('getComfyArgsSchema', () => {
     clearSchemaCache(installationId)
     mockedExecFile.mockReset()
     mockedReadGitHead.mockReset()
+  })
+
+  it("allows ComfyUI's --help 60 seconds before giving up", async () => {
+    mockHelpOutput(() => SAMPLE_HELP)
+
+    await getComfyArgsSchema('python', 'main.py', '.', installationId)
+
+    expect(mockedExecFile).toHaveBeenCalledWith(
+      'python',
+      ['-s', 'main.py', '--help'],
+      expect.objectContaining({ timeout: 60_000 }),
+      expect.any(Function)
+    )
   })
 
   it('reuses a schema for one commit and refreshes it when the checkout changes', async () => {
@@ -311,6 +315,37 @@ describe('getComfyArgsSchema', () => {
   })
 })
 
+describe('peekComfyArgsSchema', () => {
+  const installationId = 'peek-comfy-install'
+
+  beforeEach(() => {
+    clearSchemaCache(installationId)
+    mockedExecFile.mockReset()
+    mockedReadGitHead.mockReset()
+  })
+
+  it('returns only what discovery cached for the same revision, and never spawns', async () => {
+    mockHelpOutput(() => SAMPLE_HELP)
+    mockedReadGitHead.mockReturnValue('commit-1')
+    expect(peekComfyArgsSchema('main.py', installationId, 'stored')).toBeNull()
+
+    const schema = await getComfyArgsSchema('python', 'main.py', '.', installationId, 'stored')
+    expect(peekComfyArgsSchema('main.py', installationId, 'stored')).toBe(schema)
+
+    mockedReadGitHead.mockReturnValue('commit-2')
+    expect(peekComfyArgsSchema('main.py', installationId, 'stored')).toBeNull()
+    expect(mockedExecFile).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to the recorded revision when HEAD is unreadable, as discovery does', async () => {
+    mockHelpOutput(() => SAMPLE_HELP)
+    mockedReadGitHead.mockReturnValue(null)
+    const schema = await getComfyArgsSchema('python', 'main.py', '.', installationId, 'stored')
+    expect(peekComfyArgsSchema('main.py', installationId, 'stored')).toBe(schema)
+    expect(peekComfyArgsSchema('main.py', installationId, 'other')).toBeNull()
+  })
+})
+
 describe('validateArgs', () => {
   it('identifies unsupported flags', () => {
     const schema = parseHelpOutput(SAMPLE_HELP)
@@ -325,6 +360,91 @@ describe('validateArgs', () => {
       schema
     )
     expect(unsupported).toEqual([])
+  })
+})
+
+describe('dropValuelessArgs', () => {
+  const schema: ComfyArgsSchema = {
+    args: [
+      { name: 'cuda-device', flag: '--cuda-device', help: '', type: 'value', category: 'gpuVram' },
+      { name: 'listen', flag: '--listen', help: '', type: 'optional-value', category: 'network' },
+      { name: 'lowvram', flag: '--lowvram', help: '', type: 'boolean', category: 'gpuVram' },
+      {
+        name: 'extra-model-paths-config',
+        flag: '--extra-model-paths-config',
+        help: '',
+        type: 'multi-value',
+        category: 'paths'
+      }
+    ],
+    knownFlags: new Set(['cuda-device', 'listen', 'lowvram', 'extra-model-paths-config'])
+  }
+
+  it.each([
+    ['last with no value', ['--lowvram', '--cuda-device'], ['--lowvram']],
+    ['before another flag', ['--cuda-device', '--lowvram'], ['--lowvram']],
+    ['with an empty inline value', ['--cuda-device=', '--lowvram'], ['--lowvram']]
+  ])('drops a flag that needs a value %s', (_case, args, kept) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(
+        dropValuelessArgs(args, schema),
+        'a bare --cuda-device makes argparse exit; an empty one hides every GPU'
+      ).toEqual(kept)
+      expect(warn, 'the app log names what was dropped').toHaveBeenCalledWith(
+        expect.stringContaining('--cuda-device')
+      )
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it.each([
+    [['--tls-keyfile', '--tls-certfile', 'c.pem']],
+    [['--tls-keyfile', 'k.pem', '--tls-certfile']]
+  ])(
+    'keeps a TLS flag with no value, so ComfyUI refuses to start instead of serving plain HTTP: %j',
+    (args) => {
+      const tls =
+        parseHelpOutput(`usage: main.py [-h] [--tls-keyfile TLS_KEYFILE] [--tls-certfile TLS_CERTFILE]
+
+options:
+  --tls-keyfile TLS_KEYFILE
+                        Path to TLS (SSL) key file.
+  --tls-certfile TLS_CERTFILE
+                        Path to TLS (SSL) certificate file.
+`)
+      expect(tls.args.map((a) => a.type)).toEqual(['value', 'value'])
+      expect(dropValuelessArgs(args, tls), 'ComfyUI enables TLS only with both files').toEqual(args)
+    }
+  )
+
+  it('keeps a bare variadic flag, which may take zero values', () => {
+    const fast = parseHelpOutput(`usage: main.py [-h] [--fast [FAST ...]] [--lowvram]
+
+options:
+  --fast [FAST ...]     Enable fast optimisations; with no arguments, all of them.
+  --lowvram             Use less VRAM.
+`)
+    expect(
+      dropValuelessArgs(['--fast', '--lowvram'], fast),
+      '--fast with no values is how ComfyUI enables every fast optimisation'
+    ).toEqual(['--fast', '--lowvram'])
+  })
+
+  it('keeps flags that have their value, optional values and booleans', () => {
+    const args = [
+      '--cuda-device',
+      '0',
+      '--cuda-device=1',
+      '--listen',
+      '--lowvram',
+      '--extra-model-paths-config',
+      'a.yaml',
+      '--cuda-device',
+      './cuda-device'
+    ]
+    expect(dropValuelessArgs(args, schema)).toEqual(args)
   })
 })
 
@@ -406,8 +526,6 @@ options:
   })
 
   it('keeps every member of a group whose alternative has a nested optional metavar', () => {
-    // `--cache-ram [GB ...]` embeds brackets that must not close the cache group
-    // early and drop `--cache-none`.
     const help = `usage: main.py [-h] [--cache-classic | --cache-lru CACHE_LRU | --cache-ram [GB ...] | --cache-none]
 
 options:

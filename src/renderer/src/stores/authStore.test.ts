@@ -2,6 +2,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 
+import { stubWindowApi } from '../lib/stubWindowApi'
 import { useAuthStore } from './authStore'
 
 const api = {
@@ -15,15 +16,20 @@ const api = {
   installBuild: vi.fn()
 }
 
-/** Capture the renderer-side auth-change listener the store registers. */
 let authChangedCb: ((status: unknown) => void) | undefined
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (error: Error) => void
+} {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((done, fail) => {
     resolve = done
+    reject = fail
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 describe('useAuthStore', () => {
@@ -36,11 +42,11 @@ describe('useAuthStore', () => {
       return () => {}
     })
     api.getAuthStatus.mockResolvedValue({ signedIn: false })
-    ;(globalThis as unknown as { window: unknown }).window = { api: { comfybuilder: api } }
+    stubWindowApi({ comfybuilder: api })
   })
 
   afterEach(() => {
-    delete (globalThis as unknown as { window?: unknown }).window
+    vi.unstubAllGlobals()
   })
 
   it('hydrates status from the persisted session on creation', async () => {
@@ -58,6 +64,88 @@ describe('useAuthStore', () => {
     expect(store.status).toMatchObject({ signedIn: true, workspaceId: 'w1' })
   })
 
+  describe('shared sign-in state', () => {
+    function browserSignIn() {
+      const browser = deferred<{ signedIn: boolean; workspaceId?: string }>()
+      api.signIn.mockReturnValue(browser.promise)
+      return browser
+    }
+
+    it('marks a sign-in as pending until the browser answers', async () => {
+      const browser = browserSignIn()
+      const store = useAuthStore()
+
+      const attempt = store.signIn()
+      expect(store.signInPending).toBe(true)
+      browser.resolve({ signedIn: true, workspaceId: 'w1' })
+      await attempt
+
+      expect(store.signInPending).toBe(false)
+      expect(store.isSignedIn).toBe(true)
+    })
+
+    it('clears the pending sign-in when it fails', async () => {
+      const browser = browserSignIn()
+      const store = useAuthStore()
+
+      const attempt = store.signIn()
+      browser.reject(new Error('server_error'))
+
+      await expect(attempt).rejects.toThrow('server_error')
+      expect(store.signInPending).toBe(false)
+      expect(store.isSignedIn).toBe(false)
+    })
+
+    it('asks main again on a second click, which restarts the browser sign-in', async () => {
+      const browser = browserSignIn()
+      const store = useAuthStore()
+
+      const first = store.signIn()
+      const second = store.signIn()
+      browser.resolve({ signedIn: true, workspaceId: 'w1' })
+
+      await expect(second).resolves.toMatchObject({ signedIn: true })
+      await expect(first).resolves.toMatchObject({ signedIn: true })
+      expect(api.signIn).toHaveBeenCalledTimes(2)
+      expect(store.isSignedIn).toBe(true)
+      expect(store.signInPending).toBe(false)
+    })
+
+    it('signs in on a new attempt after a failed one', async () => {
+      const browser = browserSignIn()
+      const store = useAuthStore()
+      const failed = store.signIn()
+      browser.reject(new Error('cancelled'))
+      await expect(failed).rejects.toThrow()
+
+      api.signIn.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
+      await store.signIn()
+
+      expect(store.isSignedIn).toBe(true)
+      expect(store.signInPending).toBe(false)
+    })
+
+    it('starts a new sign-in after sign-out drops the open one', async () => {
+      const dropped = browserSignIn()
+      const store = useAuthStore()
+      const first = store.signIn()
+      api.signOut.mockResolvedValue({ signedIn: false })
+      await store.signOut()
+      expect(store.signInPending).toBe(false)
+
+      const fresh = browserSignIn()
+      const second = store.signIn()
+      dropped.reject(new Error('Signed out while signing in'))
+      await expect(first).rejects.toThrow()
+
+      expect(api.signIn).toHaveBeenCalledTimes(2)
+      expect(store.signInPending).toBe(true)
+      fresh.resolve({ signedIn: true, workspaceId: 'w1' })
+      await expect(second).resolves.toMatchObject({ signedIn: true })
+      expect(store.signInPending).toBe(false)
+    })
+  })
+
   it('stays signed in when main cancels sign-out', async () => {
     api.getAuthStatus.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
     api.signOut.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
@@ -71,7 +159,6 @@ describe('useAuthStore', () => {
 
   it('fetchBuilds pulls rows only when signed in', async () => {
     const store = useAuthStore()
-    // Signed out: no call, empty list.
     expect(await store.fetchBuilds()).toEqual([])
     expect(api.listBuilds).not.toHaveBeenCalled()
 
@@ -93,7 +180,7 @@ describe('useAuthStore', () => {
     await store.fetchBuilds()
     expect(store.buildsError).toBe(true)
     expect(store.buildsLoaded).toBe(false)
-    expect(store.builds).toEqual([]) // stays empty, but flagged as an error not an empty workspace
+    expect(store.builds).toEqual([])
 
     api.listBuilds.mockResolvedValue([{ id: 'd1', name: 'Image', state: 'installable' }])
     await store.fetchBuilds()
@@ -111,6 +198,23 @@ describe('useAuthStore', () => {
     await expect(store.fetchWorkspaces()).resolves.toEqual([])
     expect(store.workspacesError).toBe(true)
     expect(store.loadingWorkspaces).toBe(false)
+    expect(store.workspacesLoaded).toBe(false)
+  })
+
+  it('shares a pending workspace request and distinguishes a loaded empty catalog', async () => {
+    api.getAuthStatus.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
+    const store = useAuthStore()
+    await store.whenReady()
+    const catalog = deferred<unknown[]>()
+    api.listWorkspaces.mockReturnValueOnce(catalog.promise)
+    const first = store.fetchWorkspaces()
+    const second = store.fetchWorkspaces()
+    expect(api.listWorkspaces).toHaveBeenCalledOnce()
+    expect(store.workspacesLoaded).toBe(false)
+    catalog.resolve([])
+    await Promise.all([first, second])
+    expect(store.workspacesLoaded).toBe(true)
+    expect(store.workspaces).toEqual([])
   })
 
   it('reconciles the cached active workspace name after loading the workspace list', async () => {
@@ -175,6 +279,56 @@ describe('useAuthStore', () => {
     expect(store.loadingBuilds).toBe(false)
   })
 
+  it('keeps a switch failure out of status until the next switch or status change', async () => {
+    api.getAuthStatus.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
+    const store = useAuthStore()
+    await store.whenReady()
+    api.switchWorkspace.mockResolvedValueOnce({
+      signedIn: true,
+      workspaceId: 'w1',
+      workspaceSwitchFailure: 'unavailable'
+    })
+
+    await store.switchWorkspace('w2')
+
+    expect(store.workspaceSwitchFailure).toBe('unavailable')
+    expect(store.status).toEqual({ signedIn: true, workspaceId: 'w1' })
+
+    const nextSwitch = deferred<{ signedIn: boolean; workspaceId: string }>()
+    api.switchWorkspace.mockReturnValueOnce(nextSwitch.promise)
+    const switching = store.switchWorkspace('w3')
+    expect(store.workspaceSwitchFailure).toBeUndefined()
+    nextSwitch.resolve({ signedIn: true, workspaceId: 'w3' })
+    await switching
+
+    api.switchWorkspace.mockResolvedValueOnce({
+      signedIn: true,
+      workspaceId: 'w3',
+      workspaceSwitchFailure: 'retryable'
+    })
+    await store.switchWorkspace('w2')
+    expect(store.workspaceSwitchFailure).toBe('retryable')
+
+    authChangedCb?.({ signedIn: true, workspaceId: 'w4' })
+    expect(store.workspaceSwitchFailure).toBeUndefined()
+  })
+
+  it('does not let an older switch failure overwrite a newer switch', async () => {
+    api.getAuthStatus.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
+    const store = useAuthStore()
+    await store.whenReady()
+    const older = deferred<Record<string, unknown>>()
+    api.switchWorkspace.mockReturnValueOnce(older.promise)
+    api.switchWorkspace.mockResolvedValueOnce({ signedIn: true, workspaceId: 'w3' })
+
+    const first = store.switchWorkspace('w2')
+    await store.switchWorkspace('w3')
+    older.resolve({ signedIn: true, workspaceId: 'w3', workspaceSwitchFailure: 'retryable' })
+    await first
+
+    expect(store.workspaceSwitchFailure).toBeUndefined()
+  })
+
   it('switchWorkspace adopts the new status and drops the stale build cache', async () => {
     api.signIn.mockResolvedValue({ signedIn: true, workspaceId: 'w1' })
     const store = useAuthStore()
@@ -198,9 +352,6 @@ describe('useAuthStore', () => {
     const store = useAuthStore()
     await store.signIn()
 
-    // Main broadcasts the switched status BEFORE the switchWorkspace invoke
-    // resolves; the watcher keyed on workspace identity fires exactly once,
-    // off this push.
     const invoke = deferred<unknown>()
     api.switchWorkspace.mockReturnValueOnce(invoke.promise)
     const switching = store.switchWorkspace('w2')
@@ -211,9 +362,6 @@ describe('useAuthStore', () => {
     const fetching = store.fetchBuilds()
     expect(store.loadingBuilds).toBe(true)
 
-    // The invoke result carries the identical identity; it must not advance
-    // the revision - that would discard the only fetch for w2 and leave the
-    // UI reporting a false empty workspace with no re-fire.
     invoke.resolve({ signedIn: true, workspaceId: 'w2' })
     await switching
     expect(store.loadingBuilds).toBe(true)
@@ -237,14 +385,10 @@ describe('useAuthStore', () => {
     expect(store.loadingWorkspaces).toBe(true)
     expect(store.buildsError).toBe(true)
 
-    // Sign-out arrives while the workspace fetch is still in flight; nothing
-    // refetches for the signed-out state, so the transition itself must
-    // settle the flags.
     authChangedCb?.({ signedIn: false })
     expect(store.loadingWorkspaces).toBe(false)
     expect(store.buildsError).toBe(false)
 
-    // The stale fetch settling later must not resurrect anything.
     stale.resolve([{ id: 'w1', name: 'W1', type: 'team', role: 'owner' }])
     await staleFetch
     expect(store.loadingWorkspaces).toBe(false)
@@ -262,6 +406,7 @@ describe('useAuthStore', () => {
     authChangedCb?.({ signedIn: false })
     expect(store.isSignedIn).toBe(false)
     expect(store.workspaces).toEqual([])
+    expect(store.workspacesLoaded).toBe(false)
     expect(store.builds).toEqual([])
     expect(store.buildsLoaded).toBe(false)
   })

@@ -5,32 +5,45 @@ vi.mock('electron', () => ({
   ipcMain: { handle: vi.fn() }
 }))
 
-// resolveTemplateInputAssets reads the workflow JSON via loadTemplateJson; stub
-// it so we can feed crafted docs and assert the Load*-node scan + safety guards.
 const loadTemplateJson = vi.fn()
 vi.mock('./templateModels', () => ({
   loadTemplateJson: (...a: unknown[]) => loadTemplateJson(...a)
 }))
 
-import { resolveTemplateInputAssets, resolveInputDir } from './templateInputAssets'
+import {
+  resolveInputDir,
+  resolveTemplateInputAssetAvailability,
+  resolveTemplateInputAssetSnapshot,
+  type TemplateInputAsset
+} from './templateInputAssets'
 import { TEMPLATE_INPUT_BASE } from './curatedTemplates'
 import type { InstallationRecord } from '../../installations'
 
-const inst = { id: 'i1', bundledTemplateId: 't' } as unknown as InstallationRecord
+const inst = { id: 'i1' } as unknown as InstallationRecord
+
+let snapshotSeq = 0
+async function freshSnapshot(): Promise<TemplateInputAsset[]> {
+  const assets = await resolveTemplateInputAssetSnapshot(inst, `fresh-${++snapshotSeq}`)
+  if (assets === null) throw new Error('the template workflow did not resolve')
+  return assets
+}
 
 const loadNode = (type: string, filename: unknown) => ({ type, widgets_values: [filename] })
 
 beforeEach(() => loadTemplateJson.mockReset())
 
-describe('resolveTemplateInputAssets', () => {
-  it('derives the input filename from a LoadImage node and points at the repo input dir', async () => {
+describe('resolveTemplateInputAssetSnapshot', () => {
+  it('derives trusted preview metadata from a declared LoadImage input', async () => {
     loadTemplateJson.mockResolvedValue({
       nodes: [loadNode('LoadImage', 'white-hotel-on-rocky-island.png')]
     })
-    const assets = await resolveTemplateInputAssets(inst, 't')
+    const assets = await freshSnapshot()
     expect(assets).toEqual([
       {
+        assetId: 'white-hotel-on-rocky-island.png',
         filename: 'white-hotel-on-rocky-island.png',
+        mediaType: 'image',
+        previewUrl: `${TEMPLATE_INPUT_BASE}/white-hotel-on-rocky-island.png`,
         url: `${TEMPLATE_INPUT_BASE}/white-hotel-on-rocky-island.png`
       }
     ])
@@ -41,7 +54,7 @@ describe('resolveTemplateInputAssets', () => {
       nodes: [],
       definitions: { subgraphs: [{ nodes: [loadNode('LoadImage', 'subject.png')] }] }
     })
-    const assets = await resolveTemplateInputAssets(inst, 't')
+    const assets = await freshSnapshot()
     expect(assets.map((a) => a.filename)).toEqual(['subject.png'])
   })
 
@@ -49,9 +62,25 @@ describe('resolveTemplateInputAssets', () => {
     loadTemplateJson.mockResolvedValue({
       nodes: [loadNode('LoadVideo', 'clip.mp4'), loadNode('LoadAudio', 'voice.mp3')]
     })
-    expect((await resolveTemplateInputAssets(inst, 't')).map((a) => a.filename)).toEqual([
-      'clip.mp4',
-      'voice.mp3'
+    expect(await freshSnapshot()).toMatchObject([
+      { filename: 'clip.mp4', mediaType: 'video' },
+      { filename: 'voice.mp3', mediaType: 'audio' }
+    ])
+  })
+
+  it('uses the safe filename extension when a loader type and media disagree', async () => {
+    loadTemplateJson.mockResolvedValue({
+      nodes: [
+        loadNode('LoadImage', 'clip.mp4'),
+        loadNode('LoadVideo', 'still.webp'),
+        loadNode('LoadAudio', 'voice.wav')
+      ]
+    })
+
+    expect(await freshSnapshot()).toMatchObject([
+      { filename: 'clip.mp4', mediaType: 'video' },
+      { filename: 'still.webp', mediaType: 'image' },
+      { filename: 'voice.wav', mediaType: 'audio' }
     ])
   })
 
@@ -59,7 +88,7 @@ describe('resolveTemplateInputAssets', () => {
     loadTemplateJson.mockResolvedValue({
       nodes: [loadNode('LoadImage', 'dup.png'), loadNode('LoadImage', 'dup.png')]
     })
-    expect(await resolveTemplateInputAssets(inst, 't')).toHaveLength(1)
+    expect(await freshSnapshot()).toHaveLength(1)
   })
 
   it('rejects path-traversal and absolute names', async () => {
@@ -70,31 +99,77 @@ describe('resolveTemplateInputAssets', () => {
         loadNode('LoadImage', 'C:\\evil.png')
       ]
     })
-    expect(await resolveTemplateInputAssets(inst, 't')).toEqual([])
+    expect(await freshSnapshot()).toEqual([])
   })
 
   it('rejects non-media extensions (no arbitrary payloads through input/)', async () => {
     loadTemplateJson.mockResolvedValue({
       nodes: [loadNode('LoadImage', 'weights.safetensors'), loadNode('LoadImage', 'script.py')]
     })
-    expect(await resolveTemplateInputAssets(inst, 't')).toEqual([])
+    expect(await freshSnapshot()).toEqual([])
   })
 
   it('ignores non-loader nodes and non-string widget values', async () => {
     loadTemplateJson.mockResolvedValue({
       nodes: [loadNode('KSampler', 'not-an-input.png'), loadNode('LoadImage', 42)]
     })
-    expect(await resolveTemplateInputAssets(inst, 't')).toEqual([])
+    expect(await freshSnapshot()).toEqual([])
   })
 
   it('strips query params before validating + naming', async () => {
     loadTemplateJson.mockResolvedValue({ nodes: [loadNode('LoadImage', 'a.png?v=2')] })
-    expect((await resolveTemplateInputAssets(inst, 't'))[0]!.filename).toBe('a.png')
+    expect((await freshSnapshot())[0]!.filename).toBe('a.png')
   })
 
-  it('returns [] when the workflow JSON cannot be resolved', async () => {
-    loadTemplateJson.mockResolvedValue(null)
-    expect(await resolveTemplateInputAssets(inst, 't')).toEqual([])
+  it('resolves the workflow once across a burst for the same template', async () => {
+    loadTemplateJson.mockResolvedValue({
+      nodes: [{ type: 'LoadImage', widgets_values: ['subject.png'] }]
+    })
+
+    const [a, b, c] = await Promise.all([
+      resolveTemplateInputAssetSnapshot(inst, 'burst'),
+      resolveTemplateInputAssetSnapshot(inst, 'burst'),
+      resolveTemplateInputAssetSnapshot(inst, 'burst')
+    ])
+
+    expect(loadTemplateJson).toHaveBeenCalledOnce()
+    expect(a).toEqual(b)
+    expect(b).toEqual(c)
+  })
+
+  it('evicts only its own entry when a slow resolution fails late', async () => {
+    let settleFirst!: (value: unknown) => void
+    loadTemplateJson
+      .mockImplementationOnce(() => new Promise((resolve) => (settleFirst = resolve)))
+      .mockResolvedValue({ nodes: [{ type: 'LoadImage', widgets_values: ['subject.png'] }] })
+
+    const slow = resolveTemplateInputAssetSnapshot(inst, 'slow')
+    vi.setSystemTime(Date.now() + 31_000)
+    const second = resolveTemplateInputAssetSnapshot(inst, 'slow')
+    settleFirst(null)
+
+    await expect(slow).resolves.toBeNull()
+    await expect(second).resolves.toHaveLength(1)
+
+    await expect(resolveTemplateInputAssetSnapshot(inst, 'slow')).resolves.toHaveLength(1)
+    expect(loadTemplateJson).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries after an unresolved template rather than caching the failure', async () => {
+    loadTemplateJson.mockResolvedValueOnce(null).mockResolvedValue({
+      nodes: [{ type: 'LoadImage', widgets_values: ['subject.png'] }]
+    })
+
+    await expect(resolveTemplateInputAssetSnapshot(inst, 'retry')).resolves.toBeNull()
+    await expect(resolveTemplateInputAssetSnapshot(inst, 'retry')).resolves.toHaveLength(1)
+    expect(loadTemplateJson).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps unresolved metadata distinct from a resolved template with no inputs', async () => {
+    loadTemplateJson.mockResolvedValueOnce(null).mockResolvedValueOnce({ nodes: [] })
+
+    await expect(resolveTemplateInputAssetSnapshot(inst, 'unresolved')).resolves.toBeNull()
+    await expect(resolveTemplateInputAssetSnapshot(inst, 'no-inputs')).resolves.toEqual([])
   })
 })
 
@@ -113,5 +188,65 @@ describe('resolveInputDir', () => {
       installPath: '/apps/c'
     } as unknown as InstallationRecord
     expect(resolveInputDir(rec)).toMatch(/[/\\]apps[/\\]c[/\\]ComfyUI[/\\]input$/)
+  })
+})
+
+describe('resolveTemplateInputAssetAvailability', () => {
+  it('distinguishes exact files already present in the active input directory', async () => {
+    const access = vi.fn(async (filePath: string) => {
+      if (filePath.endsWith('present.png')) return
+      const error = new Error('missing') as NodeJS.ErrnoException
+      error.code = 'ENOENT'
+      throw error
+    })
+
+    await expect(
+      resolveTemplateInputAssetAvailability(
+        {
+          useSharedInput: false,
+          inputDir: '/inputs'
+        } as unknown as InstallationRecord,
+        ['present.png', 'missing.png'],
+        { access }
+      )
+    ).resolves.toEqual([
+      { filename: 'present.png', status: 'present' },
+      { filename: 'missing.png', status: 'missing' }
+    ])
+  })
+
+  it('rejects unsafe and duplicate declarations without probing outside input', async () => {
+    const access = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }))
+
+    await expect(
+      resolveTemplateInputAssetAvailability(
+        {
+          useSharedInput: false,
+          inputDir: '/inputs'
+        } as unknown as InstallationRecord,
+        ['safe.png', '../escape.png', 'safe.png', 'weights.safetensors'],
+        { access }
+      )
+    ).resolves.toEqual([{ filename: 'safe.png', status: 'missing' }])
+    expect(access).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps non-ENOENT filesystem failures unknown instead of claiming missing', async () => {
+    const access = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
+
+    await expect(
+      resolveTemplateInputAssetAvailability(
+        {
+          useSharedInput: false,
+          inputDir: '/inputs'
+        } as unknown as InstallationRecord,
+        ['private.png'],
+        { access }
+      )
+    ).resolves.toEqual([{ filename: 'private.png', status: 'unknown' }])
   })
 })

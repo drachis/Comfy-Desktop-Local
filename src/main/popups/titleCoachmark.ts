@@ -1,23 +1,14 @@
+import type { CoachmarkBeakPayload } from '../../types/ipc'
 import { ipcMain } from 'electron'
 import type { BrowserWindow, WebContents } from 'electron'
 import { TITLEBAR_HEIGHT } from '../lib/titleBarOverlay'
 import { EmbeddedPopupView } from './embeddedPopupView'
 
-/**
- * First-instance onboarding coachmark popup: a sticky card with an upward beak
- * pointing at the centre title-bar pill. Reuses the `comfyTitleTooltip` renderer
- * (the `variant: 'coachmark'` config switches it to the beak/accent/dismiss card)
- * but owns a separate popup view so its sticky lifecycle (no auto-hide on blur,
- * since the dismiss button needs focus) doesn't fight the tooltip's auto-dismiss.
- */
-
 const COACHMARK_POPUP_INITIAL_WIDTH = 300
 const COACHMARK_POPUP_INITIAL_HEIGHT = 96
-/** Gap (px) between the pill bottom and card top, leaving room for the beak. */
 export const COACHMARK_VERTICAL_GAP = 10
-/** Gutter (px) reserved for the card's box-shadow + beak so neither gets clipped. */
 export const COACHMARK_SHADOW_GUTTER = 18
-/** Fallback show timeout (ms) if the renderer's `:rendered` ack is slow. */
+export const COACHMARK_BEAK_EDGE_MARGIN = 14
 const COACHMARK_RENDER_ACK_TIMEOUT_MS = 120
 
 export interface CoachmarkTheme {
@@ -27,42 +18,58 @@ export interface CoachmarkTheme {
   accent: string
 }
 
+export type CoachmarkKind = 'beta-notice'
+
 export interface CoachmarkConfig {
   variant: 'coachmark'
+  kind: CoachmarkKind
   title: string
   body: string
   dismissLabel: string
+  actionLabel?: string
+  beakFraction?: number
   theme: CoachmarkTheme
   configToken: string
 }
 
-/** Hardcoded mirror of the brand tokens; the popup renderer has no app stylesheet. */
 function resolveCoachmarkTheme(): CoachmarkTheme {
-  return { bg: '#211927', text: '#ffffff', border: '#38303d', accent: '#e3ff3c' }
+  return { bg: '#1c1c21', text: '#f0f0f1', border: '#2d2d31', accent: '#f0f0f1' }
 }
 
 export function buildCoachmarkConfig(opts: {
+  kind: CoachmarkKind
   title: string
   body: string
   dismissLabel: string
+  actionLabel?: string
   token: string
 }): CoachmarkConfig {
   return {
     variant: 'coachmark',
+    kind: opts.kind,
     title: opts.title,
     body: opts.body,
     dismissLabel: opts.dismissLabel,
+    ...(opts.actionLabel ? { actionLabel: opts.actionLabel } : {}),
     theme: resolveCoachmarkTheme(),
     configToken: opts.token
   }
 }
 
-/** Compute popup bounds centering the card under the pill, clamped to the parent. */
+export interface CoachmarkPlacement {
+  x: number
+  y: number
+  width: number
+  height: number
+  beakFraction: number
+  cardCentreInView: number
+}
+
 export function positionCoachmark(opts: {
   anchor: { leftX: number; rightX: number; bottomY: number }
   bubble: { width: number; height: number }
   parentBounds: { width: number; height: number }
-}): { x: number; y: number; width: number; height: number } {
+}): CoachmarkPlacement {
   const viewWidth = Math.max(
     opts.bubble.width + COACHMARK_SHADOW_GUTTER * 2,
     COACHMARK_SHADOW_GUTTER * 2 + 1
@@ -82,7 +89,13 @@ export function positionCoachmark(opts: {
   if (y + viewHeight > opts.parentBounds.height) {
     y = Math.max(0, opts.parentBounds.height - viewHeight)
   }
-  return { x, y, width: viewWidth, height: viewHeight }
+  const cardWidth = Math.max(1, viewWidth - COACHMARK_SHADOW_GUTTER * 2)
+  const cardLeft = x + COACHMARK_SHADOW_GUTTER
+  const rawFraction = (pillCenter - cardLeft) / cardWidth
+  const beakMargin = Math.min(0.5, COACHMARK_BEAK_EDGE_MARGIN / cardWidth)
+  const beakFraction = Math.min(1 - beakMargin, Math.max(beakMargin, rawFraction))
+  const cardCentreInView = viewWidth / 2
+  return { x, y, width: viewWidth, height: viewHeight, beakFraction, cardCentreInView }
 }
 
 let _coachmarkTokenSeq = 0
@@ -96,7 +109,15 @@ interface CoachmarkPopupEntry {
   pendingConfig: CoachmarkConfig | null
   pendingAnchor: { leftX: number; rightX: number; bottomY: number } | null
   pendingConfigToken: string | null
+  kind: CoachmarkKind
+  settleTimer: ReturnType<typeof setTimeout> | null
 }
+
+let findTitleBarByParent: ((parent: BrowserWindow) => WebContents | null) | null = null
+
+let retireDrivingHide = false
+
+const COACHMARK_MOVE_SETTLE_MS = 250
 
 const coachmarkPopupsByParent = new Map<number, CoachmarkPopupEntry>()
 const coachmarkPopupsByWebContents = new Map<number, CoachmarkPopupEntry>()
@@ -115,10 +136,19 @@ function ensureCoachmarkPopup(parent: BrowserWindow): CoachmarkPopupEntry {
       width: COACHMARK_POPUP_INITIAL_WIDTH,
       height: COACHMARK_POPUP_INITIAL_HEIGHT
     },
-    // Sticky: hide only when the host window moves/resizes (stale anchor).
-    // Not on blur — the dismiss button needs focus.
     hideOnParentEvents: ['will-move', 'move', 'resize'],
+    onHide: () => {
+      if (retireDrivingHide) return
+      const entry = coachmarkPopupsByParent.get(parent.id)
+      if (!entry || parent.isDestroyed()) return
+      const tb = findTitleBarByParent?.(parent)
+      if (tb && !tb.isDestroyed()) {
+        tb.send('comfy-titlebar:coachmark-auto-hidden', { kind: entry.kind })
+      }
+    },
     onParentClosed: () => {
+      const entry = coachmarkPopupsByParent.get(parent.id)
+      if (entry?.settleTimer) clearTimeout(entry.settleTimer)
       coachmarkPopupsByParent.delete(parent.id)
       coachmarkPopupsByWebContents.delete(view.popupWebContentsId)
     },
@@ -132,11 +162,47 @@ function ensureCoachmarkPopup(parent: BrowserWindow): CoachmarkPopupEntry {
     view,
     pendingConfig: null,
     pendingAnchor: null,
-    pendingConfigToken: null
+    pendingConfigToken: null,
+    kind: 'beta-notice',
+    settleTimer: null
   }
   coachmarkPopupsByParent.set(view.parentWindowId, entry)
   coachmarkPopupsByWebContents.set(view.popupWebContentsId, entry)
+
+  const scheduleSettled = (): void => {
+    const cur = coachmarkPopupsByParent.get(parent.id)
+    if (!cur) return
+    if (cur.settleTimer) clearTimeout(cur.settleTimer)
+    cur.settleTimer = setTimeout(() => {
+      cur.settleTimer = null
+      if (parent.isDestroyed()) return
+      const tb = findTitleBarByParent?.(parent)
+      if (tb && !tb.isDestroyed()) {
+        tb.send('comfy-titlebar:coachmark-settled', { kind: cur.kind })
+      }
+    }, COACHMARK_MOVE_SETTLE_MS)
+  }
+  for (const event of ['move', 'resize'] as const) {
+    ;(parent as unknown as { on: (e: string, cb: () => void) => void }).on(event, scheduleSettled)
+  }
+
   return entry
+}
+
+function repositionCoachmark(
+  entry: CoachmarkPopupEntry,
+  bubble: { width: number; height: number }
+): void {
+  if (!entry.pendingAnchor || entry.view.isDestroyed()) return
+  const parentBounds = entry.view.parentWindow.getContentBounds()
+  const { beakFraction, cardCentreInView, ...bounds } = positionCoachmark({
+    anchor: entry.pendingAnchor,
+    bubble,
+    parentBounds
+  })
+  entry.view.popup.setBounds(bounds)
+  const beakPayload: CoachmarkBeakPayload = { beakFraction, cardCentreInView }
+  entry.view.popup.webContents.send('comfy-titletooltip:set-beak', beakPayload)
 }
 
 function repositionAndShow(
@@ -144,10 +210,7 @@ function repositionAndShow(
   bubble: { width: number; height: number }
 ): void {
   if (!entry.pendingAnchor || entry.view.isDestroyed()) return
-  const parentBounds = entry.view.parentWindow.getContentBounds()
-  const bounds = positionCoachmark({ anchor: entry.pendingAnchor, bubble, parentBounds })
-  entry.view.popup.setBounds(bounds)
-  // Focus so the dismiss button is keyboard-reachable.
+  repositionCoachmark(entry, bubble)
   entry.view.showOnTop({ focus: true })
 }
 
@@ -158,9 +221,11 @@ export function hideCoachmarkPopup(entry: CoachmarkPopupEntry | undefined): void
 
 export function openCoachmarkPopup(opts: {
   parent: BrowserWindow
+  kind?: CoachmarkKind
   title: string
   body: string
   dismissLabel: string
+  actionLabel?: string
   leftX: number
   rightX: number
   bottomY: number
@@ -170,12 +235,26 @@ export function openCoachmarkPopup(opts: {
 
   entry.pendingAnchor = { leftX: opts.leftX, rightX: opts.rightX, bottomY: opts.bottomY }
   const token = nextCoachmarkToken()
+  const kind = opts.kind ?? 'beta-notice'
   const config = buildCoachmarkConfig({
+    kind,
     title: opts.title,
     body: opts.body,
     dismissLabel: opts.dismissLabel,
+    actionLabel: opts.actionLabel,
     token
   })
+  if (entry.pendingConfigToken !== null && entry.kind !== kind) {
+    const previous = entry.kind
+    const parent = entry.view.parentWindow
+    if (parent && !parent.isDestroyed()) {
+      const tb = findTitleBarByParent?.(parent)
+      if (tb && !tb.isDestroyed()) {
+        tb.send('comfy-titlebar:coachmark-displaced', { kind: previous })
+      }
+    }
+  }
+  entry.kind = kind
   entry.pendingConfigToken = token
   if (entry.view.rendererReady) {
     entry.view.popup.webContents.send('comfy-titletooltip:set-config', config)
@@ -191,12 +270,11 @@ export function openCoachmarkPopup(opts: {
   })
 }
 
-/** Wire the coachmark IPC. Shares the tooltip's `:ready` / `:rendered` channels,
- *  disambiguated by webContents id so only coachmark-popup acks land here. */
 export function registerTitleCoachmarkIpc(opts: {
   findParentByTitleBarSender: (wc: WebContents) => BrowserWindow | null
   findTitleBarByParent: (parent: BrowserWindow) => WebContents | null
 }): void {
+  findTitleBarByParent = opts.findTitleBarByParent
   ipcMain.on('comfy-titletooltip:ready', (event) => {
     const entry = coachmarkPopupsByWebContents.get(event.sender.id)
     if (!entry) return
@@ -216,7 +294,9 @@ export function registerTitleCoachmarkIpc(opts: {
       if (!ackToken || ackToken !== entry.pendingConfigToken) return
       const width = typeof payload?.width === 'number' && payload.width > 0 ? payload.width : 0
       const height = typeof payload?.height === 'number' && payload.height > 0 ? payload.height : 0
-      if (entry.pendingAnchor) repositionAndShow(entry, { width, height })
+      if (entry.pendingAnchor) repositionCoachmark(entry, { width, height })
+      if (entry.view.pendingShowTimer === null) return
+      entry.view.showOnTop({ focus: true })
     }
   )
 
@@ -228,6 +308,7 @@ export function registerTitleCoachmarkIpc(opts: {
         title?: unknown
         body?: unknown
         dismissLabel?: unknown
+        actionLabel?: unknown
         leftX?: unknown
         rightX?: unknown
         bottomY?: unknown
@@ -238,16 +319,19 @@ export function registerTitleCoachmarkIpc(opts: {
       const title = typeof payload?.title === 'string' ? payload.title : ''
       const body = typeof payload?.body === 'string' ? payload.body : ''
       if (!title && !body) return
-      // Renderer supplies the i18n label; main only forwards it.
       const dismissLabel = typeof payload?.dismissLabel === 'string' ? payload.dismissLabel : ''
-      const leftX = typeof payload?.leftX === 'number' ? payload.leftX : 0
-      const rightX = typeof payload?.rightX === 'number' ? payload.rightX : leftX
-      const bottomY = typeof payload?.bottomY === 'number' ? payload.bottomY : TITLEBAR_HEIGHT
+      const actionLabel = typeof payload?.actionLabel === 'string' ? payload.actionLabel : undefined
+      const finite = (v: unknown, fallback: number): number =>
+        typeof v === 'number' && Number.isFinite(v) ? v : fallback
+      const leftX = finite(payload?.leftX, 0)
+      const rightX = finite(payload?.rightX, leftX)
+      const bottomY = finite(payload?.bottomY, TITLEBAR_HEIGHT)
       openCoachmarkPopup({
         parent,
         title,
         body,
         dismissLabel,
+        actionLabel,
         leftX: Math.round(leftX),
         rightX: Math.round(rightX),
         bottomY: Math.round(bottomY)
@@ -261,16 +345,33 @@ export function registerTitleCoachmarkIpc(opts: {
     hideCoachmarkPopup(coachmarkPopupsByParent.get(parent.id))
   })
 
-  // Dismiss fires from the popup's webContents; the title-bar renderer owns the
-  // once-ever flag persistence, so tell it to flip.
-  ipcMain.on('comfy-titlecoachmark:dismiss', (event) => {
-    const entry = coachmarkPopupsByWebContents.get(event.sender.id)
+  const retire = (senderId: number, channel: string, token: string | null): void => {
+    const entry = coachmarkPopupsByWebContents.get(senderId)
     if (!entry) return
-    entry.view.hide()
+    if (token !== null && entry.pendingConfigToken !== null && token !== entry.pendingConfigToken) {
+      return
+    }
+    retireDrivingHide = true
+    try {
+      entry.view.hide()
+    } finally {
+      retireDrivingHide = false
+    }
     const parent = entry.view.parentWindow
     if (parent && !parent.isDestroyed()) {
       const tb = opts.findTitleBarByParent(parent)
-      if (tb && !tb.isDestroyed()) tb.send('comfy-titlebar:coachmark-dismissed')
+      if (tb && !tb.isDestroyed()) tb.send(channel, { kind: entry.kind })
     }
+  }
+
+  const tokenOf = (payload?: { configToken?: unknown }): string | null =>
+    typeof payload?.configToken === 'string' ? payload.configToken : null
+
+  ipcMain.on('comfy-titlecoachmark:dismiss', (event, payload?: { configToken?: unknown }) => {
+    retire(event.sender.id, 'comfy-titlebar:coachmark-dismissed', tokenOf(payload))
+  })
+
+  ipcMain.on('comfy-titlecoachmark:action', (event, payload?: { configToken?: unknown }) => {
+    retire(event.sender.id, 'comfy-titlebar:coachmark-action', tokenOf(payload))
   })
 }

@@ -1,14 +1,19 @@
 import { Buffer } from 'node:buffer'
 
+import { PARTNER_NODE_MINT_SCOPE, WORKSPACE_MINT_SCOPE } from './config'
 import type { AuthStatus } from './types'
 
-/** Claims read (never verified here; the server does that) from the access-token JWT. */
 interface AccessTokenClaims {
   sub?: string
   email?: string
   workspace_id?: string
   workspace_type?: string
   role?: string
+  scope?: string
+  sign_in_provider?: string
+  fam?: unknown
+  iat?: unknown
+  exp?: unknown
 }
 
 function decodeJwtPayload(token: string): AccessTokenClaims | null {
@@ -23,15 +28,6 @@ function decodeJwtPayload(token: string): AccessTokenClaims | null {
   }
 }
 
-/**
- * Signed-in status from an access token's claims. A malformed token still counts
- * as signed in; the identity fields just stay unset.
- *
- * SECURITY: these claims are NOT signature-verified here (the server verifies the
- * token on every request). Treat `role`/`workspaceId`/`workspaceType` as
- * DISPLAY-ONLY; never gate features or access on them client-side, or a forged
- * local token would grant them.
- */
 export function statusFromAccessToken(accessToken: string): AuthStatus {
   const claims = decodeJwtPayload(accessToken)
   return {
@@ -43,12 +39,56 @@ export function statusFromAccessToken(accessToken: string): AuthStatus {
   }
 }
 
-/** The workspace id a token is scoped to, or null. Used to detect a scope switch. */
 export function workspaceIdOf(accessToken: string): string | null {
   return decodeJwtPayload(accessToken)?.workspace_id ?? null
 }
 
-/** The account subject a token belongs to, or null for malformed/legacy tokens. */
+function holdsScope(accessToken: string, scope: string): boolean {
+  const granted = decodeJwtPayload(accessToken)?.scope
+  return typeof granted === 'string' && granted.split(' ').includes(scope)
+}
+
+export function canMintWorkspaceTokens(accessToken: string): boolean {
+  return holdsScope(accessToken, WORKSPACE_MINT_SCOPE)
+}
+
+export function holdsPartnerNodeScope(accessToken: string): boolean {
+  return holdsScope(accessToken, PARTNER_NODE_MINT_SCOPE)
+}
+
+export function lifetimeSecondsOf(accessToken: string): number | null {
+  const { iat, exp } = decodeJwtPayload(accessToken) ?? {}
+  if (typeof iat !== 'number' || typeof exp !== 'number') return null
+  const lifetime = exp - iat
+  return Number.isFinite(lifetime) ? lifetime : null
+}
+
+export function grantFamilyOf(accessToken: string): string | null {
+  const fam = decodeJwtPayload(accessToken)?.fam
+  return typeof fam === 'string' ? fam : null
+}
+
 export function subjectOf(accessToken: string): string | null {
   return decodeJwtPayload(accessToken)?.sub ?? null
+}
+
+export function signInProviderOf(accessToken: string): string | null {
+  const provider = decodeJwtPayload(accessToken)?.sign_in_provider
+  return typeof provider === 'string' ? provider : null
+}
+
+export interface TokenIdentity {
+  userId: string
+  email?: string
+  workspaceId?: string
+}
+
+export function identityOf(accessToken: string): TokenIdentity | null {
+  const claims = decodeJwtPayload(accessToken)
+  if (!claims?.sub) return null
+  return {
+    userId: claims.sub,
+    ...(claims.email ? { email: claims.email } : {}),
+    ...(claims.workspace_id ? { workspaceId: claims.workspace_id } : {})
+  }
 }

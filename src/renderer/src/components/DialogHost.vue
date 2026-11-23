@@ -6,9 +6,6 @@ import BaseAlert from './ui/BaseAlert.vue'
 import SnapshotDiffView from './SnapshotDiffView.vue'
 import { useDialogs } from '../composables/useDialogs'
 
-// Singleton renderer for useDialogs(), mirroring ModalDialog.vue's role for
-// useModal(). Mount once per renderer entry point next to <ModalDialog />.
-
 const {
   state,
   submitPrompt,
@@ -53,14 +50,11 @@ const showConfirm = computed(() => state.open && state.kind === 'confirm')
     @cancel="cancel"
   />
 
-  <!-- ESC / backdrop resolve via `close` (acknowledgement), matching
-       browser alert() semantics where there's nothing to cancel. -->
   <BaseAlert
     :open="showAlert"
     :title="state.alert.title"
     :message="state.alert.message"
     :button-label="state.alert.buttonLabel"
-    :tone="state.alert.tone"
     :message-details="state.alert.messageDetails"
     @close="acknowledgeAlert"
   />
@@ -82,7 +76,6 @@ const showConfirm = computed(() => state.open && state.kind === 'confirm')
     @secondary="confirmSecondary"
     @cancel="cancel"
   >
-    <!-- Restore-confirm diff preview; only rendered when a diff is attached. -->
     <template v-if="state.confirm.restoreDiff" #extra>
       <SnapshotDiffView :diff="state.confirm.restoreDiff" collapsible />
     </template>

@@ -15,6 +15,7 @@ vi.mock('electron', () => ({
   nativeTheme: { on: vi.fn(), shouldUseDarkColors: false }
 }))
 
+import { ipcMain } from 'electron'
 import { _runningSessions } from '../lib/ipc/shared'
 import {
   comfyWindows,
@@ -23,7 +24,12 @@ import {
   nextWindowKey,
   type ComfyWindowEntry
 } from './registry'
-import { prewarmAttachedPanel, refreshComfyTabBody, setActivePanel } from './panelView'
+import {
+  prewarmAttachedPanel,
+  refreshComfyTabBody,
+  registerPanelViewIpc,
+  setActivePanel
+} from './panelView'
 
 interface FakeWindow {
   destroyed: boolean
@@ -129,6 +135,30 @@ describe('setActivePanel', () => {
     expect(fixture.titleBarWc.sent).toHaveLength(0)
   })
 
+  it.each(['performance-test', 'benchmarks'] as const)(
+    'reasserts an already-active %s page so a stale dashboard renderer can recover',
+    (panel) => {
+      const fixture = makeEntry({ activePanel: panel })
+      const panelWc = makeWc()
+      fixture.entry.panelView = {
+        webContents: panelWc
+      } as unknown as ComfyWindowEntry['panelView']
+      comfyWindows.set(fixture.entry.windowKey, fixture.entry)
+
+      setActivePanel(fixture.entry.windowKey, panel)
+
+      expect(fixture.layoutCalls).toBe(1)
+      expect(panelWc.sent).toContainEqual({
+        channel: 'panel-switch',
+        args: [{ panel, installationId: '' }]
+      })
+      expect(fixture.titleBarWc.sent).toContainEqual({
+        channel: 'comfy-titlebar:panel-changed',
+        args: [panel]
+      })
+    }
+  )
+
   it('no-ops when the windowKey does not resolve to an entry', () => {
     expect(() => setActivePanel(999_999, 'feedback')).not.toThrow()
   })
@@ -141,13 +171,8 @@ describe('setActivePanel', () => {
     expect(fixture.entry.activePanel).toBe('comfy')
   })
 
-  // After a chooser-pick in-place attach the picker leaves the host on
-  // 'progress'; prewarmAttachedPanel must reset it to 'comfy' so the rebuilt
-  // panel stays hidden instead of covering the just-attached canvas.
   it('prewarms the attached panel hidden by resetting a progress host to comfy', () => {
     const fixture = makeEntry({ installationId: 'inst-A', activePanel: 'progress' })
-    // A pre-set panelView makes the real ensurePanelView short-circuit, so the
-    // helper runs without constructing an Electron WebContentsView.
     fixture.entry.panelView = {
       webContents: makeWc()
     } as unknown as ComfyWindowEntry['panelView']
@@ -162,6 +187,75 @@ describe('setActivePanel', () => {
     expect(fixture.entry.activePanel).toBe('comfy')
     expect(computeBodyMode(fixture.entry), 'panel hidden, ComfyUI visible').toBe('comfy')
     expect(fixture.layoutCalls, 'the prewarm lays the views out').toBeGreaterThan(0)
+  })
+})
+
+describe('comfy-window:navigate-panel', () => {
+  function makeWindowWithPanel(opts: Parameters<typeof makeEntry>[0]) {
+    const fixture = makeEntry(opts)
+    const panelWc = makeWc()
+    fixture.entry.panelView = {
+      webContents: panelWc,
+      setBackgroundColor: () => {}
+    } as unknown as ComfyWindowEntry['panelView']
+    comfyWindows.set(fixture.entry.windowKey, fixture.entry)
+    return { entry: fixture.entry, panelWc, titleBarWc: fixture.titleBarWc }
+  }
+
+  function navigate(sender: unknown, page: unknown): void {
+    registerPanelViewIpc()
+    const registered = vi
+      .mocked(ipcMain.on)
+      .mock.calls.find(([channel]) => channel === 'comfy-window:navigate-panel')
+    const listener = registered?.[1] as (event: { sender: unknown }, page: unknown) => void
+    listener({ sender }, page)
+  }
+
+  it.each([
+    ['chooser', 'comfy', 'benchmarks'],
+    ['assets', 'comfy', 'benchmarks'],
+    ['benchmarks', 'benchmarks', 'comfy'],
+    ['performance-test', 'performance-test', 'comfy']
+  ] as const)('opens %s in a dashboard window', (page, panel, startingPanel) => {
+    const { entry, panelWc } = makeWindowWithPanel({
+      installationId: null,
+      activePanel: startingPanel
+    })
+
+    navigate(panelWc, page)
+
+    expect(entry.activePanel).toBe(panel)
+    expect(panelWc.sent.at(-1)?.channel).toBe('panel-switch')
+  })
+
+  it('leaves an install-backed window on its current panel', () => {
+    const { entry, panelWc } = makeWindowWithPanel({
+      installationId: 'install-1',
+      activePanel: 'comfy'
+    })
+
+    navigate(panelWc, 'benchmarks')
+
+    expect(entry.activePanel).toBe('comfy')
+  })
+
+  it.each(['feedback', 'new-install', undefined])('ignores the unknown page %s', (page) => {
+    const { entry, panelWc } = makeWindowWithPanel({ installationId: null, activePanel: 'comfy' })
+
+    navigate(panelWc, page)
+
+    expect(entry.activePanel).toBe('comfy')
+  })
+
+  it('ignores a sender that is not a panel', () => {
+    const { entry, titleBarWc } = makeWindowWithPanel({
+      installationId: null,
+      activePanel: 'comfy'
+    })
+
+    navigate(titleBarWc, 'benchmarks')
+
+    expect(entry.activePanel).toBe('comfy')
   })
 })
 
@@ -183,7 +277,6 @@ describe('refreshComfyTabBody', () => {
     comfyWindows.set(fixture.entry.windowKey, fixture.entry)
     indexInstallationId('inst-1', fixture.entry.windowKey)
     refreshComfyTabBody('inst-1')
-    // No layout pass since the entry isn't on the comfy pill.
     expect(fixture.layoutCalls).toBe(0)
   })
 })

@@ -1,21 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 import ArgsBuilderPage from './ArgsBuilderPage.vue'
-import { en } from '../../lib/i18nMessages'
 import type { ComfyArgDef } from '../../types/ipc'
-
-// Pins the deselectable "Choose one" contract: the exclusive group renders as
-// a compact BaseSelect with a synthetic "None" option so it can clear, the
-// label previews every member, and an active group is promoted to the top
-// "Active" section as the same dropdown.
-const i18n = createI18n({
-  legacy: false,
-  locale: 'en',
-  messages: { en },
-  missingWarn: false,
-  fallbackWarn: false
-})
+import { TELEMETRY_ACTION_EVENT_NAME } from '../../lib/telemetry'
+import { SECTION_TITLE_CLASS } from '../../lib/sectionTitle'
 
 const SCHEMA: ComfyArgDef[] = [
   {
@@ -53,8 +41,6 @@ const SCHEMA: ComfyArgDef[] = [
 ]
 
 function stubElectronApi(): void {
-  // Attach to the real window so jsdom listeners survive teardown
-  // (swapping the whole window object breaks BaseSelect's resize/scroll cleanup).
   ;(window as unknown as { api: unknown }).api = {
     getComfyArgs: vi.fn().mockResolvedValue({ args: SCHEMA })
   }
@@ -66,9 +52,6 @@ async function mountPage(initialValue = '', pendingRestart = false): Promise<Vue
   const wrapper = mount(ArgsBuilderPage, {
     props: { installationId: 'inst-1', initialValue, pendingRestart },
     global: {
-      plugins: [i18n],
-      // BaseSelect teleports its popover to <body>; render it in-tree
-      // so we can query options through the wrapper.
       stubs: { Teleport: { template: '<div><slot /></div>' } }
     },
     attachTo: document.body
@@ -83,13 +66,11 @@ function lastUpdate(wrapper: VueWrapper): string {
   return (events.at(-1)?.[0] as string | undefined) ?? ''
 }
 
-// An active group renders the same dropdown twice (Active section + category),
-// so target the first combobox; both share the group's state.
 async function openSelect(wrapper: VueWrapper, index = 0): Promise<void> {
   const triggers = wrapper.findAll('[role="combobox"]')
   const trigger = triggers[index]
   if (!trigger) throw new Error(`No combobox at index ${index}`)
-  await trigger.trigger('click')
+  await trigger.trigger('keydown', { key: 'ArrowDown' })
   await flushPromises()
 }
 
@@ -98,7 +79,7 @@ async function pickOption(wrapper: VueWrapper, labelText: string, index = 0): Pr
   const opts = wrapper.findAll('[role="option"]')
   const target = opts.find((o) => o.text().includes(labelText))
   if (!target) throw new Error(`Option not found: ${labelText}`)
-  await target.trigger('click')
+  await target.trigger('keydown', { key: 'Enter' })
   await flushPromises()
 }
 
@@ -109,13 +90,18 @@ function activeSection(wrapper: VueWrapper) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   stubElectronApi()
 })
 
 afterEach(() => {
-  while (wrappers.length) wrappers.pop()?.unmount()
-  delete (window as unknown as { api?: unknown }).api
-  vi.restoreAllMocks()
+  try {
+    while (wrappers.length) wrappers.pop()?.unmount()
+  } finally {
+    vi.useRealTimers()
+    delete (window as unknown as { api?: unknown }).api
+    vi.restoreAllMocks()
+  }
 })
 
 describe('ArgsBuilderPage — exclusive group dropdown', () => {
@@ -135,6 +121,7 @@ describe('ArgsBuilderPage — exclusive group dropdown', () => {
     const wrapper = await mountPage()
     const label = wrapper.find('.args-page-cluster-label')
     expect(label.exists()).toBe(true)
+    expect(label.classes()).toEqual(expect.arrayContaining(SECTION_TITLE_CLASS.split(' ')))
     expect(label.text()).toContain('--cpu')
     expect(label.text()).toContain('--gpu-only')
     expect(label.text()).toContain('--lowvram')
@@ -177,7 +164,6 @@ describe('ArgsBuilderPage — exclusive group dropdown', () => {
   it('emits the picked flag and replaces siblings on selection', async () => {
     const wrapper = await mountPage('--lowvram')
     await pickOption(wrapper, '--cpu')
-    // No `--lowvram` survives — the parent commits a single-flag string.
     expect(lastUpdate(wrapper)).toBe('--cpu')
   })
 
@@ -205,7 +191,6 @@ describe('ArgsBuilderPage — exclusive group dropdown', () => {
   it('keeps unrelated flags intact when toggling the exclusive group', async () => {
     const wrapper = await mountPage('--port 8188 --lowvram')
     await pickOption(wrapper, 'None (default)')
-    // Only the cluster member is removed; `--port 8188` survives.
     const result = lastUpdate(wrapper)
     expect(result).toContain('--port')
     expect(result).toContain('8188')
@@ -254,7 +239,6 @@ describe('ArgsBuilderPage — raw-args validation', () => {
     const err = wrapper.find('.args-raw-validation-error')
     expect(err.exists()).toBe(true)
     expect(err.text()).toContain('--bogus')
-    // BaseInput surfaces the invalid state via aria-invalid.
     expect(wrapper.find('input[aria-invalid="true"]').exists()).toBe(true)
   })
 
@@ -282,18 +266,161 @@ describe('ArgsBuilderPage — raw-args validation', () => {
 
   it('holds off flagging the trailing flag while the raw input is focused', async () => {
     const wrapper = await mountPage('--po')
-    // Unfocused: the partial is flagged as unsupported.
     expect(wrapper.find('.args-raw-validation-error').exists()).toBe(true)
 
-    // Focused: the trailing flag being typed is no longer flagged.
-    await wrapper.find('.args-raw-input').trigger('focusin')
+    await wrapper.find('.args-raw-input input').trigger('focusin')
     await flushPromises()
     expect(wrapper.find('.args-raw-validation-error').exists()).toBe(false)
     expect(wrapper.find('input[aria-invalid="true"]').exists()).toBe(false)
 
-    // Blur: validation applies again.
-    await wrapper.find('.args-raw-input').trigger('focusout')
+    await wrapper.find('.args-raw-input input').trigger('focusout')
     await flushPromises()
     expect(wrapper.find('.args-raw-validation-error').exists()).toBe(true)
+  })
+})
+
+describe('ArgsBuilderPage — args.changed telemetry', () => {
+  function captureTelemetry(): { events: string[]; stop: () => void } {
+    const events: string[] = []
+    const listener = (e: Event): void => {
+      events.push((e as CustomEvent<{ actionName: string }>).detail.actionName)
+    }
+    window.addEventListener(TELEMETRY_ACTION_EVENT_NAME, listener)
+    return { events, stop: () => window.removeEventListener(TELEMETRY_ACTION_EVENT_NAME, listener) }
+  }
+
+  type ArgsChangedContext = { arg_key?: string; value_kind?: string }
+
+  function captureArgsChanged(): { contexts: ArgsChangedContext[]; stop: () => void } {
+    const contexts: ArgsChangedContext[] = []
+    const listener = (e: Event): void => {
+      const detail = (e as CustomEvent<{ actionName: string; context?: ArgsChangedContext }>).detail
+      if (detail.actionName === 'comfy.desktop.args.changed') contexts.push(detail.context ?? {})
+    }
+    window.addEventListener(TELEMETRY_ACTION_EVENT_NAME, listener)
+    return {
+      contexts,
+      stop: () => window.removeEventListener(TELEMETRY_ACTION_EVENT_NAME, listener)
+    }
+  }
+
+  it('emits args.changed once the 500ms debounce elapses', async () => {
+    const wrapper = await mountPage()
+    const { events, stop } = captureTelemetry()
+    try {
+      await wrapper.find('button[role="switch"]').trigger('click')
+      await flushPromises()
+      expect(events).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(500)
+      expect(events).toEqual(['comfy.desktop.args.changed'])
+    } finally {
+      stop()
+    }
+  })
+
+  it('coalesces a burst of edits into a single emission', async () => {
+    const wrapper = await mountPage()
+    const { events, stop } = captureTelemetry()
+    try {
+      const switches = wrapper.findAll('button[role="switch"]')
+      for (const toggle of switches.slice(0, 3)) {
+        await toggle.trigger('click')
+        await vi.advanceTimersByTimeAsync(100)
+      }
+      await vi.advanceTimersByTimeAsync(500)
+      expect(events).toEqual(['comfy.desktop.args.changed'])
+    } finally {
+      stop()
+    }
+  })
+
+  it('flushes a pending args.changed when the page unmounts mid-debounce', async () => {
+    const wrapper = await mountPage()
+    const { contexts, stop } = captureArgsChanged()
+    try {
+      await wrapper.find('button[role="switch"]').trigger('click')
+      await flushPromises()
+      expect(contexts).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(100)
+      wrapper.unmount()
+      expect(contexts).toHaveLength(1)
+      expect(contexts[0]?.arg_key).toBe('port')
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not emit a second args.changed after the flush', async () => {
+    const wrapper = await mountPage()
+    const { contexts, stop } = captureArgsChanged()
+    try {
+      await wrapper.find('button[role="switch"]').trigger('click')
+      await flushPromises()
+      wrapper.unmount()
+      expect(contexts).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(contexts).toHaveLength(1)
+    } finally {
+      stop()
+    }
+  })
+
+  it('emits nothing on unmount when no edit is pending', async () => {
+    const wrapper = await mountPage()
+    const { contexts, stop } = captureArgsChanged()
+    try {
+      wrapper.unmount()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(contexts).toEqual([])
+    } finally {
+      stop()
+    }
+  })
+
+  it('flushes the last edit of a burst, not the first', async () => {
+    const wrapper = await mountPage()
+    const { contexts, stop } = captureArgsChanged()
+    try {
+      await wrapper.find('button[role="switch"]').trigger('click')
+      await vi.advanceTimersByTimeAsync(100)
+      await pickOption(wrapper, '--cpu')
+      await vi.advanceTimersByTimeAsync(100)
+
+      wrapper.unmount()
+      expect(contexts).toHaveLength(1)
+      expect(contexts[0]?.arg_key).toBe('cpu')
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('ArgsBuilderPage — flag switch', () => {
+  it('uses the shared ToggleSwitch for every flag row', async () => {
+    const wrapper = await mountPage()
+    const switches = wrapper.findAll('.args-page-arg-row button[role="switch"]')
+    expect(switches.length).toBeGreaterThan(0)
+    for (const toggle of switches) {
+      expect(toggle.attributes('data-slot')).toBe('toggle-switch')
+      expect(toggle.find('[data-slot="toggle-switch-knob"]').exists()).toBe(true)
+    }
+    expect(wrapper.find('.args-page-switch-thumb').exists()).toBe(false)
+  })
+
+  it('keeps the flag name as the accessible label and flips aria-checked on click', async () => {
+    const wrapper = await mountPage()
+    const toggle = wrapper.find('button[role="switch"][aria-label="--port"]')
+    expect(toggle.attributes('aria-checked')).toBe('false')
+
+    await toggle.trigger('click')
+    await flushPromises()
+
+    expect(lastUpdate(wrapper)).toContain('--port')
+    expect(
+      wrapper.find('button[role="switch"][aria-label="--port"]').attributes('aria-checked')
+    ).toBe('true')
   })
 })

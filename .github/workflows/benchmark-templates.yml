@@ -1,0 +1,29 @@
+name: Benchmark templates
+
+on:
+  pull_request:
+    paths:
+      - 'assets/benchmark-templates.json'
+      - 'scripts/benchmark-templates.mjs'
+      - '.github/workflows/benchmark-templates.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'assets/benchmark-templates.json'
+      - 'scripts/benchmark-templates.mjs'
+      - '.github/workflows/benchmark-templates.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          package-manager-cache: false
+          node-version-file: .nvmrc
+      - run: node scripts/benchmark-templates.mjs validate

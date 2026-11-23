@@ -32,6 +32,9 @@ vi.mock('../settings', () => ({
 }))
 
 vi.mock('electron', () => ({
+  session: {
+    fromPartition: vi.fn((partition: string) => ({ __partition: partition }))
+  },
   net: {
     request: vi.fn((options: { url: string } & Record<string, unknown>) => {
       const req = Object.assign(new EventEmitter(), {
@@ -49,6 +52,8 @@ vi.mock('electron', () => ({
 }))
 
 import { startModelTransfer, type ModelTransferOptions } from './modelDownloadTransport'
+import { DEFAULT_SEGMENT_TUNING, planSegments, type SegmentTuning } from './modelDownloadSegments'
+import { DISK_SPACE_RESERVE_BYTES } from './modelDownloadSpace'
 
 interface FakeResponse extends EventEmitter {
   statusCode: number
@@ -69,7 +74,6 @@ function makeResponse(
   }) as FakeResponse
 }
 
-/** Flush a couple of macrotask turns so stream close callbacks run. */
 async function flush(turns = 4): Promise<void> {
   for (let i = 0; i < turns; i++) {
     await new Promise((r) => setImmediate(r))
@@ -133,7 +137,6 @@ describe('completion', () => {
     res.emit('data', Buffer.from('01234'))
     await flush()
 
-    // Mid-transfer: bytes live ONLY under the staging name.
     expect(fs.existsSync(finalPath)).toBe(false)
     expect(fs.existsSync(stagingPathFor(finalPath))).toBe(true)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.url).toBe(URL_MAIN)
@@ -186,9 +189,6 @@ describe('completion', () => {
   })
 
   it('never finalizes a body whose total size cannot be verified', async () => {
-    // Fresh 200 with no Content-Length, no caller expectation and no
-    // persisted total: the bytes cannot be proven complete, so they must
-    // never land under a recognized model extension (issue #1322).
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
     const res = makeResponse(200, {})
@@ -199,8 +199,6 @@ describe('completion', () => {
     expect(outcome.outcome).toBe('error')
     expect((outcome as { error: string }).error).toMatch(/did not report a size/)
     expect(fs.existsSync(finalPath)).toBe(false)
-    // Staged bytes and sidecar survive so a Range retry can learn the total
-    // from a 206 Content-Range and then verify.
     expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('0123456789')
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.url).toBe(URL_MAIN)
   })
@@ -245,7 +243,6 @@ describe('pause / cancel', () => {
     expect(fs.existsSync(finalPath)).toBe(false)
     expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(5)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.etag).toBe('"v1"')
-    // Already settled: a second stop is a no-op.
     expect(handle.pause()).toBe(false)
     expect(handle.cancel()).toBe(false)
   })
@@ -297,10 +294,6 @@ describe('network failure', () => {
   })
 
   it('aborts a stalled transfer and keeps staged bytes', async () => {
-    // Fake timers: the idle timer must fire only when WE advance the clock,
-    // after the data chunk landed - otherwise a loaded runner could burn the
-    // 25 ms window during the synchronous response setup and abort before
-    // any byte was staged.
     vi.useFakeTimers()
     let handle!: ReturnType<typeof startModelTransfer>
     let req!: (typeof requests)[number]
@@ -312,8 +305,6 @@ describe('network failure', () => {
       res.emit('data', Buffer.from('012'))
       await vi.advanceTimersByTimeAsync(30)
     } finally {
-      // The stream close callback that settles `done` is fs I/O, not a
-      // timer - real timers must be back before awaiting it.
       vi.useRealTimers()
     }
     const outcome = await handle.done
@@ -352,10 +343,6 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // RFC 9110 requires Content-Range on every 206. A server that omits it
-    // gives no proof its body continues our staged bytes - splicing it in
-    // blind could corrupt the file. The staged pair stays for a retry
-    // against a compliant response.
     const res = makeResponse(206, { 'content-length': '5' })
     req.emit('response', res)
     res.emit('data', Buffer.from('BBBBB'))
@@ -372,8 +359,6 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // Range says 5 bytes (5-9) but Content-Length says 4: internally
-    // inconsistent response - no part of it can be trusted.
     const res = makeResponse(206, { 'content-length': '4', 'content-range': 'bytes 5-9/10' })
     req.emit('response', res)
     const outcome = await handle.done
@@ -386,16 +371,12 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // A misbehaving server/proxy answers with a range that does NOT start at
-    // our staged byte count - appending its body would corrupt the file.
     const res = makeResponse(206, { 'content-length': '8', 'content-range': 'bytes 2-9/10' })
     req.emit('response', res)
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
     expect(req.abort).toHaveBeenCalled()
     await flush()
-    // The staged pair is not resumable against this source - discarded so the
-    // next attempt restarts clean.
     expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
     expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(false)
     expect(fs.existsSync(finalPath)).toBe(false)
@@ -419,7 +400,6 @@ describe('resume', () => {
     res.emit('end')
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
-    // New content only - the stale staged bytes were discarded, not prepended.
     expect(fs.readFileSync(finalPath, 'utf-8')).toBe('CCCCCCCCCC')
   })
 
@@ -428,8 +408,6 @@ describe('resume', () => {
     const handle = startModelTransfer(baseOpts())
     const headers = headerCalls(requests[0]!)
     expect(headers['Range']).toBeUndefined()
-    // The unverifiable pair was discarded; a fresh zero-byte placeholder +
-    // sidecar replace it so a crash right here still hydrates a job.
     expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(0)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.url).toBe(URL_MAIN)
     handle.cancel()
@@ -459,7 +437,6 @@ describe('resume', () => {
   it('never treats staged bytes EXCEEDING the expected size as complete', async () => {
     preStage('0123456789X', stagedMeta({ expectedSize: 10 }))
     const handle = startModelTransfer(baseOpts())
-    // Corrupt overrun: restart clean instead of finalizing.
     expect(requests).toHaveLength(1)
     const headers = headerCalls(requests[0]!)
     expect(headers['Range']).toBeUndefined()
@@ -470,14 +447,10 @@ describe('resume', () => {
   })
 
   it('finalizes on HTTP 416 only with server-confirmed proof of completeness', async () => {
-    // Sidecar total unknown (0) so the pre-network completion path is
-    // skipped; a resume request goes out from byte 10.
     preStage('0123456789', stagedMeta({ expectedSize: 0 }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
     expect(headerCalls(req)['Range']).toBe('bytes=10-')
-    // RFC 9110 unsatisfied-range response confirms the real total equals our
-    // staged byte count - independent proof the file is complete.
     req.emit('response', makeResponse(416, { 'content-range': 'bytes */10' }))
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
@@ -499,7 +472,6 @@ describe('resume', () => {
   it('treats a malformed 416 Content-Range as failure, not as absent', async () => {
     preStage('0123456789', stagedMeta({ expectedSize: 0 }))
     const handle = startModelTransfer(baseOpts())
-    // Present but garbage: must NOT fall through to any finalize heuristic.
     requests[0]!.emit('response', makeResponse(416, { 'content-range': 'bytes */banana' }))
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
@@ -509,8 +481,6 @@ describe('resume', () => {
   it('does not finalize on HTTP 416 when the server reports a different total', async () => {
     preStage('0123456789', stagedMeta({ expectedSize: 0 }))
     const handle = startModelTransfer(baseOpts())
-    // RFC 9110 unsatisfied-range response names the REAL total - 12, not our
-    // staged 10, so the staged bytes are stale content, not a complete file.
     requests[0]!.emit('response', makeResponse(416, { 'content-range': 'bytes */12' }))
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
@@ -521,8 +491,6 @@ describe('resume', () => {
   it('does not finalize on HTTP 416 when the caller expects a different total', async () => {
     preStage('0123456789', stagedMeta({ expectedSize: 0 }))
     const handle = startModelTransfer(baseOpts({ expectedSize: 12 }))
-    // Server confirms 10 bytes total but the CALLER expects 12: the staged
-    // content cannot be the model the caller asked for.
     requests[0]!.emit('response', makeResponse(416, { 'content-range': 'bytes */10' }))
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
@@ -533,8 +501,6 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10 }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // Right start offset, wrong entity: the server now reports 20 total bytes
-    // where our staged pair expects 10 - appending would corrupt the file.
     const res = makeResponse(206, { 'content-length': '15', 'content-range': 'bytes 5-19/20' })
     req.emit('response', res)
     const outcome = await handle.done
@@ -560,8 +526,6 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // If-Range compliance forbids a 206 for a changed entity; a broken server
-    // that answers 206 with a NEW ETag must not have its bytes spliced in.
     const res = makeResponse(206, {
       'content-length': '5',
       'content-range': 'bytes 5-9/10',
@@ -596,8 +560,6 @@ describe('resume', () => {
     preStage('AAAAA', stagedMeta({ expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // Chunked 206 with a valid Content-Range but no Content-Length. The
-    // interrupted short body must NOT finalize as a complete model.
     const res = makeResponse(206, { 'content-range': 'bytes 5-9/10' })
     req.emit('response', res)
     res.emit('data', Buffer.from('BBB'))
@@ -608,7 +570,6 @@ describe('resume', () => {
       error: 'Download incomplete: expected 10 bytes but got 8'
     })
     expect(fs.existsSync(finalPath)).toBe(false)
-    // Retained for resume - 8 of 10 bytes staged.
     expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('AAAAABBB')
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.expectedSize).toBe(10)
   })
@@ -616,8 +577,6 @@ describe('resume', () => {
   it('restarts clean instead of finalizing when the caller expects a different size', async () => {
     preStage('0123456789', stagedMeta({ expectedSize: 10 }))
     const handle = startModelTransfer(baseOpts({ expectedSize: 12 }))
-    // Staged bytes match the sidecar but NOT what the caller now expects -
-    // stale content; a fresh request goes out with no Range header.
     expect(requests).toHaveLength(1)
     const headers = headerCalls(requests[0]!)
     expect(headers['Range']).toBeUndefined()
@@ -628,8 +587,6 @@ describe('resume', () => {
   })
 
   it('uses Last-Modified for If-Range when the staged ETag is weak', () => {
-    // RFC 9110: a weak ETag never guarantees byte-for-byte equality, so it
-    // must not gate a Range splice.
     preStage('AAAAA', stagedMeta({ etag: 'W/"v1"', lastModified: 'Wed, 01 Jan 2026' }))
     startModelTransfer(baseOpts())
     const headers = headerCalls(requests[0]!)
@@ -666,7 +623,6 @@ describe('sha-256 integrity', () => {
     req.emit('response', res)
     res.emit('data', Buffer.from('01234'))
     await flush()
-    // The expectation survives a crash: a hydrated resume can still verify.
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.sha256).toBe(SHA_0123456789)
 
     res.emit('data', Buffer.from('56789'))
@@ -686,7 +642,6 @@ describe('sha-256 integrity', () => {
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
     expect((outcome as { code?: string }).code).toBe('checksum-mismatch')
-    // Wrong bytes are not short bytes: nothing to resume, so nothing stays.
     expect(fs.existsSync(finalPath)).toBe(false)
     expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
     expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(false)
@@ -721,7 +676,6 @@ describe('sha-256 integrity', () => {
     preStage('AAAAA', stagedMeta({ sha256: SHA_0123456789, expectedSize: 10, etag: '"v1"' }))
     const handle = startModelTransfer(baseOpts({ sha256: SHA_AAAAABBBBB }))
     const headers = headerCalls(requests[0]!)
-    // Splicing onto bytes for other content could only fail verification.
     expect(headers['Range']).toBeUndefined()
     expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(0)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))?.sha256).toBe(SHA_AAAAABBBBB)
@@ -733,7 +687,6 @@ describe('sha-256 integrity', () => {
     preStage('0123456789', stagedMeta({ sha256: SHA_AAAAABBBBB, expectedSize: 10 }))
     const handle = startModelTransfer(baseOpts())
     const outcome = await handle.done
-    // Hydrated finalize without a network attempt still runs verification.
     expect(requests).toHaveLength(0)
     expect(outcome.outcome).toBe('error')
     expect((outcome as { code?: string }).code).toBe('checksum-mismatch')
@@ -767,7 +720,6 @@ describe('redirects', () => {
     handle.pause()
     await handle.done
 
-    // A later resume keys off the original url, not the redirect target.
     const resumed = startModelTransfer(baseOpts())
     const req2 = requests[1]!
     expect(req2.__url).toBe(URL_MAIN)
@@ -822,8 +774,6 @@ describe('R2 mirror fallback', () => {
 describe('durable staging placeholder', () => {
   it('persists a hydratable pair before any network response arrives', async () => {
     const handle = startModelTransfer(baseOpts({ jobId: 'job-1', expectedSize: 10 }))
-    // No response yet - a quit/crash right now must still leave a pair the
-    // next launch can hydrate into a paused job.
     expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(0)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))).toMatchObject({
       url: URL_MAIN,
@@ -846,7 +796,6 @@ describe('durable staging placeholder', () => {
 })
 
 describe('staging durability failures', () => {
-  /** Throw only for writes matching `match`; pass every other write through. */
   function failWritesMatching(match: (file: string) => boolean): ReturnType<typeof vi.spyOn> {
     const realWriteFileSync = fs.writeFileSync.bind(fs)
     return vi.spyOn(fs, 'writeFileSync').mockImplementation(((
@@ -866,7 +815,6 @@ describe('staging durability failures', () => {
     spy.mockRestore()
     expect(outcome.outcome).toBe('error')
     expect((outcome as { error: string }).error).toMatch(/cannot create staging file/)
-    // The failure happened before the request was ever issued.
     expect(requests.length).toBe(0)
     expect(fs.existsSync(finalPath)).toBe(false)
   })
@@ -881,14 +829,12 @@ describe('staging durability failures', () => {
       error: 'Download failed: cannot write staging metadata'
     })
     expect(requests.length).toBe(0)
-    // The .part placeholder that DID land stays for a later retry.
     expect(fs.existsSync(stagingPathFor(finalPath))).toBe(true)
   })
 
   it('refuses body bytes when the response-phase sidecar rewrite fails', async () => {
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // Initial placeholder + sidecar landed fine; the refresh on response fails.
     const spy = failWritesMatching((file) => file.endsWith('.dl-meta.tmp'))
     const res = makeResponse(200, { 'content-length': '10' })
     req.emit('response', res)
@@ -899,8 +845,6 @@ describe('staging durability failures', () => {
       error: 'Download failed: cannot write staging metadata'
     })
     expect(req.abort).toHaveBeenCalled()
-    // No byte was accepted without a durable resume identity - even ones the
-    // aborted response flushes late.
     res.emit('data', Buffer.from('0123456789'))
     res.emit('end')
     await flush()
@@ -912,13 +856,10 @@ describe('staging durability failures', () => {
 
 describe('orphan staged bytes (no sidecar)', () => {
   it('parks orphan .part bytes aside instead of truncating them', async () => {
-    // A `.part` with no readable sidecar may be quarantined migration data of
-    // unknown provenance - never a new transfer's to claim or destroy.
     fs.mkdirSync(path.dirname(finalPath), { recursive: true })
     fs.writeFileSync(stagingPathFor(finalPath), 'foreign bytes')
     const handle = startModelTransfer(baseOpts())
     const req = requests[0]!
-    // The new transfer starts fresh - no Range resume into foreign bytes.
     expect(headerCalls(req)['Range']).toBeUndefined()
     const res = makeResponse(200, { 'content-length': '10' })
     req.emit('response', res)
@@ -927,7 +868,6 @@ describe('orphan staged bytes (no sidecar)', () => {
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
     expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
-    // The orphan bytes were preserved under a parked non-model name.
     expect(fs.readFileSync(stagingPathFor(finalPath) + '.orphan', 'utf-8')).toBe('foreign bytes')
   })
 
@@ -935,7 +875,6 @@ describe('orphan staged bytes (no sidecar)', () => {
     fs.mkdirSync(path.dirname(finalPath), { recursive: true })
     const orphanPath = stagingPathFor(finalPath)
     fs.writeFileSync(orphanPath, 'foreign bytes')
-    // Both park primitives (hard link and claim+rename fallback) fail.
     const realLinkSync = fs.linkSync.bind(fs)
     const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation(((
       from: Parameters<typeof fs.linkSync>[0],
@@ -958,7 +897,6 @@ describe('orphan staged bytes (no sidecar)', () => {
     renameSpy.mockRestore()
     expect(outcome.outcome).toBe('error')
     expect((outcome as { error: string }).error).toMatch(/unidentified staged bytes/)
-    // No network activity and no truncation of the unmovable bytes.
     expect(requests.length).toBe(0)
     expect(fs.readFileSync(orphanPath, 'utf-8')).toBe('foreign bytes')
     expect(fs.existsSync(finalPath)).toBe(false)
@@ -974,7 +912,6 @@ describe('setup failures settle the transfer', () => {
     const handle = startModelTransfer(baseOpts())
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'error', error: 'Download failed: bad url' })
-    // The pre-network placeholder stays hydratable.
     expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(true)
   })
 
@@ -1017,7 +954,6 @@ describe('terminal race safety', () => {
     req.emit('response', res)
     res.emit('data', Buffer.from('abcd'))
     res.emit('end')
-    // Verification claimed the outcome synchronously on 'end'.
     expect(handle.pause()).toBe(false)
     expect(handle.cancel()).toBe(false)
     const outcome = await handle.done
@@ -1034,7 +970,6 @@ describe('terminal race safety', () => {
     expect(handle.cancel()).toBe(true)
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'cancelled' })
-    // The aborted request may still flush buffered events.
     res.emit('data', Buffer.from('56789'))
     res.emit('end')
     res.emit('error', new Error('aborted'))
@@ -1052,8 +987,6 @@ describe('final destination conflicts', () => {
     const res = makeResponse(200, { 'content-length': '10' })
     req.emit('response', res)
     res.emit('data', Buffer.from('01234'))
-    // The user (or another process) drops a DIFFERENT file at the final name
-    // mid-download - the verified staged bytes must not overwrite it.
     fs.writeFileSync(finalPath, 'XXX')
     res.emit('data', Buffer.from('56789'))
     res.emit('end')
@@ -1061,7 +994,6 @@ describe('final destination conflicts', () => {
     expect(outcome.outcome).toBe('error')
     expect((outcome as { error: string }).error).toMatch(/already exists/)
     expect(fs.readFileSync(finalPath, 'utf-8')).toBe('XXX')
-    // Staged bytes survive the conflict for the user to resolve.
     expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('0123456789')
   })
 
@@ -1076,7 +1008,6 @@ describe('final destination conflicts', () => {
     res.emit('end')
     const outcome = await handle.done
     expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
-    // The independently placed identical file stays authoritative.
     expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
     expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
     expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(false)
@@ -1088,16 +1019,12 @@ describe('final destination conflicts', () => {
     const res = makeResponse(200, { 'content-length': '10' })
     req.emit('response', res)
     res.emit('data', Buffer.from('01234'))
-    // Same length as the download but different content - e.g. a different
-    // model that happens to match in size. Equal length must never be
-    // accepted as proof of identity.
     fs.writeFileSync(finalPath, 'ZZZZZZZZZZ')
     res.emit('data', Buffer.from('56789'))
     res.emit('end')
     const outcome = await handle.done
     expect(outcome.outcome).toBe('error')
     expect((outcome as { error: string }).error).toMatch(/already exists/)
-    // Both files are preserved for the user to resolve.
     expect(fs.readFileSync(finalPath, 'utf-8')).toBe('ZZZZZZZZZZ')
     expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('0123456789')
   })
@@ -1133,8 +1060,6 @@ describe('final destination conflicts', () => {
   })
 
   it('fails closed on a real link error instead of degrading to claim+rename', async () => {
-    // A genuine I/O failure must surface as the transfer error it is, keeping
-    // the staged bytes for retry.
     const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
       const err = new Error('EIO: i/o error') as NodeJS.ErrnoException
       err.code = 'EIO'
@@ -1150,8 +1075,6 @@ describe('final destination conflicts', () => {
       const outcome = await handle.done
       expect(outcome.outcome).toBe('error')
       expect((outcome as { error: string }).error).toMatch(/EIO/)
-      // No zero-byte claim marker was left at the final name; staged bytes
-      // and sidecar survive for retry.
       expect(fs.existsSync(finalPath)).toBe(false)
       expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('0123456789')
       expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(true)
@@ -1208,5 +1131,794 @@ describe('final destination conflicts', () => {
       openSpy.mockRestore()
       linkSpy.mockRestore()
     }
+  })
+})
+
+describe('segment planning', () => {
+  it('splits a large file into equal ranges with the remainder on the last one', () => {
+    const tuning: SegmentTuning = {
+      ...DEFAULT_SEGMENT_TUNING,
+      minBytes: 8,
+      minSegmentBytes: 3,
+      maxSegments: 3
+    }
+    expect(planSegments(10, tuning)).toEqual([
+      { start: 0, end: 2, done: 0 },
+      { start: 3, end: 5, done: 0 },
+      { start: 6, end: 9, done: 0 }
+    ])
+  })
+
+  it('keeps small files and files without room for two segments on one stream', () => {
+    expect(planSegments(63 * 1024 * 1024, DEFAULT_SEGMENT_TUNING)).toBeNull()
+    expect(
+      planSegments(10, { ...DEFAULT_SEGMENT_TUNING, minBytes: 8, minSegmentBytes: 6 })
+    ).toBeNull()
+  })
+
+  it('caps a 20 GB model at eight segments', () => {
+    const segments = planSegments(20_533_762_817, DEFAULT_SEGMENT_TUNING)!
+    expect(segments).toHaveLength(8)
+    expect(segments[0]!.start).toBe(0)
+    expect(segments[7]!.end).toBe(20_533_762_816)
+  })
+})
+
+describe('segmented download', () => {
+  const tuning: Partial<SegmentTuning> = {
+    minBytes: 8,
+    maxSegments: 2,
+    minSegmentBytes: 4,
+    persistEveryBytes: 1_000_000,
+    maxAttempts: 3
+  }
+
+  const CDN_URL = 'https://cdn.example.com/signed?expires=1'
+  const callerSession = { __fake: 'caller' } as unknown as Electron.Session
+
+  const probeHeaders = {
+    'content-length': '10',
+    'accept-ranges': 'bytes',
+    etag: '"v1"'
+  }
+
+  function rangeResponse(from: number, to: number): FakeResponse {
+    return makeResponse(206, {
+      'content-range': `bytes ${from}-${to}/10`,
+      'content-length': String(to - from + 1),
+      etag: '"v1"'
+    })
+  }
+
+  function startSegmented(overrides: Partial<ModelTransferOptions> = {}) {
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning, ...overrides }))
+    const probe = requests[0]!
+    probe.emit('response', makeResponse(200, probeHeaders))
+    return { handle, probe }
+  }
+
+  function preStageSegments(bytes: Buffer, segments: StagedDownloadMeta['segments']): void {
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+    fs.writeFileSync(stagingPathFor(finalPath), bytes)
+    writeStagedMeta(
+      stagingMetaPathFor(finalPath),
+      stagedMeta({ version: 3, expectedSize: 10, etag: '"v1"', segments })
+    )
+  }
+
+  it('drops the probe, fetches each range from the original URL and assembles them in order', async () => {
+    const progress: number[] = []
+    const { handle, probe } = startSegmented({ onProgress: (p) => progress.push(p.receivedBytes) })
+
+    expect(probe.abort).toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
+    const [, first, second] = requests
+    expect(first!.__url).toBe(URL_MAIN)
+    expect(second!.__url).toBe(URL_MAIN)
+    expect(headerCalls(first!)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+    expect(headerCalls(second!)).toMatchObject({ Range: 'bytes=5-9', 'If-Range': '"v1"' })
+    expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(10)
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toEqual([
+      { start: 0, end: 4, done: 0 },
+      { start: 5, end: 9, done: 0 }
+    ])
+
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+    tail.emit('end')
+    const head = rangeResponse(0, 4)
+    first!.emit('response', head)
+    head.emit('data', Buffer.from('012'))
+    head.emit('data', Buffer.from('34'))
+    head.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
+    expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(false)
+    expect(progress).toEqual([5, 8, 10])
+  })
+
+  it('resumes a partly done segmented download by asking only for the missing bytes', async () => {
+    const staged = Buffer.alloc(10)
+    staged.write('0123456', 0)
+    preStageSegments(staged, [
+      { start: 0, end: 4, done: 5 },
+      { start: 5, end: 9, done: 2 }
+    ])
+
+    const progress: number[] = []
+    const handle = startModelTransfer(
+      baseOpts({ segmentTuning: tuning, onProgress: (p) => progress.push(p.receivedBytes) })
+    )
+    expect(requests).toHaveLength(1)
+    const req = requests[0]!
+    expect(headerCalls(req)).toMatchObject({ Range: 'bytes=7-9', 'If-Range': '"v1"' })
+
+    const res = rangeResponse(7, 9)
+    req.emit('response', res)
+    res.emit('data', Buffer.from('789'))
+    res.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    expect(progress).toEqual([10])
+  })
+
+  it('stays on one stream when the server does not advertise byte ranges', async () => {
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    const req = requests[0]!
+    const res = makeResponse(200, { 'content-length': '10', etag: '"v1"' })
+    req.emit('response', res)
+    res.emit('data', Buffer.from('0123456789'))
+    res.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome.outcome).toBe('completed')
+    expect(requests).toHaveLength(1)
+    expect(req.abort).not.toHaveBeenCalled()
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it('stays on one stream for a file under the size threshold', async () => {
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    const req = requests[0]!
+    const res = makeResponse(200, { 'content-length': '6', 'accept-ranges': 'bytes', etag: '"v1"' })
+    req.emit('response', res)
+    res.emit('data', Buffer.from('012345'))
+    res.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome.outcome).toBe('completed')
+    expect(requests).toHaveLength(1)
+  })
+
+  it('falls back to one plain stream from byte zero when a range gets a 200', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    first!.emit('response', makeResponse(200, probeHeaders))
+
+    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    expect(second!.abort).toHaveBeenCalled()
+    const plain = requests[3]!
+    expect(plain.__url).toBe(URL_MAIN)
+    expect(headerCalls(plain)['Range']).toBeUndefined()
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toBeUndefined()
+
+    const res = makeResponse(200, probeHeaders)
+    plain.emit('response', res)
+    expect(requests).toHaveLength(4)
+    res.emit('data', Buffer.from('0123456789'))
+    res.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it('pause keeps every written segment byte and the next request continues from them', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    const head = rangeResponse(0, 4)
+    first!.emit('response', head)
+    head.emit('data', Buffer.from('012'))
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    expect(handle.pause()).toBe(true)
+    expect(await handle.done).toEqual({ outcome: 'paused' })
+    expect(first!.abort).toHaveBeenCalled()
+    expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(10)
+    const meta = readStagedMeta(stagingMetaPathFor(finalPath))
+    expect(meta?.version).toBe(3)
+    expect(meta?.segments).toEqual([
+      { start: 0, end: 4, done: 3 },
+      { start: 5, end: 9, done: 5 }
+    ])
+
+    const before = requests.length
+    const again = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    expect(requests).toHaveLength(before + 1)
+    const rest = requests[before]!
+    expect(headerCalls(rest)).toMatchObject({ Range: 'bytes=3-4', 'If-Range': '"v1"' })
+    const res = rangeResponse(3, 4)
+    rest.emit('response', res)
+    res.emit('data', Buffer.from('34'))
+    res.emit('end')
+
+    const outcome = await again.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it('aborts a range that sent all its bytes but never ended once the download completes', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    const head = rangeResponse(0, 4)
+    first!.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+    tail.emit('end')
+
+    expect(await handle.done).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(first!.abort).toHaveBeenCalled()
+    expect(second!.abort).not.toHaveBeenCalled()
+  })
+
+  it('pause aborts a range that sent all its bytes but never ended', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    const head = rangeResponse(0, 4)
+    first!.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56'))
+
+    expect(handle.pause()).toBe(true)
+    expect(await handle.done).toEqual({ outcome: 'paused' })
+    expect(first!.abort).toHaveBeenCalled()
+    expect(second!.abort).toHaveBeenCalled()
+  })
+
+  it('aborts a range that sent all its bytes when its response does not end within the idle timeout', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { handle } = startSegmented({ idleTimeoutMs: 20 })
+      const [, first, second] = requests
+      const head = rangeResponse(0, 4)
+      first!.emit('response', head)
+      head.emit('data', Buffer.from('01234'))
+      const tail = rangeResponse(5, 9)
+      second!.emit('response', tail)
+      tail.emit('data', Buffer.from('56'))
+      vi.advanceTimersByTime(15)
+      tail.emit('data', Buffer.from('7'))
+      vi.advanceTimersByTime(15)
+
+      expect(first!.abort).toHaveBeenCalled()
+      expect(second!.abort).not.toHaveBeenCalled()
+      expect(requests).toHaveLength(3)
+
+      tail.emit('data', Buffer.from('89'))
+      tail.emit('end')
+      const outcome = await handle.done
+      expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+      expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancel deletes the staged segments', async () => {
+    const { handle } = startSegmented()
+    const head = rangeResponse(0, 4)
+    requests[1]!.emit('response', head)
+    head.emit('data', Buffer.from('012'))
+
+    expect(handle.cancel()).toBe(true)
+    expect(await handle.done).toEqual({ outcome: 'cancelled' })
+    expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
+    expect(fs.existsSync(stagingMetaPathFor(finalPath))).toBe(false)
+  })
+
+  it('retries a failed range from the original URL so an expired signed redirect is resolved again', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    first!.emit('redirect', 302, 'GET', CDN_URL)
+    expect(requests).toHaveLength(4)
+    requests[3]!.emit('error', new Error('net::ERR_CONNECTION_RESET'))
+
+    expect(requests).toHaveLength(5)
+    const retried = requests[4]!
+    expect(retried.__url).toBe(URL_MAIN)
+    expect(retried.__options['session']).toBeUndefined()
+    expect(headerCalls(retried)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+
+    const head = rangeResponse(0, 4)
+    retried.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    const outcome = await handle.done
+    expect(outcome.outcome).toBe('completed')
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it('fetches a part that redirects to another host on its own session without cookies', async () => {
+    const { handle } = startSegmented({ session: callerSession })
+    const [, first, second] = requests
+    expect(first!.__options['session']).toBe(callerSession)
+    expect(first!.__options['useSessionCookies']).toBe(true)
+
+    first!.emit('redirect', 302, 'GET', CDN_URL)
+    second!.emit('redirect', 302, 'GET', CDN_URL)
+
+    expect(first!.abort).toHaveBeenCalled()
+    expect(first!.followRedirect).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(5)
+    const [, , , headPart, tailPart] = requests
+    expect(headPart!.__url).toBe(CDN_URL)
+    expect(headPart!.__options['session']).toEqual({ __partition: 'comfy-download-part-0' })
+    expect(headPart!.__options['useSessionCookies']).toBeUndefined()
+    expect(headPart!.__options['redirect']).toBe('manual')
+    expect(headerCalls(headPart!)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+    expect(tailPart!.__options['session']).toEqual({ __partition: 'comfy-download-part-1' })
+    expect(headerCalls(tailPart!)).toMatchObject({ Range: 'bytes=5-9', 'If-Range': '"v1"' })
+
+    const head = rangeResponse(0, 4)
+    headPart!.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+    const tail = rangeResponse(5, 9)
+    tailPart!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it("keeps a part on the caller's session when it is answered by the original host", async () => {
+    const { handle } = startSegmented({ session: callerSession })
+    const [, first, second] = requests
+
+    first!.emit('redirect', 307, 'GET', 'https://example.com/api/resolve-cache/model.safetensors')
+    expect(first!.followRedirect).toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
+
+    const head = rangeResponse(0, 4)
+    first!.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    const outcome = await handle.done
+    expect(outcome.outcome).toBe('completed')
+    expect(requests).toHaveLength(3)
+    for (const part of [first!, second!]) {
+      expect(part.__options['session']).toBe(callerSession)
+      expect(part.__options['useSessionCookies']).toBe(true)
+    }
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it.each([401, 403])(
+    "falls back once to the caller's session when a part session gets HTTP %i",
+    async (status) => {
+      const { handle } = startSegmented({ session: callerSession })
+      const [, first, second] = requests
+      first!.emit('redirect', 302, 'GET', CDN_URL)
+      const partRequest = requests[3]!
+      partRequest.emit('response', makeResponse(status, {}))
+
+      expect(partRequest.abort).toHaveBeenCalled()
+      expect(requests).toHaveLength(5)
+      const fallback = requests[4]!
+      expect(fallback.__url).toBe(URL_MAIN)
+      expect(fallback.__options['session']).toBe(callerSession)
+      expect(fallback.__options['useSessionCookies']).toBe(true)
+      expect(headerCalls(fallback)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+
+      fallback.emit('redirect', 302, 'GET', CDN_URL)
+      expect(fallback.followRedirect).toHaveBeenCalled()
+      expect(requests).toHaveLength(5)
+
+      const head = rangeResponse(0, 4)
+      fallback.emit('response', head)
+      head.emit('data', Buffer.from('01234'))
+      second!.emit('redirect', 302, 'GET', CDN_URL)
+      expect(second!.followRedirect).toHaveBeenCalled()
+      expect(requests).toHaveLength(5)
+      const tail = rangeResponse(5, 9)
+      second!.emit('response', tail)
+      tail.emit('data', Buffer.from('56789'))
+
+      const outcome = await handle.done
+      expect(outcome.outcome).toBe('completed')
+      expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    }
+  )
+
+  it('keeps staged segments after a range fails on every attempt', async () => {
+    const { handle } = startSegmented()
+    const tail = rangeResponse(5, 9)
+    requests[2]!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+    requests[1]!.emit('error', new Error('net::ERR_CONNECTION_RESET'))
+    requests[3]!.emit('error', new Error('net::ERR_CONNECTION_RESET'))
+    requests[4]!.emit('error', new Error('net::ERR_CONNECTION_RESET'))
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({
+      outcome: 'error',
+      error: 'Download failed: net::ERR_CONNECTION_RESET'
+    })
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toEqual([
+      { start: 0, end: 4, done: 0 },
+      { start: 5, end: 9, done: 5 }
+    ])
+  })
+
+  it('discards staged segments when the server says the content changed', async () => {
+    const { handle } = startSegmented()
+    const res = makeResponse(206, {
+      'content-range': 'bytes 0-4/10',
+      'content-length': '5',
+      etag: '"v2"'
+    })
+    requests[1]!.emit('response', res)
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({
+      outcome: 'error',
+      error: 'Download failed: content changed on the server during resume'
+    })
+    expect(fs.existsSync(stagingPathFor(finalPath))).toBe(false)
+  })
+
+  it('waits for a running range to finish before asking again for a range answered 429', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    first!.emit('response', makeResponse(429, { 'retry-after': '0' }))
+
+    expect(first!.abort).toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
+
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    expect(requests).toHaveLength(4)
+    const again = requests[3]!
+    expect(headerCalls(again)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+    const head = rangeResponse(0, 4)
+    again.emit('response', head)
+    head.emit('data', Buffer.from('01234'))
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+    expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+  })
+
+  it('retries a range answered 503 after Retry-After when it runs alone, and keeps the bytes after the last attempt', async () => {
+    const { handle } = startSegmented()
+    const [, first, second] = requests
+    const tail = rangeResponse(5, 9)
+    second!.emit('response', tail)
+    tail.emit('data', Buffer.from('56789'))
+
+    first!.emit('response', makeResponse(503, { 'retry-after': '0' }))
+    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    requests[3]!.emit('response', makeResponse(503, { 'retry-after': '0' }))
+    await vi.waitFor(() => expect(requests).toHaveLength(5))
+    requests[4]!.emit('response', makeResponse(503, { 'retry-after': '0' }))
+
+    const outcome = await handle.done
+    expect(outcome).toEqual({ outcome: 'error', error: 'Download failed: HTTP 503' })
+    expect(requests).toHaveLength(5)
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toEqual([
+      { start: 0, end: 4, done: 0 },
+      { start: 5, end: 9, done: 5 }
+    ])
+  })
+
+  it.each([
+    [
+      'a Content-Range for other bytes',
+      makeResponse(206, { 'content-range': 'bytes 1-4/10', 'content-length': '4', etag: '"v1"' })
+    ],
+    ['HTTP 416', makeResponse(416, { 'content-range': 'bytes */10' })]
+  ])(
+    'falls back to one plain stream from byte zero when a range gets %s',
+    async (_label, answer) => {
+      const { handle } = startSegmented()
+      requests[1]!.emit('response', answer)
+
+      await vi.waitFor(() => expect(requests).toHaveLength(4))
+      expect(requests[2]!.abort).toHaveBeenCalled()
+      const plain = requests[3]!
+      expect(headerCalls(plain)['Range']).toBeUndefined()
+
+      const res = makeResponse(200, probeHeaders)
+      plain.emit('response', res)
+      res.emit('data', Buffer.from('0123456789'))
+      res.emit('end')
+
+      const outcome = await handle.done
+      expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+      expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    }
+  )
+
+  it('does not count a range as stalled while it waits for a connection and another range is receiving', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const { handle } = startSegmented({ idleTimeoutMs: 20 })
+      const [, first, second] = requests
+      const tail = rangeResponse(5, 9)
+      second!.emit('response', tail)
+      tail.emit('data', Buffer.from('56'))
+      vi.advanceTimersByTime(15)
+      tail.emit('data', Buffer.from('7'))
+      vi.advanceTimersByTime(15)
+      tail.emit('data', Buffer.from('8'))
+      vi.advanceTimersByTime(15)
+
+      expect(first!.abort).not.toHaveBeenCalled()
+      expect(requests).toHaveLength(3)
+
+      tail.emit('data', Buffer.from('9'))
+      const head = rangeResponse(0, 4)
+      first!.emit('response', head)
+      head.emit('data', Buffer.from('01234'))
+
+      const outcome = await handle.done
+      expect(outcome).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+      expect(fs.readFileSync(finalPath, 'utf-8')).toBe('0123456789')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('counts a range waiting for a connection as stalled when no other range is receiving', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { handle } = startSegmented({ idleTimeoutMs: 20 })
+    try {
+      const first = requests[1]!
+      vi.advanceTimersByTime(25)
+
+      expect(first.abort).toHaveBeenCalled()
+      expect(requests.length).toBeGreaterThan(3)
+      expect(headerCalls(requests[requests.length - 1]!)['Range']).toMatch(/^bytes=/)
+    } finally {
+      handle.cancel()
+      await handle.done
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits out Retry-After before asking again for a range parked behind a running one', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const { handle } = startSegmented()
+    try {
+      const [, first, second] = requests
+      first!.emit('response', makeResponse(429, { 'retry-after': '20' }))
+      const tail = rangeResponse(5, 9)
+      second!.emit('response', tail)
+      tail.emit('data', Buffer.from('56789'))
+
+      expect(requests).toHaveLength(3)
+      vi.advanceTimersByTime(19_000)
+      expect(requests).toHaveLength(3)
+      vi.advanceTimersByTime(1_000)
+      expect(requests).toHaveLength(4)
+      expect(headerCalls(requests[3]!)).toMatchObject({ Range: 'bytes=0-4', 'If-Range': '"v1"' })
+    } finally {
+      handle.cancel()
+      await handle.done
+      vi.useRealTimers()
+    }
+  })
+
+  it('pauses a retried range that refills the write queue and resumes that same range once it drains', async () => {
+    const MIB = 1024 * 1024
+    const half = 16 * MIB
+    const total = 2 * half
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    requests[0]!.emit(
+      'response',
+      makeResponse(200, { 'content-length': String(total), 'accept-ranges': 'bytes', etag: '"v1"' })
+    )
+    const part = (from: number, to: number): FakeResponse =>
+      makeResponse(206, {
+        'content-range': `bytes ${from}-${to}/${total}`,
+        'content-length': String(to - from + 1),
+        etag: '"v1"'
+      })
+
+    const dropped = part(0, half - 1)
+    requests[1]!.emit('response', dropped)
+    dropped.emit('data', Buffer.alloc(9 * MIB, 1))
+    expect(dropped.pause).toHaveBeenCalled()
+    dropped.emit('error', new Error('net::ERR_CONNECTION_RESET'))
+
+    expect(requests).toHaveLength(4)
+    expect(headerCalls(requests[3]!)['Range']).toBe(`bytes=${9 * MIB}-${half - 1}`)
+    const replacement = part(9 * MIB, half - 1)
+    requests[3]!.emit('response', replacement)
+    replacement.emit('data', Buffer.alloc(MIB, 2))
+    expect(replacement.pause).toHaveBeenCalled()
+
+    await vi.waitFor(() => expect(replacement.resume).toHaveBeenCalled())
+    expect(dropped.resume).not.toHaveBeenCalled()
+    handle.cancel()
+    await handle.done
+  })
+
+  it('keeps the saved SHA-256 when a resumed range falls back to one stream', async () => {
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+    fs.writeFileSync(stagingPathFor(finalPath), Buffer.alloc(10))
+    writeStagedMeta(
+      stagingMetaPathFor(finalPath),
+      stagedMeta({
+        version: 3,
+        expectedSize: 10,
+        etag: '"v1"',
+        sha256: '84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882',
+        segments: [
+          { start: 0, end: 4, done: 0 },
+          { start: 5, end: 9, done: 0 }
+        ]
+      })
+    )
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    expect(requests).toHaveLength(2)
+    requests[0]!.emit('response', makeResponse(200, probeHeaders))
+
+    await vi.waitFor(() => expect(requests).toHaveLength(3))
+    const plain = requests[2]!
+    expect(headerCalls(plain)['Range']).toBeUndefined()
+    const res = makeResponse(200, probeHeaders)
+    plain.emit('response', res)
+    res.emit('data', Buffer.from('abcdefghij'))
+    res.emit('end')
+
+    const outcome = await handle.done
+    expect(outcome).toMatchObject({ outcome: 'error', code: 'checksum-mismatch' })
+    expect(fs.existsSync(finalPath)).toBe(false)
+  })
+
+  it('starts over rather than send a mirror validator to the original URL once mirrors are off', async () => {
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+    fs.writeFileSync(stagingPathFor(finalPath), Buffer.alloc(10))
+    writeStagedMeta(
+      stagingMetaPathFor(finalPath),
+      stagedMeta({
+        version: 3,
+        expectedSize: 10,
+        etag: '"v1"',
+        segments: [
+          { start: 0, end: 4, done: 5 },
+          { start: 5, end: 9, done: 0 }
+        ],
+        segmentsFromMirror: true
+      })
+    )
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.__url).toBe(URL_MAIN)
+    expect(headerCalls(requests[0]!)['Range']).toBeUndefined()
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toBeUndefined()
+    handle.cancel()
+    await handle.done
+  })
+})
+
+describe('disk space', () => {
+  const tuning: Partial<SegmentTuning> = {
+    minBytes: 8,
+    maxSegments: 2,
+    minSegmentBytes: 4,
+    persistEveryBytes: 1_000_000,
+    maxAttempts: 3
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function freeBytes(bytes: number): void {
+    vi.spyOn(fs, 'statfsSync').mockReturnValue({ bavail: bytes, bsize: 1 } as never)
+  }
+
+  const shortfall = 'Free up 0.6 GB of space, then try again'
+
+  it('stops before writing when the drive cannot hold the file', async () => {
+    freeBytes(100)
+    const handle = startModelTransfer(baseOpts())
+    const req = requests[0]!
+    req.emit('response', makeResponse(200, { 'content-length': '10' }))
+    expect(await handle.done).toEqual({ outcome: 'error', error: shortfall })
+    expect(req.abort).toHaveBeenCalled()
+    expect(fs.existsSync(finalPath)).toBe(false)
+  })
+
+  it('stops a parallel download before asking for any range', async () => {
+    freeBytes(100)
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    requests[0]!.emit(
+      'response',
+      makeResponse(200, { 'content-length': '10', 'accept-ranges': 'bytes', etag: '"v1"' })
+    )
+    expect(await handle.done).toEqual({ outcome: 'error', error: shortfall })
+    expect(requests).toHaveLength(1)
+  })
+
+  it('keeps saved ranges and asks for nothing when a resume no longer fits', async () => {
+    freeBytes(100)
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true })
+    fs.writeFileSync(stagingPathFor(finalPath), '')
+    fs.truncateSync(stagingPathFor(finalPath), 10)
+    const segments = [
+      { start: 0, end: 4, done: 0 },
+      { start: 5, end: 9, done: 0 }
+    ]
+    writeStagedMeta(
+      stagingMetaPathFor(finalPath),
+      stagedMeta({ version: 3, expectedSize: 10, etag: '"v1"', segments })
+    )
+    const handle = startModelTransfer(baseOpts({ segmentTuning: tuning }))
+    const outcome = await handle.done
+    expect(outcome).toMatchObject({ outcome: 'error' })
+    expect((outcome as { error: string }).error).toBe(shortfall)
+    expect(requests).toHaveLength(0)
+    expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(10)
+    expect(readStagedMeta(stagingMetaPathFor(finalPath))?.segments).toEqual(segments)
+  })
+
+  it('downloads when the drive has room', async () => {
+    freeBytes(DISK_SPACE_RESERVE_BYTES + 10)
+    const handle = startModelTransfer(baseOpts())
+    const req = requests[0]!
+    const res = makeResponse(200, { 'content-length': '10' })
+    req.emit('response', res)
+    res.emit('data', Buffer.from('0123456789'))
+    res.emit('end')
+    expect(await handle.done).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+  })
+
+  it('downloads when free space cannot be read', async () => {
+    vi.spyOn(fs, 'statfsSync').mockImplementation(() => {
+      throw new Error('ENOSYS')
+    })
+    const handle = startModelTransfer(baseOpts())
+    const req = requests[0]!
+    const res = makeResponse(200, { 'content-length': '10' })
+    req.emit('response', res)
+    res.emit('data', Buffer.from('0123456789'))
+    res.emit('end')
+    expect(await handle.done).toEqual({ outcome: 'completed', savePath: finalPath, finalBytes: 10 })
+  })
+
+  it('does not check a download whose size the server does not give', async () => {
+    const statfs = vi.spyOn(fs, 'statfsSync')
+    const handle = startModelTransfer(baseOpts())
+    const req = requests[0]!
+    const res = makeResponse(200, {})
+    req.emit('response', res)
+    res.emit('data', Buffer.from('0123456789'))
+    res.emit('end')
+    await handle.done
+    expect(statfs).not.toHaveBeenCalled()
   })
 })

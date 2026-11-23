@@ -15,7 +15,6 @@ import {
   pipFreeze,
   runUvPip as sharedRunUvPip,
   installFilteredRequirements,
-  getPipIndexArgs,
   type PipMirrorConfig
 } from '../pip'
 import { installCnrNode, switchCnrVersion, isSafePathComponent } from '../cnr'
@@ -23,17 +22,12 @@ import { killProcTree } from '../process'
 import { formatComfyVersion } from '../version'
 import { getActivePythonPath, getActiveUvPath, getActiveVenvDir } from '../pythonEnv'
 import { findSitePackages } from '../../sources/standalone/envPaths'
-import type { Snapshot, RestoreResult, NodeRestoreResult } from './types'
+import type { Snapshot, RestoreResult, RestoreRevertOutcome, NodeRestoreResult } from './types'
 import type { ScannedNode } from '../nodes'
 import type { InstallationRecord } from '../../installations'
 import type { ComfyVersion } from '../version'
 import * as settings from '../../settings'
 
-/** Packages never modified during snapshot restore: core tooling plus the
- *  torch stack itself (owned by the torch transaction, not pip sync). Stack
- *  packages are named EXACTLY — ordinary torch-ecosystem deps a snapshot can
- *  restore fine (torchsde, torchmetrics, torchdiffeq…) must stay managed by
- *  the pip sync, or v1 snapshots could never fully restore. */
 const PROTECTED_EXACT = new Set([
   'pip',
   'setuptools',
@@ -45,12 +39,6 @@ const PROTECTED_EXACT = new Set([
   'torio',
   'functorch',
   'triton',
-  // Intel XPU runtime family members protected by exact name because a
-  // prefix would swallow unrelated user packages (mkl-fft, mkl-service,
-  // intel-extension-for-pytorch, ...). 'pyelftools' is general-purpose but
-  // a hard dependency of the XPU triton build - the sync removing it breaks
-  // the protected triton, so it is protected with it (tradeoff: a snapshot
-  // recording pyelftools for its own sake will not install it either).
   'mkl',
   'intel-opencl-rt',
   'intel-openmp',
@@ -61,26 +49,6 @@ const PROTECTED_EXACT = new Set([
   'umf',
   'pyelftools'
 ])
-// Prefixes matched as `<prefix>` / `<prefix>-*` / `<prefix>_*` (never a bare
-// substring — 'torchsde' must not match 'torch'): torch-tensorrt and
-// torch_scatter compile against torch's ABI, 'nvidia' covers
-// nvidia-cublas-cu12 etc., 'triton' covers triton-windows,
-// 'pytorch-triton' covers pytorch-triton-rocm, 'cuda' covers cuda-bindings.
-// The 'amd-*-device' prefixes cover AMD's multi-arch per-architecture
-// device-overlay wheels (amd-torch-device-gfx*, amd-torchvision-device-gfx*):
-// they only resolve from AMD's index via the torch [device-all] extras, so
-// the torch phase owns them - a plain pip sync can neither install nor
-// remove them safely. Deliberately NOT a bare 'amd' prefix, so ordinary
-// AMD-published libraries (e.g. amd-quark) stay snapshot-restorable.
-// The oneAPI prefixes cover the XPU stack's runtime family (dpcpp-cpp-rt,
-// intel-cmplr-*, onemkl-sycl-*, oneccl/impi bindings, level-zero): pip
-// installs them as ordinary dependencies of torch +xpu wheels, so without
-// protection a snapshot from another vendor uninstalls them from an Intel
-// install (breaking the local stack) and an Intel snapshot installs them
-// onto AMD/NVIDIA installs. Deliberately NOT bare 'intel' or 'mkl'
-// prefixes: ordinary Intel-published libraries (mkl-fft, mkl-service,
-// intel-extension-for-pytorch) must stay snapshot-restorable - the
-// remaining runtime members are protected by exact name above.
 const PROTECTED_PREFIXES = [
   'torch',
   'nvidia',
@@ -107,10 +75,6 @@ export function isProtectedPackage(name: string): boolean {
   )
 }
 
-/** Constraint pins for the currently installed protected packages. Only plain
- *  `name==version` pins are valid in a constraints file: editable installs
- *  (`-e ...`) and PEP 508 direct references (bare URL values from pipFreeze)
- *  are skipped — the post-repair freeze diff still flags any drift on them. */
 export function buildProtectedConstraints(freeze: Record<string, string>): string[] {
   return Object.entries(freeze)
     .filter(
@@ -122,35 +86,20 @@ export function buildProtectedConstraints(freeze: Record<string, string>): strin
 
 export interface ProtectedDriftEntry {
   name: string
-  /** Version the snapshot records; null when the package is not in the snapshot. */
   target: string | null
-  /** Version installed now; null when the package is absent. */
   live: string | null
 }
 
-/**
- * Protected packages whose live version differs from the snapshot's freeze.
- * The exact pip sync never mutates protected packages (torch stack, CUDA
- * runtime, core tooling), so after a restore this diff is what tells the
- * caller whether the live state actually reached the snapshot's recorded
- * state — the torch transaction reconciles the stack itself, but e.g. a v1
- * snapshot with a different torchvision has no stack record to reconcile it.
- */
 export async function protectedPackageDrift(
   installation: InstallationRecord,
   targetPips: Record<string, string>
 ): Promise<ProtectedDriftEntry[]> {
   const uvPath = getActiveUvPath(installation)
   const pythonPath = getActivePythonPath(installation)
-  // Throw rather than return [] — "can't measure" must surface as unknown
-  // drift, never as known-zero.
   if (!pythonPath || !fs.existsSync(uvPath)) {
     throw new Error('Python environment or uv not found')
   }
   const live = await pipFreeze(uvPath, pythonPath)
-  // Compare under PEP 503 canonical names — distribution names are
-  // case-insensitive and treat -/_/. as equivalent, so snapshot `Torch` and
-  // live `torch` are the same package, not one missing and one extra.
   const canon = (name: string): string => name.toLowerCase().replace(/[-_.]+/g, '-')
   const liveByCanon = new Map(
     Object.entries(live).map(([name, version]) => [canon(name), { name, version }])
@@ -173,19 +122,15 @@ export async function protectedPackageDrift(
   return drift
 }
 
-/** Normalize a package name for dist-info directory matching (PEP 503). */
 function normalizeDistInfoName(name: string): string {
   return name.toLowerCase().replace(/[-_.]+/g, '_')
 }
 
-/** Find a package's dist-info directory in site-packages. */
 function findDistInfoDir(sitePackages: string, packageName: string): string | null {
   const normalized = normalizeDistInfoName(packageName)
   try {
     for (const entry of fs.readdirSync(sitePackages)) {
       if (!entry.endsWith('.dist-info')) continue
-      // Format {normalized_name}-{version}.dist-info; normalized name uses _, so the first
-      // '-' separates name from version.
       const stem = entry.slice(0, -'.dist-info'.length)
       const dashIdx = stem.indexOf('-')
       if (dashIdx < 0) continue
@@ -198,7 +143,6 @@ function findDistInfoDir(sitePackages: string, packageName: string): string | nu
   return null
 }
 
-/** Find all site-packages entries belonging to a package, via the dist-info RECORD file. */
 function findPackageEntries(sitePackages: string, packageName: string): string[] {
   const entries: string[] = []
   const distInfo = findDistInfoDir(sitePackages, packageName)
@@ -224,7 +168,6 @@ function findPackageEntries(sitePackages: string, packageName: string): string[]
       }
     }
   } catch {
-    // Fallback: common name patterns
     const normalized = normalizeDistInfoName(packageName)
     for (const suffix of ['', '.py', '.libs', '.data']) {
       const candidate = normalized + suffix
@@ -237,14 +180,18 @@ function findPackageEntries(sitePackages: string, packageName: string): string[]
   return entries
 }
 
-/** Back up only the site-packages entries belonging to `packageNames`. */
-async function createTargetedBackup(sitePackages: string, packageNames: string[]): Promise<string> {
+async function createTargetedBackup(
+  sitePackages: string,
+  packageNames: string[]
+): Promise<{ dir: string; uncaptured: string[] }> {
   const backupDir = path.join(path.dirname(sitePackages), `.restore-backup-${Date.now()}`)
   await fs.promises.mkdir(backupDir, { recursive: true })
 
   const failures: string[] = []
+  const uncaptured: string[] = []
   for (const pkg of packageNames) {
     const pkgEntries = findPackageEntries(sitePackages, pkg)
+    if (pkgEntries.length === 0) uncaptured.push(pkg)
     for (const entry of pkgEntries) {
       const src = path.join(sitePackages, entry)
       const dst = path.join(backupDir, entry)
@@ -263,37 +210,78 @@ async function createTargetedBackup(sitePackages: string, packageNames: string[]
   }
 
   if (failures.length > 0) {
-    // Clean up incomplete backup
     await fs.promises.rm(backupDir, { recursive: true, force: true }).catch(() => {})
     throw new Error(`Backup failed for ${failures.length} entry(s): ${failures.join('; ')}`)
   }
 
-  return backupDir
+  return { dir: backupDir, uncaptured }
 }
 
-/** Restore backed-up package files to site-packages. */
-async function restoreFromBackup(backupDir: string, sitePackages: string): Promise<void> {
+async function restoreFromBackup(backupDir: string, sitePackages: string): Promise<boolean> {
+  let entries: string[]
   try {
-    const entries = await fs.promises.readdir(backupDir)
-    for (const entry of entries) {
-      const src = path.join(backupDir, entry)
-      const dst = path.join(sitePackages, entry)
-      await fs.promises.rm(dst, { recursive: true, force: true }).catch(() => {})
+    entries = await fs.promises.readdir(backupDir)
+  } catch (err) {
+    console.error('Failed to read backup directory:', (err as Error).message)
+    return false
+  }
+
+  let allRestored = true
+  for (const entry of entries) {
+    const src = path.join(backupDir, entry)
+    const dst = path.join(sitePackages, entry)
+    try {
       const stat = await fs.promises.stat(src)
+      await fs.promises.rm(dst, { recursive: true, force: true }).catch(() => {})
       if (stat.isDirectory()) {
         await fs.promises.cp(src, dst, { recursive: true })
       } else {
         await fs.promises.copyFile(src, dst)
       }
+    } catch (err) {
+      console.error(`Failed to restore ${entry} from backup:`, (err as Error).message)
+      allRestored = false
     }
-  } catch (err) {
-    console.error('Failed to restore from backup:', (err as Error).message)
   }
+  return allRestored
+}
+
+const DIST_METADATA_SUFFIXES = ['.dist-info', '.egg-info', '.egg-link']
+
+const UNVERSIONED_METADATA_SUFFIXES = new Set(['.egg-link'])
+
+function stemBelongsTo(stem: string, normalizedName: string, versioned: boolean): boolean {
+  if (stem === normalizedName) return true
+  if (!versioned) return false
+  if (!stem.startsWith(`${normalizedName}_`)) return false
+  return /^\d/.test(stem.slice(normalizedName.length + 1))
+}
+
+export function preexistingOnDisk(sitePackages: string, packageNames: string[]): string[] {
+  if (packageNames.length === 0) return []
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(sitePackages)
+  } catch {
+    return [...packageNames]
+  }
+  const stems: Array<{ stem: string; versioned: boolean }> = []
+  for (const entry of entries) {
+    const suffix = DIST_METADATA_SUFFIXES.find((s) => entry.endsWith(s))
+    if (!suffix) continue
+    stems.push({
+      stem: normalizeDistInfoName(entry.slice(0, -suffix.length)),
+      versioned: !UNVERSIONED_METADATA_SUFFIXES.has(suffix)
+    })
+  }
+  return packageNames.filter((name) => {
+    const normalized = normalizeDistInfoName(name)
+    return stems.some(({ stem, versioned }) => stemBelongsTo(stem, normalized, versioned))
+  })
 }
 
 const runUvPip = sharedRunUvPip
 
-/** Restore the ComfyUI version to the snapshot's commit, checking it out if HEAD differs. */
 export async function restoreComfyUIVersion(
   installPath: string,
   targetSnapshot: Snapshot,
@@ -339,14 +327,6 @@ export async function restoreComfyUIVersion(
   return { changed: true, commit: newHead }
 }
 
-/**
- * Installation-record overrides that freeze a snapshot-created install to the
- * snapshot's pinned ComfyUI version. `autoUpdateComfyUI: false` stops the
- * post-install auto-update (the snapshot restore is the sole authority for the
- * core commit). Pass the snapshot's updateChannel to mirror it as the manual
- * update preference; omit it to leave whatever channel the install was built
- * with (the restore re-applies the channel via buildPostRestoreState).
- */
 export function frozenSnapshotInstallOverrides(snapshotUpdateChannel?: string): {
   autoUpdateComfyUI: false
   updateChannel?: 'stable' | 'latest'
@@ -359,11 +339,6 @@ export function frozenSnapshotInstallOverrides(snapshotUpdateChannel?: string): 
   }
 }
 
-/**
- * Build the installation-state update to apply after a restore. Always updates updateChannel
- * + lastRollback; updates version + updateInfoByChannel to the snapshot when the version
- * restore succeeded, else keeps current state so the next update check detects the mismatch.
- */
 export function buildPostRestoreState(
   targetSnapshot: Snapshot,
   comfyResult: { changed: boolean; commit: string | null; error?: string },
@@ -409,7 +384,6 @@ export function buildPostRestoreState(
   return state
 }
 
-/** Restore pip packages to the snapshot, backing up affected packages first and reverting on failure. */
 export async function restorePipPackages(
   installPath: string,
   installation: InstallationRecord,
@@ -434,7 +408,6 @@ export async function restorePipPackages(
     throw new Error('Python environment or uv not found')
   }
 
-  // 1. Capture current pip state
   sendProgress('restore', { percent: 5, status: 'Analyzing current environment…' })
   sendOutput('\nAnalyzing pip packages…\n')
   const currentPips = await pipFreeze(uvPath, pythonPath)
@@ -443,7 +416,6 @@ export async function restorePipPackages(
   const targetCount = Object.keys(targetPips).length
   sendOutput(`Found ${currentCount} current package(s), target snapshot has ${targetCount}\n`)
 
-  // 2. Compute what needs to change
   const toInstall: Array<{ name: string; version: string }> = []
   const toRemove: string[] = []
 
@@ -454,7 +426,6 @@ export async function restorePipPackages(
       }
       continue
     }
-    // Skip editable installs and direct references.
     if (version.startsWith('-e ') || version.includes('://')) continue
 
     if (!(name in currentPips)) {
@@ -475,13 +446,10 @@ export async function restorePipPackages(
     }
   }
 
-  // Identify truly-new packages upfront so revert can uninstall them even if a bulk install
-  // was killed mid-way before result.installed was populated.
   const newPkgNames = toInstall
     .filter((p) => !result.changed.some((c) => c.name === p.name))
     .map((p) => p.name)
 
-  // Print the plan
   const newPkgs = newPkgNames
   const pipPlanParts: string[] = []
   if (newPkgs.length > 0) pipPlanParts.push(`install ${newPkgs.length}`)
@@ -499,12 +467,10 @@ export async function restorePipPackages(
     return result
   }
 
-  // 3. Create targeted backup of packages that will be modified or removed
   sendProgress('restore', { percent: 10, status: 'Creating backup of affected packages…' })
   let envDir = getActiveVenvDir(installation)
   let sitePackages = findSitePackages(envDir)
   if (!sitePackages) {
-    // Fallback: legacy envs/default/ layout (pre-migration).
     envDir = path.join(installPath, 'envs', 'default')
     sitePackages = findSitePackages(envDir)
   }
@@ -512,33 +478,51 @@ export async function restorePipPackages(
     throw new Error('Could not locate site-packages directory')
   }
 
+  const alreadyInstalled = preexistingOnDisk(sitePackages, newPkgNames)
+  const alreadyInstalledSet = new Set(alreadyInstalled)
+  const revertUninstall = newPkgNames.filter((name) => !alreadyInstalledSet.has(name))
+  if (alreadyInstalled.length > 0) {
+    sendOutput(
+      `Note: ${alreadyInstalled.length} package(s) planned as new are already installed on disk; ` +
+        `a revert will leave them in place.\n`
+    )
+  }
+
   const packagesToBackup = [
-    ...toInstall.filter((p) => p.name in currentPips).map((p) => p.name),
-    ...toRemove
+    ...new Set([
+      ...toInstall.filter((p) => p.name in currentPips).map((p) => p.name),
+      ...alreadyInstalled,
+      ...toRemove
+    ])
   ]
 
   let backupDir: string | null = null
+  let keepBackup = false
+  let uncapturedByBackup: string[] = []
   if (packagesToBackup.length > 0) {
-    backupDir = await createTargetedBackup(sitePackages, packagesToBackup)
+    const backup = await createTargetedBackup(sitePackages, packagesToBackup)
+    backupDir = backup.dir
+    uncapturedByBackup = backup.uncaptured
   }
 
+  let mutationAttempted = false
+
   try {
-    // 4. Install missing + upgrade/downgrade changed packages
     if (toInstall.length > 0 && !signal?.aborted) {
+      mutationAttempted = true
       const totalOps = toInstall.length + toRemove.length
       sendProgress('restore', { percent: 20, status: `Installing ${toInstall.length} package(s)…` })
 
       const specs = toInstall.map((p) => `${p.name}==${p.version}`)
-      const indexArgs = getPipIndexArgs(mirrors?.pypiMirror, mirrors?.useChineseMirrors)
 
-      // Try bulk install first
       sendOutput(`\nInstalling ${specs.length} package(s)…\n`)
       const bulkResult = await runUvPip(
         uvPath,
-        ['pip', 'install', ...specs, '--python', pythonPath, ...indexArgs],
+        ['pip', 'install', ...specs, '--python', pythonPath],
         installPath,
         sendOutput,
-        signal
+        signal,
+        mirrors ?? {}
       )
 
       if (bulkResult !== 0) {
@@ -553,10 +537,11 @@ export async function restorePipPackages(
 
           const singleResult = await runUvPip(
             uvPath,
-            ['pip', 'install', spec, '--no-deps', '--python', pythonPath, ...indexArgs],
+            ['pip', 'install', spec, '--no-deps', '--python', pythonPath],
             installPath,
             sendOutput,
-            signal
+            signal,
+            mirrors ?? {}
           )
 
           if (singleResult !== 0) {
@@ -575,8 +560,8 @@ export async function restorePipPackages(
       }
     }
 
-    // 5. Remove extra packages (present in current but absent from snapshot)
     if (toRemove.length > 0 && !signal?.aborted) {
+      mutationAttempted = true
       sendProgress('restore', {
         percent: 75,
         status: `Removing ${toRemove.length} extra package(s)…`
@@ -612,41 +597,66 @@ export async function restorePipPackages(
       }
     }
 
-    // 6. If aborted or there were failures, revert the entire operation
     if (signal?.aborted || result.failed.length > 0) {
       const reason = signal?.aborted ? 'cancelled' : 'failures'
       sendProgress('restore', { percent: 90, status: `Reverting due to ${reason}…` })
       sendOutput(`\n⚠ Restore ${reason}. Reverting…\n`)
 
+      let complete = true
+      let restoredFromBackup = false
       if (backupDir) {
-        await restoreFromBackup(backupDir, sitePackages)
+        restoredFromBackup = await restoreFromBackup(backupDir, sitePackages)
+        if (!restoredFromBackup) {
+          complete = false
+          keepBackup = true
+        }
+      }
+      if (mutationAttempted && uncapturedByBackup.length > 0) {
+        complete = false
+        sendOutput(
+          `⚠ No backup was captured for ${uncapturedByBackup.length} package(s); ` +
+            `their pre-restore state could not be put back: ${uncapturedByBackup.join(', ')}\n`
+        )
       }
 
-      // Use pre-computed newPkgNames (not result.installed): a killed bulk install may have
-      // partially installed packages without populating result.installed.
-      if (newPkgNames.length > 0) {
-        await runUvPip(
+      const uninstalled: string[] = []
+      if (revertUninstall.length > 0) {
+        const code = await runUvPip(
           uvPath,
-          ['pip', 'uninstall', ...newPkgNames, '--python', pythonPath],
+          ['pip', 'uninstall', ...revertUninstall, '--python', pythonPath],
           installPath,
           sendOutput
-        ).catch(() => {})
+        ).catch(() => 1)
+        if (code === 0) uninstalled.push(...revertUninstall)
+        else complete = false
       }
 
       result.installed = []
       result.removed = []
       result.changed = []
-      result.errors.push(`Restore reverted to pre-restore state due to ${reason}`)
+      result.revert = {
+        reason,
+        uninstalled,
+        keptPreexisting: alreadyInstalled,
+        restoredFromBackup,
+        complete
+      }
+      result.errors.push(
+        complete
+          ? `Restore reverted to pre-restore state due to ${reason}`
+          : `Restore ${reason}, and the revert did not fully complete — see the log for details`
+      )
     }
   } catch (err) {
-    // Catastrophic failure — revert
     if (backupDir) {
       sendOutput(`\n⚠ Restore failed: ${(err as Error).message}\nReverting from backup…\n`)
-      await restoreFromBackup(backupDir, sitePackages)
+      if (!(await restoreFromBackup(backupDir, sitePackages))) keepBackup = true
     }
     throw err
   } finally {
-    if (backupDir) {
+    if (backupDir && keepBackup) {
+      sendOutput(`\nPre-restore package files were kept at ${backupDir}\n`)
+    } else if (backupDir) {
       await fs.promises.rm(backupDir, { recursive: true, force: true }).catch(() => {})
     }
   }
@@ -654,24 +664,24 @@ export async function restorePipPackages(
   return result
 }
 
+export function describePackageRevert(revert: RestoreRevertOutcome | undefined): string {
+  if (!revert) return 'The state of the package changes is unknown — see the log for details.'
+  if (!revert.complete)
+    return 'Some package changes could not be reverted — see the log for details.'
+  if (
+    revert.uninstalled.length === 0 &&
+    !revert.restoredFromBackup &&
+    revert.keptPreexisting.length === 0
+  )
+    return 'No package changes were applied.'
+  return 'The package changes this restore made were reverted.'
+}
+
 export interface RequirementsRepairResult {
-  /** Freeze diff of the repair pass: installs, version changes, and removals
-   *  (`to: '(removed)'`). */
   changed: Array<{ name: string; from: string | null; to: string }>
-  /** Non-fatal per-file install failures, plus any (should-be-impossible)
-   *  protected-package drift the constraint pins failed to prevent. */
   errors: string[]
 }
 
-/**
- * Additive repair pass for compatible-mode restores, run AFTER the exact pip
- * sync: re-install ComfyUI core requirements and every enabled custom node's
- * requirements so the sync's remove-extras step can never leave the install
- * missing dependencies (the snapshot's freeze may not contain packages this
- * machine resolves differently). Only installs; never removes. The returned
- * freeze diff tells the caller whether the live state drifted from the
- * snapshot target.
- */
 export async function repairNodeRequirements(
   installPath: string,
   installation: InstallationRecord,
@@ -700,11 +710,6 @@ export async function repairNodeRequirements(
 
   const before = await pipFreeze(uvPath, pythonPath)
 
-  // Pin every currently installed protected package (torch stack, core
-  // tooling) via a constraints file so a node requirement's transitive
-  // dependencies can never swap the PyTorch stack out from under the restore.
-  // A requirement that conflicts with the pins fails its install (recorded as
-  // a repair error) instead of changing the stack.
   const constraintLines = buildProtectedConstraints(before)
   const constraintPath = path.join(installPath, '.repair-constraints.txt')
   await fs.promises.writeFile(constraintPath, constraintLines.join('\n'), 'utf-8')
@@ -734,8 +739,6 @@ export async function repairNodeRequirements(
     await fs.promises.unlink(constraintPath).catch(() => {})
   }
 
-  // Diff the freeze even when aborted mid-loop: callers must see any drift the
-  // completed installs already caused. Union of keys so removals count too.
   const after = await pipFreeze(uvPath, pythonPath)
   const names = new Set([...Object.keys(before), ...Object.keys(after)])
   for (const name of names) {
@@ -835,7 +838,6 @@ async function runPostInstallScripts(
   }
 }
 
-/** Failure message for a git subprocess: action, exit code, and the output tail. */
 function gitFailureMessage(action: string, result: ProcessResult): string {
   const detail = (result.stderr || result.stdout).trim().split('\n').slice(-20).join('\n')
   return detail
@@ -866,7 +868,6 @@ export async function restoreCustomNodes(
   const comfyuiDir = path.join(installPath, 'ComfyUI')
   const customNodesDir = path.join(comfyuiDir, 'custom_nodes')
 
-  // 1. Scan current custom nodes
   sendProgress('restore-nodes', { percent: 5, status: 'Scanning custom nodes…' })
   sendOutput('Scanning current custom nodes…\n')
   const currentNodes = await scanCustomNodes(comfyuiDir)
@@ -876,7 +877,6 @@ export async function restoreCustomNodes(
     `Found ${currentNodes.length} current node(s), target snapshot has ${targetSnapshot.customNodes.length}\n`
   )
 
-  // Check git availability for git node operations
   const needsGit = targetSnapshot.customNodes.some(
     (n) =>
       n.type === 'git' &&
@@ -887,7 +887,6 @@ export async function restoreCustomNodes(
     sendOutput('⚠ git is not available in PATH — git node operations will be skipped\n')
   }
 
-  // Compute and print the plan
   const toRemove: string[] = []
   const toDisable: string[] = []
   const toInstallNodes: string[] = []
@@ -935,7 +934,6 @@ export async function restoreCustomNodes(
     sendOutput('\nNo node changes needed\n')
   }
 
-  // 2. Remove extras: nodes not in target snapshot (enabled or disabled)
   for (const [key, currentNode] of currentByKey) {
     if (signal?.aborted) break
     if (isManagerNode(currentNode)) continue
@@ -960,7 +958,6 @@ export async function restoreCustomNodes(
     }
   }
 
-  // 3. Process target nodes
   const targetList = targetSnapshot.customNodes.filter((n) => !isManagerNode(n))
   const nodesNeedingPostInstall: string[] = []
 
@@ -973,7 +970,6 @@ export async function restoreCustomNodes(
     sendProgress('restore-nodes', { percent, status: `Processing ${targetNode.id}…` })
 
     if (!currentNode) {
-      // Node not present — install or report
       if (targetNode.type === 'cnr') {
         if (!targetNode.version) {
           result.failed.push({ id: targetNode.id, error: 'no version in snapshot' })
@@ -995,9 +991,6 @@ export async function restoreCustomNodes(
           result.failed.push({ id: targetNode.id, error: (err as Error).message })
         }
       } else if (targetNode.type === 'git') {
-        // Phantom entry from an older buggy scan (#1253): a directory recorded
-        // with no source at all cannot be restored and never could — skip it
-        // instead of failing the whole restore.
         if (!targetNode.url && !targetNode.commit) {
           result.skipped.push(targetNode.id)
           sendOutput(`Skipped ${targetNode.id}: snapshot records no source for it\n`)
@@ -1045,8 +1038,6 @@ export async function restoreCustomNodes(
               break
             }
             if (checkoutResult.exitCode !== 0) {
-              // Remove the fresh clone so the failed restore doesn't leave a
-              // wrong-commit node behind to be scanned as installed on next boot.
               await fs.promises.rm(dest, { recursive: true, force: true }).catch(() => {})
               result.failed.push({
                 id: targetNode.id,
@@ -1062,7 +1053,6 @@ export async function restoreCustomNodes(
           }
         } catch (err) {
           if (signal?.aborted) {
-            // Clean up partial clone on abort
             const dest = path.join(customNodesDir, targetNode.dirName)
             await fs.promises.rm(dest, { recursive: true, force: true }).catch(() => {})
             break
@@ -1075,7 +1065,6 @@ export async function restoreCustomNodes(
       continue
     }
 
-    // Node exists — handle enable/disable and version changes
     if (!currentNode.enabled && targetNode.enabled) {
       try {
         await enableNode(customNodesDir, currentNode.dirName)
@@ -1099,7 +1088,6 @@ export async function restoreCustomNodes(
       continue
     }
 
-    // Version/commit changes (only if the node is/will be enabled)
     if (targetNode.enabled || currentNode.enabled) {
       const nodePath = path.join(customNodesDir, currentNode.dirName)
 
@@ -1149,7 +1137,6 @@ export async function restoreCustomNodes(
     }
   }
 
-  // 4. Run post-install scripts for installed/switched nodes
   if (nodesNeedingPostInstall.length > 0 && !signal?.aborted) {
     const uvPath = getActiveUvPath(installation)
     const pythonPath = getActivePythonPath(installation)
@@ -1174,7 +1161,6 @@ export async function restoreCustomNodes(
     }
   }
 
-  // 5. Install manager_requirements.txt from ComfyUI root if present
   {
     const mgrReqPath = path.join(comfyuiDir, 'manager_requirements.txt')
     if (fs.existsSync(mgrReqPath)) {

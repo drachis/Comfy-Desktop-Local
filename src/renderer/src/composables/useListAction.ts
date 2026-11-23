@@ -1,9 +1,11 @@
+import { relaunchAfterAction, stopThenRun } from '../lib/relaunchAfterAction'
 import { useI18n } from 'vue-i18n'
 import { useModal } from './useModal'
 import { useDialogs } from './useDialogs'
 import { useActionGuard } from './useActionGuard'
 import { useLocalInstanceGuard } from './useLocalInstanceGuard'
 import { useSessionStore } from '../stores/sessionStore'
+import { useProgressStore } from '../stores/progressStore'
 import { emitTelemetryAction, toErrorBucket } from '../lib/telemetry'
 import {
   progressOpKindForActionId,
@@ -19,19 +21,18 @@ import {
 import { resolvePickerTab } from '../lib/pickerTabs'
 import { REQUIRES_STOPPED } from '../types/ipc'
 import type { Installation, ListAction, ActionResult, ShowProgressOpts } from '../types/ipc'
+import { progressTitle } from '../lib/progressTitle'
+import { confirmToneForActionStyle } from '../lib/destructiveStyles'
 
 export interface ListActionCallbacks {
   showProgress: (opts: ShowProgressOpts) => void
   onNavigate?: (result: ActionResult, action: ListAction) => void | Promise<void>
 }
 
-// `onGuardsPassed` fires once after all cancel-paths pass but before the
-// action dispatches, so the chooser stakes its attach claim only when the
-// launch will really proceed (staking earlier would clobber a sibling's claim).
 export interface ListActionInvocationHooks {
   onGuardsPassed?: () => Promise<void> | void
-  /** This launch resumes the same installation after a restart stop. */
   isRestart?: boolean
+  actionData?: Record<string, unknown>
 }
 
 export function useListAction(uiSurface: string, callbacks: ListActionCallbacks) {
@@ -41,6 +42,7 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
   const actionGuard = useActionGuard()
   const localInstanceGuard = useLocalInstanceGuard()
   const sessionStore = useSessionStore()
+  const progressStore = useProgressStore()
 
   async function executeAction(
     inst: Installation,
@@ -53,7 +55,6 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
     }
 
     if (action.enabled === false && action.disabledMessage) {
-      // An install that only needs a setup step (e.g. a venv) gets a way to run it from here.
       if (action.id === 'launch' && inst.setupAction) {
         const choice = await dialogs.confirm({
           title: action.label,
@@ -76,8 +77,6 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
       return
     }
 
-    // A launch must not race a long operation on the same install (for example while its
-    // Python environment is being created), whichever window started that operation.
     const runningOp = sessionStore.operationInstances?.get(inst.id)
     if (action.id === 'launch' && runningOp && isLongRunningActionId(runningOp.actionId)) {
       await modal.alert({
@@ -94,7 +93,6 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
       REQUIRES_STOPPED.has(action.id) && action.id !== 'migrate-to-standalone'
     const wasRunning = sessionStore.isRunning(inst.id)
 
-    // Busy guard runs for every action so none can race an in-flight op.
     if (!(await actionGuard.checkBeforeAction(inst.id, action.label))) return
 
     if (action.confirm || (requiresStoppedGuard && wasRunning)) {
@@ -110,7 +108,7 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
         title: action.confirm?.title || action.label,
         message,
         confirmLabel: action.label,
-        confirmStyle: action.style || 'danger'
+        confirmStyle: confirmToneForActionStyle(action.style)
       })
       if (!confirmed) {
         emitTelemetryAction('comfy.desktop.action.result', {
@@ -136,9 +134,6 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
       }
     }
 
-    // A not-yet-adopted Legacy Desktop install offers a choice: migrate (adopt it in place, then
-    // launch inside Comfy Desktop) or launch the original app as-is. Migrating is optional. Skips
-    // onGuardsPassed on the migrate path since the launch targets the freshly-adopted install.
     if (action.id === 'launch' && inst.sourceId === 'desktop' && !inst.adopted) {
       const choice = await dialogs.confirm({
         title: t('desktop.migrateBeforeLaunchTitle'),
@@ -166,11 +161,10 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
         })
         callbacks.showProgress({
           installationId: inst.id,
-          title: `${t('desktop.migrating')} — ${inst.name}`,
+          title: progressTitle(t('desktop.migrating'), inst.name),
           apiCall: async () => {
             const migrateResult = await window.api.runAction(inst.id, 'migrate-to-standalone')
             if (!migrateResult.ok || !migrateResult.newInstallationId) return migrateResult
-            // Launch the adopted install in the same overlay (continuous flow).
             return window.api.runAction(migrateResult.newInstallationId, 'launch')
           },
           cancellable: true,
@@ -179,10 +173,8 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
         })
         return
       }
-      // 'secondary': fall through to the normal launch, which starts the original Desktop app.
     }
 
-    // Past all cancel-paths; cancel-sensitive side effects go in this hook.
     if (hooks?.onGuardsPassed) await hooks.onGuardsPassed()
 
     sessionStore.clearErrorInstance(inst.id)
@@ -194,25 +186,29 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
     const needsSelfStop = wasRunning && requiresStoppedGuard
     const wantsRelaunch = needsSelfStop && IN_PLACE_RELAUNCH.has(action.id)
     const isRunning = (): boolean => sessionStore.isRunning(inst.id)
+    const runAction = (): Promise<ActionResult> =>
+      hooks?.actionData
+        ? window.api.runAction(inst.id, action.id, hooks.actionData)
+        : window.api.runAction(inst.id, action.id)
 
     if (action.showProgress) {
-      // Tag launch/restart so the host installs the close-on-instance-started
-      // subscription and routes through the brand-chrome takeover.
       const triggersInstanceStart =
         action.id === 'launch' || action.id === 'restart' || wantsRelaunch
       const apiCall = needsSelfStop
         ? async () => {
-            await stopAndWaitForExit(inst.id, isRunning)
-            const result = await window.api.runAction(inst.id, action.id)
-            if (wantsRelaunch && result?.ok !== false) {
-              await window.api.runAction(inst.id, 'launch')
-            }
-            return result
+            const result = await stopThenRun(
+              inst.id,
+              isRunning,
+              () => progressStore.operations.get(inst.id)?.cancelRequested === true,
+              runAction
+            )
+            if (result.cancelled) return result
+            return wantsRelaunch ? relaunchAfterAction(inst.id, result) : result
           }
-        : () => window.api.runAction(inst.id, action.id)
+        : runAction
       callbacks.showProgress({
         installationId: inst.id,
-        title: `${action.progressTitle || action.label} — ${inst.name}`,
+        title: progressTitle(action.progressTitle || action.label, inst.name),
         apiCall,
         cancellable: !!action.cancellable,
         triggersInstanceStart,
@@ -227,7 +223,7 @@ export function useListAction(uiSurface: string, callbacks: ListActionCallbacks)
       if (needsSelfStop) {
         await stopAndWaitForExit(inst.id, isRunning)
       }
-      const result = await window.api.runAction(inst.id, action.id)
+      const result = await runAction()
       if (result.running) {
         await actionGuard.checkBeforeAction(inst.id, action.label)
         return

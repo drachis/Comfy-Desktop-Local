@@ -87,8 +87,6 @@ function resolveVenvPython(installation: InstallationRecord): string | null {
   return null
 }
 
-/** True when the venv was built from Desktop's trimmed bootstrap Python, which lacks stdlib
- *  modules (unittest, sqlite3) that PyTorch needs, so it can never launch ComfyUI. */
 function venvUsesTrimmedPython(installation: InstallationRecord): boolean {
   const venvPath = installation.venvPath as string | undefined
   if (!venvPath) return false
@@ -103,7 +101,6 @@ function venvUsesTrimmedPython(installation: InstallationRecord): boolean {
 
 type VenvSetup = 'create' | 'recreate' | null
 
-/** Which setup step a tracked ComfyUI folder needs before it can launch, if any. */
 function venvSetupNeeded(installation: InstallationRecord): VenvSetup {
   if (installation.status !== 'installed' || findMainPy(installation.installPath) === null) {
     return null
@@ -154,7 +151,6 @@ function findMainPy(dirPath: string): string | null {
   return null
 }
 
-/** ComfyUI's own version from `comfyui_version.py`, for folders with no git history to read. */
 function readComfyVersion(mainPy: string): string | null {
   try {
     const src = fs.readFileSync(path.join(path.dirname(mainPy), 'comfyui_version.py'), 'utf-8')
@@ -164,8 +160,6 @@ function readComfyVersion(mainPy: string): string | null {
   }
 }
 
-/** What Add Existing Instance records for a folder: git details when there is a repo, else the
- *  ComfyUI version, plus any venv sitting next to it. Every field is best-effort. */
 function readTrackInfo(
   dirPath: string,
   gitDir: string | null,
@@ -174,25 +168,20 @@ function readTrackInfo(
   const info: Record<string, unknown> = { version: 'unknown', repo: '', branch: '', commit: '' }
 
   if (gitDir) {
-    // Extract branch name from HEAD
     try {
       const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim()
       const branchMatch = head.match(/^ref: refs\/heads\/(.+)$/)
       if (branchMatch && branchMatch[1]) {
         info.branch = branchMatch[1]
       }
-    } catch {
-      // ignore — partial info is fine
-    }
+    } catch {}
 
-    // Resolve commit SHA via readGitHead (handles refs, packed-refs, detached HEAD)
     const commit = readGitHead(dirPath)
     if (commit) {
       info.commit = commit
       info.version = commit.slice(0, 8)
     }
 
-    // Read remote URL via readGitRemoteUrl (handles credential redaction)
     const remoteUrl = readGitRemoteUrl(dirPath)
     if (remoteUrl) info.repo = remoteUrl
   } else if (mainPy) {
@@ -276,11 +265,6 @@ export const gitSource: SourcePlugin = {
   },
 
   getTerminalEnv(installation: InstallationRecord): TerminalEnv {
-    // A git install runs from its own venv (`venvPath`), not the standalone
-    // `ComfyUI/.venv`, and has no bundled `standalone-env/uv.exe`. Activate that
-    // venv so its own `pip` is on PATH; leave pip unaliased. Open the shell on
-    // the ComfyUI code folder (where `main.py` lives) regardless of whether a
-    // venv is usable.
     const mainPy = findMainPy(installation.installPath)
     const base: TerminalEnv = mainPy ? { cwd: path.dirname(mainPy) } : {}
     const venvPath = installation.venvPath as string | undefined
@@ -396,7 +380,6 @@ export const gitSource: SourcePlugin = {
   probeInstallation(dirPath: string): Record<string, unknown> | null {
     const gitDir = resolveGitDir(dirPath)
     const mainPy = findMainPy(dirPath)
-    // A plain ComfyUI folder (zip download, copied tree) has no .git but runs the same way.
     if (!gitDir && !mainPy) return null
     return readTrackInfo(dirPath, gitDir, mainPy)
   },

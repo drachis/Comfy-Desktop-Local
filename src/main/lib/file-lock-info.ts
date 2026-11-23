@@ -1,23 +1,49 @@
-import { execFile } from 'child_process'
+import { execFile, type ExecFileException } from 'child_process'
 
 export interface LockingProcess {
   pid: number
   name: string
 }
 
+export type LockProbeFailure = 'timeout' | 'unavailable'
+
+export type LockProbeResult =
+  { ok: true; processes: LockingProcess[] } | { ok: false; reason: LockProbeFailure }
+
 const TIMEOUT_MS = 10000
 
-// Best-effort: processes holding a lock on `filePath`; empty on failure/timeout.
-export function findLockingProcesses(filePath: string): Promise<LockingProcess[]> {
+export function findLockingProcesses(
+  filePath: string,
+  timeoutMs: number = TIMEOUT_MS
+): Promise<LockProbeResult> {
   if (process.platform === 'win32') {
-    return findLockingProcessesWindows(filePath)
+    return findLockingProcessesWindows(filePath, timeoutMs)
   }
-  return findLockingProcessesUnix(filePath)
+  return findLockingProcessesUnix(filePath, timeoutMs)
 }
 
-// Windows: query the built-in Restart Manager API via inline C# in PowerShell.
-function findLockingProcessesWindows(filePath: string): Promise<LockingProcess[]> {
-  // Escape single quotes for PowerShell string embedding.
+const WINDOWS_PROBE_FAILED = '__RM_QUERY_FAILED__'
+
+function classifyCommonFailure(err: ExecFileException): LockProbeFailure | null {
+  if (typeof err.code === 'string') return 'unavailable'
+  if (err.killed === true || err.signal) return 'timeout'
+  return null
+}
+
+function classifyUnixFailure(err: ExecFileException): LockProbeFailure | null {
+  const common = classifyCommonFailure(err)
+  if (common) return common
+  return err.code === 1 ? null : 'unavailable'
+}
+
+function classifyWindowsFailure(err: ExecFileException): LockProbeFailure {
+  return classifyCommonFailure(err) ?? 'unavailable'
+}
+
+function findLockingProcessesWindows(
+  filePath: string,
+  timeoutMs: number
+): Promise<LockProbeResult> {
   const escaped = filePath.replace(/'/g, "''")
   const script = `
 $code = @'
@@ -50,19 +76,23 @@ public static class RmUtil {
     [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] static extern int RmRegisterResources(uint h, uint nFiles, string[] rgFiles, uint nApps, RM_UNIQUE_PROCESS[] rgApps, uint nSvcs, string[] rgSvcs);
     [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint h, out uint nProcInfoNeeded, ref uint nProcInfo, [In,Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
 
+    // Empty output means "nobody holds it"; FAILED means the query broke. The
+    // two used to be the same empty string, which made a broken probe look
+    // like a clean file.
+    const string FAILED = "${WINDOWS_PROBE_FAILED}";
     public static string Query(string path) {
         uint handle;
-        if (RmStartSession(out handle, 0, Guid.NewGuid().ToString()) != 0) return "";
+        if (RmStartSession(out handle, 0, Guid.NewGuid().ToString()) != 0) return FAILED;
         try {
-            if (RmRegisterResources(handle, 1, new[]{path}, 0, null, 0, null) != 0) return "";
+            if (RmRegisterResources(handle, 1, new[]{path}, 0, null, 0, null) != 0) return FAILED;
             uint needed = 0, count = 0, reasons = 0;
             int rc = RmGetList(handle, out needed, ref count, null, ref reasons);
             if (rc == 234 && needed > 0) { count = needed; }
-            else if (rc != 0) return "";
+            else if (rc != 0) return FAILED;
             else return "";
             var info = new RM_PROCESS_INFO[count];
             rc = RmGetList(handle, out needed, ref count, info, ref reasons);
-            if (rc != 0) return "";
+            if (rc != 0) return FAILED;
             var results = new List<string>();
             for (int i = 0; i < count; i++) {
                 try {
@@ -84,49 +114,64 @@ Add-Type -TypeDefinition $code
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', script],
-      { timeout: TIMEOUT_MS, windowsHide: true },
+      { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true },
       (err, stdout) => {
-        if (err || !stdout.trim()) return resolve([])
-        const results: LockingProcess[] = []
-        for (const line of stdout.trim().split('\n')) {
-          const parts = line.trim().split('\t')
-          if (parts.length >= 2) {
-            const pid = parseInt(parts[0]!, 10)
-            const name = parts[1]!
-            if (pid > 0 && name) results.push({ pid, name })
-          }
+        const failure = err ? classifyWindowsFailure(err) : null
+        if (failure === 'timeout') return resolve({ ok: false, reason: failure })
+        if (stdout.trim() === WINDOWS_PROBE_FAILED) {
+          return resolve({ ok: false, reason: 'unavailable' })
         }
-        resolve(results)
+        const processes = parseRestartManagerOutput(stdout)
+        if (failure && processes.length === 0) return resolve({ ok: false, reason: failure })
+        resolve({ ok: true, processes })
       }
     )
   })
 }
 
-// Linux/macOS: `lsof -F pc` gives machine-readable "p<pid>" / "c<command>"
-// line pairs, avoiding the column-shift parsing issues of the default format.
-function findLockingProcessesUnix(filePath: string): Promise<LockingProcess[]> {
+function findLockingProcessesUnix(filePath: string, timeoutMs: number): Promise<LockProbeResult> {
   return new Promise((resolve) => {
     execFile(
       'lsof',
       ['-F', 'pc', '--', filePath],
-      { timeout: TIMEOUT_MS, windowsHide: true },
+      { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true },
       (err, stdout) => {
-        if (err || !stdout.trim()) return resolve([])
-        const results: LockingProcess[] = []
-        const seen = new Set<number>()
-        let currentPid = 0
-        for (const line of stdout.trim().split('\n')) {
-          if (line.startsWith('p')) {
-            currentPid = parseInt(line.slice(1), 10)
-          } else if (line.startsWith('c') && currentPid > 0) {
-            if (!seen.has(currentPid)) {
-              seen.add(currentPid)
-              results.push({ pid: currentPid, name: line.slice(1) })
-            }
-          }
-        }
-        resolve(results)
+        const failure = err ? classifyUnixFailure(err) : null
+        if (failure === 'timeout') return resolve({ ok: false, reason: failure })
+        const processes = parseLsofOutput(stdout)
+        if (failure && processes.length === 0) return resolve({ ok: false, reason: failure })
+        resolve({ ok: true, processes })
       }
     )
   })
+}
+
+function parseRestartManagerOutput(stdout: string): LockingProcess[] {
+  const results: LockingProcess[] = []
+  for (const line of stdout.trim().split('\n')) {
+    const parts = line.trim().split('\t')
+    if (parts.length >= 2) {
+      const pid = parseInt(parts[0]!, 10)
+      const name = parts[1]!
+      if (pid > 0 && name) results.push({ pid, name })
+    }
+  }
+  return results
+}
+
+function parseLsofOutput(stdout: string): LockingProcess[] {
+  const results: LockingProcess[] = []
+  const seen = new Set<number>()
+  let currentPid = 0
+  for (const line of stdout.trim().split('\n')) {
+    if (line.startsWith('p')) {
+      currentPid = parseInt(line.slice(1), 10)
+    } else if (line.startsWith('c') && currentPid > 0) {
+      if (!seen.has(currentPid)) {
+        seen.add(currentPid)
+        results.push({ pid: currentPid, name: line.slice(1) })
+      }
+    }
+  }
+  return results
 }

@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { execFile } from 'child_process'
+import type * as ChildProcessModule from 'child_process'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcessModule>()
+  return { ...actual, execFile: vi.fn(actual.execFile) }
+})
+
 import {
   parseFeatureFlagOutput,
   getCachedFeatureFlagRegistry,
@@ -56,8 +64,6 @@ describe('parseFeatureFlagOutput', () => {
 
 describe('feature-flag registry cache accessors', () => {
   const installationId = 'cache-test-install'
-  // A path that can't be executed, so discovery fails and caches {} —
-  // exercising the spawn-free accessors without needing a real Python.
   const badPython = '/nonexistent/python-binary'
 
   beforeEach(() => {
@@ -79,8 +85,19 @@ describe('feature-flag registry cache accessors', () => {
     await getComfyFeatureFlagRegistry(badPython, 'main.py', process.cwd(), installationId, '1.0.0')
     expect(getCachedFeatureFlagRegistry(installationId, '1.0.0')).toEqual({})
     expect(getCachedFeatureFlagRegistry(installationId, '2.0.0')).toBeNull()
-    // A version-less query always hits the cache.
     expect(getCachedFeatureFlagRegistry(installationId)).toEqual({})
+  })
+
+  it("allows ComfyUI's --list-feature-flags 60 seconds before giving up", async () => {
+    vi.mocked(execFile).mockClear()
+    await getComfyFeatureFlagRegistry(badPython, 'main.py', process.cwd(), installationId, '1.0.0')
+
+    expect(vi.mocked(execFile)).toHaveBeenCalledWith(
+      badPython,
+      ['-s', 'main.py', '--list-feature-flags'],
+      expect.objectContaining({ timeout: 60_000 }),
+      expect.any(Function)
+    )
   })
 
   it('clears the cache back to a miss', async () => {

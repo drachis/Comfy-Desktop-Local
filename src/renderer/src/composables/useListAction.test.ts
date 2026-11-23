@@ -1,11 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('vue-i18n', () => ({
-  useI18n: () => ({
-    t: (key: string, params?: Record<string, unknown>) =>
-      params ? `${key}:${JSON.stringify(params)}` : key
-  })
-}))
+vi.mock('vue-i18n', async (importOriginal) =>
+  (await import('../lib/vueI18nWithAppMessages')).vueI18nWithAppMessages(importOriginal)
+)
 
 const mockModalConfirm = vi.hoisted(() => vi.fn())
 const mockModalAlert = vi.hoisted(() => vi.fn())
@@ -43,6 +40,10 @@ vi.mock('../stores/sessionStore', () => ({
   })
 }))
 
+vi.mock('../stores/progressStore', () => ({
+  useProgressStore: () => ({ operations: new Map() })
+}))
+
 vi.mock('../lib/telemetry', () => ({
   emitTelemetryAction: vi.fn(),
   toErrorBucket: () => 'unknown'
@@ -51,13 +52,12 @@ vi.mock('../lib/telemetry', () => ({
 const mockRunAction = vi.hoisted(() => vi.fn())
 const mockOpenInstancePicker = vi.hoisted(() => vi.fn())
 ;(
-  globalThis as unknown as {
-    window: {
-      api: { runAction: typeof mockRunAction; openInstancePicker: typeof mockOpenInstancePicker }
-    }
+  window as unknown as {
+    api: { runAction: typeof mockRunAction; openInstancePicker: typeof mockOpenInstancePicker }
   }
-).window = {
-  api: { runAction: mockRunAction, openInstancePicker: mockOpenInstancePicker }
+).api = {
+  runAction: mockRunAction,
+  openInstancePicker: mockOpenInstancePicker
 }
 
 import { useListAction } from './useListAction'
@@ -68,7 +68,6 @@ function makeInstall(overrides: Partial<Installation> = {}): Installation {
     id: 'inst-1',
     name: 'Legacy Desktop',
     sourceLabel: 'Legacy Desktop',
-    // Legacy Desktop reports category `local`; the `desktop` sourceId is the marker.
     sourceCategory: 'local',
     sourceId: 'desktop',
     status: 'installed',
@@ -98,20 +97,19 @@ describe('useListAction — desktop launch interceptor', () => {
   it('on migrate: emits show-progress with an apiCall that chains migrate → launch', async () => {
     mockDialogsConfirm.mockResolvedValueOnce('primary')
     mockRunAction
-      .mockResolvedValueOnce({ ok: true, newInstallationId: 'inst-adopted-1' }) // migrate-to-standalone
-      .mockResolvedValueOnce({ ok: true }) // launch on adopted
+      .mockResolvedValueOnce({ ok: true, newInstallationId: 'inst-adopted-1' })
+      .mockResolvedValueOnce({ ok: true })
 
     const showProgress = vi.fn()
     const { executeAction } = useListAction('chooser', { showProgress })
 
     await executeAction(makeInstall({ adopted: false }), launchAction)
 
-    // Migrating is offered as an option next to launching the original app, never forced.
     expect(mockDialogsConfirm).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: 'desktop.migrateBeforeLaunchTitle',
-        confirmLabel: 'desktop.migrateBeforeLaunchConfirm',
-        secondaryLabel: 'desktop.launchLegacyApp',
+        title: 'Start Legacy Desktop build',
+        confirmLabel: 'Migrate and start',
+        secondaryLabel: 'Start with legacy app',
         showCancel: true
       })
     )
@@ -232,8 +230,6 @@ describe('useListAction.executeAction onGuardsPassed hook', () => {
 
     expect(onGuardsPassed).toHaveBeenCalledOnce()
     expect(showProgress).toHaveBeenCalledOnce()
-    // Hook must fire BEFORE showProgress so the chooser claim is in place
-    // by the time the launch op is dispatched.
     expect(onGuardsPassed.mock.invocationCallOrder[0]).toBeLessThan(
       showProgress.mock.invocationCallOrder[0]
     )
@@ -394,5 +390,37 @@ describe('useListAction.executeAction onGuardsPassed hook', () => {
 
     expect(onGuardsPassed).not.toHaveBeenCalled()
     expect(showProgress).not.toHaveBeenCalled()
+  })
+})
+
+describe('useListAction confirm colour', () => {
+  beforeEach(() => {
+    sessionState.running.clear()
+    mockModalConfirm.mockReset().mockResolvedValue(false)
+    mockCheckBeforeAction.mockReset().mockResolvedValue(true)
+    mockRunAction.mockReset()
+  })
+
+  async function confirmStyleFor(style: ListAction['style']): Promise<unknown> {
+    const { executeAction } = useListAction('chooser', { showProgress: vi.fn() })
+    await executeAction(INSTALL, {
+      id: 'some-action',
+      label: 'Do it',
+      style,
+      confirm: { title: 'Sure?', message: 'Really?' }
+    })
+    return mockModalConfirm.mock.calls[0]![0].confirmStyle
+  }
+
+  it('is red for a danger action', async () => {
+    expect(await confirmStyleFor('danger')).toBe('danger')
+  })
+
+  it('is white for a primary action', async () => {
+    expect(await confirmStyleFor('primary')).toBe('primary')
+  })
+
+  it('is white for an action with no style', async () => {
+    expect(await confirmStyleFor(undefined)).toBe('primary')
   })
 })

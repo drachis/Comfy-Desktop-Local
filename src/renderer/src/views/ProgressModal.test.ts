@@ -1,17 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 import { createPinia, setActivePinia } from 'pinia'
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 
 import ProgressModal from './ProgressModal.vue'
 import { useProgressStore } from '../stores/progressStore'
 import type { Operation } from '../stores/progressStore'
-import type { ActionResult, PortConflictInfo } from '../types/ipc'
+import { useInstallationStore } from '../stores/installationStore'
+import type { ActionResult, Installation, PortConflictInfo } from '../types/ipc'
 
-// Test-controllable `useModal` mock - the in-flight Return-to-Dashboard path
-// prompts a cancel-operation confirm; default to the user accepting it.
 const mockModal = {
   alert: vi.fn().mockResolvedValue(undefined),
   confirm: vi.fn().mockResolvedValue(true),
@@ -20,62 +16,6 @@ const mockModal = {
 vi.mock('../composables/useModal', () => ({
   useModal: () => mockModal
 }))
-
-// Each spec snaps a synthetic op into `progressStore.operations` to lock
-// a precise state and assert what renders, bypassing `startOperation`.
-const messages = {
-  en: {
-    common: {
-      copy: 'Copy',
-      cancel: 'Cancel',
-      back: 'Back'
-    },
-    dashboard: {
-      confirmStopLocal: {
-        title: 'Return to Dashboard?',
-        message: 'This will stop the current ComfyUI.',
-        confirmLabel: 'Return to Dashboard'
-      }
-    },
-    overlay: {
-      cancelCurrentTitle: 'Cancel current operation?',
-      cancelMessage: 'The operation will stop where it is.',
-      cancelConfirm: 'Cancel operation'
-    },
-    progress: {
-      working: 'Working…',
-      starting: 'Starting…',
-      cancelling: 'Cancelling…',
-      completedSuccess: 'Completed successfully',
-      completedError: 'Operation failed',
-      completedCancelled: 'Operation was cancelled',
-      returnToDashboard: 'Return to Dashboard',
-      reboot: 'Reboot',
-      phaseLabel: {
-        cleanup: 'Tidying up dependencies...',
-        download: 'Downloading ComfyUI…',
-        gpu: 'Initializing GPU...',
-        launchStart: 'Starting ComfyUI...',
-        securityScan: 'Running security scan...',
-        source: 'Staging ComfyUI source code...',
-        startingServer: 'Starting server...',
-        torchRepair: 'Restoring GPU PyTorch…'
-      }
-    },
-    launch: {
-      viewLogs: 'View logs'
-    },
-    errors: {
-      portConflictTitle: 'Port already in use',
-      portConflictUsePort: 'Use next available port',
-      portConflictKill: 'Stop process and retry'
-    }
-  }
-}
-
-function createTestI18n() {
-  return createI18n({ legacy: false, locale: 'en', messages })
-}
 
 interface MockApi {
   onInstallProgress: ReturnType<typeof vi.fn>
@@ -86,9 +26,11 @@ interface MockApi {
   runAction: ReturnType<typeof vi.fn>
   killPortProcess: ReturnType<typeof vi.fn>
   returnToDashboard: ReturnType<typeof vi.fn>
+  getSetting?: ReturnType<typeof vi.fn>
   getInstallations: ReturnType<typeof vi.fn>
   onInstallationsChanged: ReturnType<typeof vi.fn>
   onInstallationsVersionsUpdated: ReturnType<typeof vi.fn>
+  onInstanceStarted?: ReturnType<typeof vi.fn>
 }
 
 function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
@@ -110,8 +52,6 @@ function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
   return api
 }
 
-/** Snap a synthetic op into the store. Must be called AFTER mount — the
- *  store's setup calls `useI18n()`, which needs the app context. */
 function snapOp(installationId: string, patch: Partial<Operation> = {}): Operation {
   const store = useProgressStore()
   const op: Operation = {
@@ -143,18 +83,12 @@ function snapOp(installationId: string, patch: Partial<Operation> = {}): Operati
   return op
 }
 
-/** Mount with `installationId: null` so nothing renders yet, giving an
- *  active i18n context for `snapOp` before flipping `installation-id`. */
 function mountProgress() {
   return mount(ProgressModal, {
-    props: { installationId: null },
-    global: { plugins: [createTestI18n()] }
+    props: { installationId: null }
   })
 }
 
-/** Mount, snap an op, then surface it via `installation-id`. Returns
- *  body-scoped accessors because the takeover teleports its tree to
- *  `document.body`, where `wrapper.find()` can't see it. */
 async function mountWithOp(
   installationId: string,
   patch: Partial<Operation> = {}
@@ -205,8 +139,6 @@ function makeBodyHelpers(): BodyHelpers {
 }
 
 afterEach(() => {
-  // The teleported takeover survives wrapper unmount; wipe it so the
-  // next spec starts on a clean DOM.
   document.body.innerHTML = ''
 })
 
@@ -227,14 +159,17 @@ describe('ProgressModal — brand branch state transitions', () => {
       flatPercent: 42
     })
 
+    expect(document.querySelector('.brand-takeover-root')?.getAttribute('aria-label')).toBe(
+      'Deleting — My Install'
+    )
     expect(body.exists('.brand-progress__banner')).toBe(false)
     expect(body.exists('.brand-progress__error-message')).toBe(false)
     expect(body.exists('.brand-progress__bar')).toBe(true)
 
     expect(body.exists('.brand-progress__footer')).toBe(true)
-    expect(body.selectorText('.brand-progress__footer')).toContain('Return to Dashboard')
+    expect(body.selectorText('.brand-progress__footer')).toContain('Back to Home')
     expect(body.selectorText('.brand-progress__footer')).not.toContain('Minimize')
-    expect(body.selectorText('.brand-progress__footer')).not.toContain('Reboot')
+    expect(body.selectorText('.brand-progress__footer')).not.toContain('Try again')
     expect(body.classList('.brand-progress__footer-bar')).not.toContain('is-centered')
   })
 
@@ -300,11 +235,8 @@ describe('ProgressModal — brand branch state transitions', () => {
     expect(body.classList('.brand-progress__banner')).toContain('brand-progress__banner--success')
     expect(body.selectorText('.brand-progress__banner')).toContain('Completed successfully')
 
-    // No action buttons during auto-close; the footer band stays mounted
-    // (it hosts the logs accordion), so assert on the buttons specifically.
     expect(body.exists('.brand-progress__footer-btn')).toBe(false)
 
-    // Auto-close fires after ~700ms and emits `close`.
     vi.advanceTimersByTime(800)
     await flushPromises()
     expect(wrapper.emitted('close')?.length).toBeGreaterThan(0)
@@ -327,7 +259,7 @@ describe('ProgressModal — brand branch state transitions', () => {
     expect(wrapper.emitted('close')?.length).toBeGreaterThan(0)
   })
 
-  it('renders the error banner + error message + Back + Reboot, and does NOT auto-close', async () => {
+  it('renders the error banner + explanation + error message + Back + Try again, and does NOT auto-close', async () => {
     const { wrapper, body } = await mountWithOp('inst-1', {
       finished: true,
       error: 'Disk write failed: ENOSPC'
@@ -335,24 +267,25 @@ describe('ProgressModal — brand branch state transitions', () => {
 
     expect(body.exists('.brand-progress__banner')).toBe(true)
     expect(body.classList('.brand-progress__banner')).toContain('brand-progress__banner--error')
-    expect(body.selectorText('.brand-progress__banner')).toContain('Operation failed')
+    expect(body.selectorText('.brand-progress__banner')).toContain("Couldn't finish")
+    expect(body.selectorText('[data-testid="progress-error-detail"]')).toBe(
+      'Comfy Desktop stopped before this finished. The details are below.'
+    )
 
     expect(body.exists('.brand-progress__error-message')).toBe(true)
     expect(body.selectorText('.brand-progress__error-message')).toContain(
       'Disk write failed: ENOSPC'
     )
-    // Test-id exposes the element for e2e overflow assertions.
     expect(body.exists('[data-testid="progress-error-message"]')).toBe(true)
 
     expect(body.exists('.brand-progress__error-copy')).toBe(true)
 
-    // Error CTAs live in the centered hero stack, not the footer.
     expect(body.exists('.brand-progress__error-actions')).toBe(true)
-    expect(body.selectorText('.brand-progress__error-actions')).toContain('Reboot')
+    expect(body.selectorText('.brand-progress__error-actions')).toContain('Try again')
+    expect(body.selectorText('.brand-progress__error-actions')).not.toContain('Reboot')
     expect(body.selectorText('.brand-progress__error-actions')).toContain('Back')
-    expect(body.selectorText('.brand-progress__footer')).not.toContain('Reboot')
+    expect(body.selectorText('.brand-progress__footer')).not.toContain('Try again')
 
-    // Errors stay mounted, so no close emit even past the grace window.
     vi.advanceTimersByTime(2000)
     await flushPromises()
     expect(wrapper.emitted('close')).toBeUndefined()
@@ -374,26 +307,20 @@ describe('ProgressModal — brand branch state transitions', () => {
       } as ActionResult
     })
 
-    // Banner swaps to the port-specific copy instead of the generic
-    // "Operation failed" string used for regular errors.
     expect(body.exists('.brand-progress__banner')).toBe(true)
     expect(body.selectorText('.brand-progress__banner')).toContain('Port already in use')
-    expect(body.selectorText('.brand-progress__banner')).not.toContain('Operation failed')
+    expect(body.selectorText('.brand-progress__banner')).not.toContain("Couldn't finish")
+    expect(body.exists('[data-testid="progress-error-detail"]')).toBe(false)
 
-    // Detail line carries the server-side message (with port filled in).
     expect(body.selectorText('.brand-progress__error-message')).toContain(
       'Port 8188 is already in use'
     )
 
-    // Footer carries Return-to-Dashboard alongside Use-Port + Kill-Process
-    // so the user is never stuck on the conflict screen.
     expect(body.exists('.brand-progress__footer')).toBe(true)
-    expect(body.selectorText('.brand-progress__footer')).toContain('Return to Dashboard')
+    expect(body.selectorText('.brand-progress__footer')).toContain('Back to Home')
     expect(body.selectorText('.brand-progress__footer')).toContain('Use next available port')
     expect(body.selectorText('.brand-progress__footer')).toContain('Stop process and retry')
 
-    // Port conflict is explicitly excluded from auto-close so the user
-    // has time to pick a resolution.
     vi.advanceTimersByTime(2000)
     await flushPromises()
     expect(wrapper.emitted('close')).toBeUndefined()
@@ -415,17 +342,11 @@ describe('ProgressModal — brand branch state transitions', () => {
     })
 
     expect(body.selectorText('.brand-progress__footer')).toContain('Use next available port')
-    // Kill-Process is only shown when the offender is itself a Comfy
-    // process — there's nothing safe to suggest killing otherwise.
     expect(body.selectorText('.brand-progress__footer')).not.toContain('Stop process and retry')
-    // Return-to-Dashboard is always present so non-Comfy conflicts still
-    // have a non-destructive escape.
-    expect(body.selectorText('.brand-progress__footer')).toContain('Return to Dashboard')
+    expect(body.selectorText('.brand-progress__footer')).toContain('Back to Home')
   })
 
   it('renders only Return to Dashboard when a port conflict has no suggested fix', async () => {
-    // Worst-case: main couldn't find a next port and the offender isn't
-    // ComfyUI. Without the back button the user is stuck on the takeover.
     const portConflict: PortConflictInfo = {
       port: 8188,
       isComfy: false
@@ -440,13 +361,181 @@ describe('ProgressModal — brand branch state transitions', () => {
     })
 
     expect(body.exists('.brand-progress__footer')).toBe(true)
-    expect(body.selectorText('.brand-progress__footer')).toContain('Return to Dashboard')
+    expect(body.selectorText('.brand-progress__footer')).toContain('Back to Home')
     expect(body.selectorText('.brand-progress__footer')).not.toContain('Use next available port')
     expect(body.selectorText('.brand-progress__footer')).not.toContain('Stop process and retry')
 
     const api = (window as unknown as { api: MockApi }).api
     expect(await body.click('.brand-progress__footer-bar button')).toBe(true)
     expect(api.returnToDashboard).toHaveBeenCalledTimes(1)
+  })
+
+  it('starts Stop process and retry from a neutral button and confirms killing the other process in red', async () => {
+    const api = installMockApi()
+    api.killPortProcess.mockResolvedValue({ ok: false })
+    const portConflict: PortConflictInfo = { port: 8188, pids: [777], isComfy: true }
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      finished: true,
+      result: { ok: false, message: 'Port 8188 is already in use', portConflict } as ActionResult
+    })
+
+    const killButton = '[data-testid="progress-port-conflict-kill"]'
+    expect(body.classList(killButton).some((name) => name.includes('danger'))).toBe(false)
+    expect(await body.click(killButton)).toBe(true)
+    await flushPromises()
+
+    expect(mockModal.confirm.mock.lastCall![0]).toMatchObject({ confirmStyle: 'danger' })
+  })
+
+  it('says so when "Stop process and retry" could not free the port', async () => {
+    const api = installMockApi()
+    api.killPortProcess.mockResolvedValue({ ok: false })
+    const portConflict: PortConflictInfo = { port: 8188, pids: [777], isComfy: true }
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      finished: true,
+      result: { ok: false, message: 'Port 8188 is already in use', portConflict } as ActionResult
+    })
+    expect(body.selectorText('.brand-progress__error-message')).not.toContain('Could not free')
+
+    expect(await body.click('[data-testid="progress-port-conflict-kill"]')).toBe(true)
+    await flushPromises()
+
+    expect(api.killPortProcess).toHaveBeenCalledWith(8188)
+    expect(api.runAction).not.toHaveBeenCalled()
+    expect(body.selectorText('.brand-progress__error-message')).toContain(
+      'Port 8188 is already in use'
+    )
+    expect(body.selectorText('.brand-progress__error-message')).toContain(
+      'Could not free port 8188. The process may require manual termination.'
+    )
+  })
+
+  it('offers to stop a busy earlier ComfyUI through launch, never by killing the port', async () => {
+    const api = installMockApi()
+    const portConflict: PortConflictInfo = {
+      port: 8188,
+      pids: [777],
+      isComfy: true,
+      priorBusy: true
+    }
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      finished: true,
+      result: { ok: false, message: 'still working on a prompt', portConflict } as ActionResult
+    })
+
+    expect(body.selectorText('.brand-progress__banner')).toContain(
+      'ComfyUI is still running a prompt'
+    )
+    expect(body.selectorText('.brand-progress__footer')).toContain('Back to Home')
+    expect(body.selectorText('.brand-progress__footer')).toContain('Stop it and start this build')
+    expect(body.selectorText('.brand-progress__footer')).not.toContain('Use next available port')
+
+    expect(await body.click('[data-testid="progress-port-conflict-kill"]')).toBe(true)
+    await flushPromises()
+
+    expect(mockModal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        confirmLabel: 'Stop it and start this build'
+      })
+    )
+    expect(mockModal.confirm.mock.lastCall![0]).not.toHaveProperty('confirmStyle')
+    expect(api.killPortProcess).not.toHaveBeenCalled()
+    expect(api.runAction).toHaveBeenCalledWith('inst-1', 'launch', { stopBusyPriorProcess: true })
+  })
+
+  it.each([
+    {
+      fix: 'Use next available port',
+      portConflict: { port: 8188, nextPort: 8189, isComfy: false } as PortConflictInfo
+    },
+    {
+      fix: 'Stop it and start this build',
+      portConflict: { port: 8188, pids: [777], isComfy: true, priorBusy: true } as PortConflictInfo
+    },
+    {
+      fix: 'Stop process and retry',
+      portConflict: { port: 8188, pids: [777], isComfy: true } as PortConflictInfo
+    }
+  ])('keeps a start retried with "$fix" a launch', async ({ fix, portConflict }) => {
+    installMockApi()
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      opKind: 'launch',
+      finished: true,
+      apiCall: () => Promise.resolve({ ok: true }),
+      result: { ok: false, message: 'Port 8188 is already in use', portConflict } as ActionResult
+    })
+
+    const before = useProgressStore().operations.get('inst-1')
+    body.buttonByText(fix)!.click()
+    await flushPromises()
+
+    const retried = useProgressStore().operations.get('inst-1')
+    expect(retried).not.toBe(before)
+    expect(retried?.opKind).toBe('launch')
+  })
+
+  it('never claims a prompt is running when the earlier ComfyUI did not answer', async () => {
+    installMockApi()
+    const portConflict: PortConflictInfo = {
+      port: 8188,
+      pids: [777],
+      isComfy: true,
+      priorBusy: true,
+      priorUnknown: true
+    }
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      finished: true,
+      result: { ok: false, message: 'did not answer', portConflict } as ActionResult
+    })
+
+    expect(body.selectorText('.brand-progress__banner')).toContain(
+      'An earlier ComfyUI is still running'
+    )
+    expect(body.selectorText('.brand-progress__banner')).not.toContain('running a prompt')
+    expect(await body.click('[data-testid="progress-port-conflict-kill"]')).toBe(true)
+    await flushPromises()
+    expect(mockModal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'An earlier ComfyUI is still running',
+        message: 'This stops the earlier ComfyUI and cancels anything it is doing.'
+      })
+    )
+  })
+
+  it('titles and confirms survivors as processes, not as a running ComfyUI', async () => {
+    installMockApi()
+    const portConflict: PortConflictInfo = {
+      port: 8188,
+      pids: [555, 556],
+      isComfy: true,
+      priorBusy: true,
+      priorUnknown: true,
+      priorSurvivors: true
+    }
+    const { body } = await mountWithOp('inst-1', {
+      title: 'Launching',
+      finished: true,
+      result: { ok: false, message: 'PID 555, 556', portConflict } as ActionResult
+    })
+
+    expect(body.selectorText('.brand-progress__banner')).toContain(
+      'Processes from an earlier ComfyUI are still running'
+    )
+    expect(body.selectorText('.brand-progress__footer')).toContain('Stop them and start this build')
+    expect(await body.click('[data-testid="progress-port-conflict-kill"]')).toBe(true)
+    await flushPromises()
+    expect(mockModal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Processes from an earlier ComfyUI are still running',
+        message: 'This stops those processes and anything they are doing.',
+        confirmLabel: 'Stop them and start this build'
+      })
+    )
   })
 
   it('renders Cancel (not Return to Dashboard) in flight for destroy ops', async () => {
@@ -457,20 +546,49 @@ describe('ProgressModal — brand branch state transitions', () => {
     })
     expect(body.exists('.brand-progress__footer')).toBe(true)
     expect(body.selectorText('.brand-progress__footer')).toContain('Cancel')
-    expect(body.selectorText('.brand-progress__footer')).not.toContain('Return to Dashboard')
+    expect(body.selectorText('.brand-progress__footer')).not.toContain('Back to Home')
   })
 
-  it('renders Back (no Reboot) on a destroy op error', async () => {
+  it('labels a failed launch\'s retry "Restart ComfyUI", not "Try again"', async () => {
+    const { body } = await mountWithOp('inst-1', {
+      finished: true,
+      error: "Another ComfyUI is using this installation's database",
+      opKind: 'launch'
+    })
+    expect(body.selectorText('.brand-progress__error-actions')).toContain('Restart ComfyUI')
+    expect(body.selectorText('.brand-progress__error-actions')).not.toContain('Try again')
+  })
+
+  it('keeps a failed start and its actions on screen when the build starts from another window', async () => {
+    let startedElsewhere: (data: { installationId: string }) => void = () => {}
+    installMockApi({
+      onInstanceStarted: vi.fn((cb: (data: { installationId: string }) => void) => {
+        startedElsewhere = cb
+        return () => {}
+      })
+    })
+    const { body } = await mountWithOp('inst-1', {
+      finished: true,
+      error: 'Port 8188 is in use',
+      opKind: 'launch'
+    })
+
+    startedElsewhere({ installationId: 'inst-1' })
+    await flushPromises()
+
+    expect(body.text()).toContain('Port 8188 is in use')
+    expect(body.selectorText('.brand-progress__error-actions')).toContain('Restart ComfyUI')
+  })
+
+  it('renders Back (no Try again) on a destroy op error', async () => {
     const { body } = await mountWithOp('inst-1', {
       destroysInstance: true,
       finished: true,
       error: 'Partial delete failed'
     })
-    // Destroy ops can't be rebooted, so only Back renders (as primary)
-    // in the centered error-actions row.
     expect(body.exists('.brand-progress__error-actions')).toBe(true)
     expect(body.selectorText('.brand-progress__error-actions')).toContain('Back')
-    expect(body.selectorText('.brand-progress__error-actions')).not.toContain('Reboot')
+    expect(body.selectorText('.brand-progress__error-actions')).not.toContain('Try again')
   })
 
   it('cancels the in-flight destroy op and emits close when Cancel is clicked', async () => {
@@ -508,15 +626,12 @@ describe('ProgressModal — brand branch state transitions', () => {
       flatPercent: 42
     })
 
-    const returnBtn = body.buttonByText('Return to Dashboard')
+    const returnBtn = body.buttonByText('Back to Home')
     expect(returnBtn).not.toBeNull()
     returnBtn!.click()
     await flushPromises()
 
     expect(wrapper.emitted('close')?.length).toBeGreaterThan(0)
-    // The in-flight path always prompts the cancel-operation confirm (even
-    // with no installation record in the store); the mock accepts it, so the
-    // in-flight op is cancelled.
     expect(mockModal.confirm).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Cancel current operation?' })
     )
@@ -527,8 +642,60 @@ describe('ProgressModal — brand branch state transitions', () => {
     expect(api.returnToDashboard).toHaveBeenCalled()
   })
 
+  it('leaves a start of a build on this computer running when Back to Home is clicked', async () => {
+    mockModal.confirm.mockClear()
+    useInstallationStore().installations = [
+      { id: 'inst-1', name: 'Studio', sourceCategory: 'local' } as Installation
+    ]
+    const { wrapper, body } = await mountWithOp('inst-1', { opKind: 'launch' })
+
+    body.buttonByText('Back to Home')!.click()
+    await flushPromises()
+
+    expect(mockModal.confirm).not.toHaveBeenCalled()
+    expect(useProgressStore().operations.get('inst-1')?.cancelRequested).toBe(false)
+    const api = (window as unknown as { api: MockApi }).api
+    expect(api.cancelOperation).not.toHaveBeenCalled()
+    expect(wrapper.emitted('close')?.length).toBeGreaterThan(0)
+    expect(api.returnToDashboard).toHaveBeenCalled()
+  })
+
+  it('asks, then cancels a start when Back to Home is clicked with keepComfyRunningWhenWindowCloses off', async () => {
+    mockModal.confirm.mockClear()
+    useInstallationStore().installations = [
+      { id: 'inst-1', name: 'Studio', sourceCategory: 'local' } as Installation
+    ]
+    const { body } = await mountWithOp('inst-1', { opKind: 'launch' })
+    const api = (window as unknown as { api: MockApi }).api
+    api.getSetting = vi.fn().mockResolvedValue(false)
+
+    body.buttonByText('Back to Home')!.click()
+    await flushPromises()
+
+    expect(api.getSetting).toHaveBeenCalledWith('keepComfyRunningWhenWindowCloses')
+    expect(mockModal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Cancel current operation?' })
+    )
+    expect(useProgressStore().operations.get('inst-1')?.cancelRequested).toBe(true)
+  })
+
+  it('still asks, then cancels an install in flight when Back to Home is clicked', async () => {
+    mockModal.confirm.mockClear()
+    useInstallationStore().installations = [
+      { id: 'inst-1', name: 'Studio', sourceCategory: 'local' } as Installation
+    ]
+    const { body } = await mountWithOp('inst-1', { opKind: 'install' })
+
+    body.buttonByText('Back to Home')!.click()
+    await flushPromises()
+
+    expect(mockModal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Cancel current operation?' })
+    )
+    expect(useProgressStore().operations.get('inst-1')?.cancelRequested).toBe(true)
+  })
+
   it('uses friendlyCaption (not launchCaption) for non-launch ops', async () => {
-    // Resolves through `progress.phaseLabel.download`, not the launch caption.
     const { body } = await mountWithOp('inst-1', {
       opKind: 'destructive',
       steps: [
@@ -541,23 +708,16 @@ describe('ProgressModal — brand branch state transitions', () => {
     })
 
     expect(body.text()).toContain('Downloading ComfyUI…')
-    // Launch-only narrative phrases must never show for non-launch ops.
     expect(body.text()).not.toContain('Mounting model libraries')
     expect(body.text()).not.toContain('Security scan')
   })
 
   it('uses registered step label as the headline and hides the substatus when no rich detail was sent', async () => {
-    // Adopt/migration flow path: main registers steps with friendly
-    // labels but emits `sendProgress(phase, { percent })` without a
-    // `status` string. Without this guard the headline fell through to
-    // the raw phase id ("source") and the substatus duplicated it.
     const { body } = await mountWithOp('inst-1', {
       opKind: 'install',
       steps: [{ phase: 'source', label: 'Stage ComfyUI source' }],
       activePhase: 'source',
       activePercent: 10,
-      // progressStore writes `data.status || data.phase`, so the raw id
-      // is what lands here when main sends no status string.
       lastStatus: { source: 'source' }
     })
 
@@ -575,14 +735,10 @@ describe('ProgressModal — brand branch state transitions', () => {
     })
 
     expect(body.text()).toContain('Downloading ComfyUI…')
-    // Stepped ops show the rich detail inside the active focus-stepper row.
-    // `formattedSubStatus` locale-groups byte counts >= 4 digits (`2100 MB`
-    // → `2,100 MB`); `1050` stays since it's followed by `/`.
     const detail = body.selectorText('.bpv__detail')
     expect(detail).toContain('1050 / 2,100 MB')
     expect(detail).toContain('22 MB/s')
     expect(detail).toContain('~1m remaining')
-    // The flat substatus line is suppressed when step rows render.
     expect(body.exists('.brand-progress__substatus')).toBe(false)
   })
 })
@@ -608,9 +764,6 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
   }
 
   it('a chained launch leg starts the bar at ~70% (prior install leg done)', async () => {
-    // The bar is now ONE continuous 0→100 across the chain: the completed
-    // install leg occupies the first 70% (PRIOR_FRACTION), so the launch leg
-    // begins at ~70 and fills the remaining 30 — no discontinuity, one bar.
     await mountWithOp('inst-chain-launch', {
       opKind: 'launch',
       chainSpan: 'launch',
@@ -625,8 +778,6 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
   })
 
   it('renders the unified bar for launch ops (no separate stepper)', async () => {
-    // Launch ops render the same bar element as install ops; only the
-    // caption swaps to the rolling launchCaption.
     const { body } = await mountWithOp('inst-launch-bar', {
       opKind: 'launch',
       chainSpan: 'launch'
@@ -636,8 +787,6 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
   })
 
   it('a standalone launch (no prior leg) spans the full bar from ~0', async () => {
-    // Direct launch (not chained from an install) owns 0→100 on its own, so
-    // the first phase starts the bar low, not at 70.
     await mountWithOp('inst-standalone-launch', {
       opKind: 'launch',
       steps: [
@@ -652,8 +801,6 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
   })
 
   it('drives the launch caption from the real active phase (no timer)', async () => {
-    // Launch is now a log-driven stepped op: the caption is the active
-    // phase's curated label, set by main, not a 900ms narrative timer.
     const { body } = await mountWithOp('inst-launch-roll', {
       opKind: 'launch',
       steps: [
@@ -663,14 +810,11 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
       activePhase: 'gpu',
       activePercent: -1
     })
-    // Stepped launch ops surface the active phase in the focus stepper, not the caption.
     expect(body.selectorText('.bpv__row.is-active .bpv__label')).toMatch(/GPU/i)
     expect(body.exists('.bpv__row')).toBe(true)
   })
 
   it('renders an injected torchRepair pre-launch step with its curated label', async () => {
-    // The v1.13.0 GPU-PyTorch repair is a first-class launch step (not a flat
-    // `setup` status): it leads the stepper with "Restoring GPU PyTorch…".
     const { body } = await mountWithOp('inst-torch-repair', {
       opKind: 'launch',
       steps: [
@@ -685,9 +829,6 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
   })
 
   it('caps the bar below 100 while running, reaching 100 only on finish', async () => {
-    // Honest model: the bar moves only on real milestones and NEVER reads 100
-    // while still running — even the final phase at 100% of its slot caps at
-    // 99 until the op actually finishes (then the success branch returns 100).
     await mountWithOp('inst-launch-ready', {
       opKind: 'launch',
       steps: [{ phase: 'startingServer', label: 'startingServer' }],
@@ -707,34 +848,19 @@ describe('ProgressModal — unified bar (install→launch chained 0→100)', () 
       activePhase: 'download',
       activePercent: 40
     })
-    // Install op with `activePhase=download` shows the curated label in the
-    // focus stepper, not the launch rolling caption.
     const label = body.selectorText('.bpv__row.is-active .bpv__label')
     expect(label).toContain('Downloading')
     expect(label).not.toMatch(/security scan|mount.*librar/i)
   })
 })
 
-describe('ProgressModal — error message styling (regression for #582)', () => {
-  // jsdom can't compute layout, so parse the .vue `<style>` directly to
-  // assert `.brand-progress__error-message` keeps its `max-height` +
-  // `overflow-y` rules that stop long tracebacks stretching the takeover.
-
-  // Resolved against cwd (not import.meta.url, which jsdom can mangle).
-  const vueSource = readFileSync(path.resolve('src/renderer/src/views/ProgressModal.vue'), 'utf8')
-
-  function extractRule(selector: string): string {
-    // Anchor on a line start so we match the base rule, not a descendant override.
-    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const re = new RegExp(`(?:^|\\n)${escaped}\\s*\\{([^}]*)\\}`)
-    const match = vueSource.match(re)
-    if (!match) throw new Error(`CSS rule for "${selector}" not found in ProgressModal.vue`)
-    return match[1]
-  }
-
-  it('bounds .brand-progress__error-message height so long errors do not stretch the takeover', () => {
-    const body = extractRule('.brand-progress__error-message')
-    expect(body).toMatch(/max-height:/)
-    expect(body).toMatch(/overflow-y:\s*auto/)
+describe('ProgressModal — bounded error details (regression for #582)', () => {
+  it('keeps a long error message inside the bounded scroll region', async () => {
+    const error = 'Traceback detail\n'.repeat(200)
+    const { body } = await mountWithOp('inst-long-error', { finished: true, error })
+    const classes = body.classList('.brand-progress__error-message')
+    expect(classes).toContain('max-h-[clamp(120px,22vh,240px)]')
+    expect(classes).toContain('overflow-y-auto')
+    expect(body.selectorText('.brand-progress__error-message')).toBe(error)
   })
 })

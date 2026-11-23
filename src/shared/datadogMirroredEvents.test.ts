@@ -7,10 +7,6 @@ import {
 } from './datadogMirroredEvents'
 
 describe('isDatadogMirroredEvent', () => {
-  // The boot lifecycle splits success vs failure: boot_failed is a failure
-  // signal ops alerts on, boot_started/boot_completed are funnel events
-  // (PostHog only). Mirroring a success event would page on-call on healthy
-  // boots and double its RUM volume for no monitor benefit.
   it('mirrors boot_failed but not boot_started / boot_completed', () => {
     expect(isDatadogMirroredEvent('comfy.desktop.comfyui.boot_failed')).toBe(true)
     expect(isDatadogMirroredEvent('comfy.desktop.comfyui.asset_scan_error')).toBe(true)
@@ -18,21 +14,59 @@ describe('isDatadogMirroredEvent', () => {
     expect(isDatadogMirroredEvent('comfy.desktop.comfyui.boot_completed')).toBe(false)
   })
 
-  // The onboarding→install handoff (#1224) splits the same way: install.not_started
-  // is the abort/failure signal ops alerts on; install.dispatched is the paired
-  // funnel success gate (PostHog only).
+  it('mirrors view_token_mint_failed but not view_token_minted', () => {
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.view_token_mint_failed')).toBe(true)
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.view_token_minted')).toBe(false)
+  })
+
+  it('mirrors workspace_switch_browser but not workspace_switch', () => {
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.workspace_switch_browser')).toBe(true)
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.workspace_returned_to_anchor')).toBe(true)
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.mint_scope_not_granted')).toBe(true)
+    expect(isDatadogMirroredEvent('comfy.desktop.auth.workspace_switch')).toBe(false)
+  })
+
   it('mirrors install.not_started but not install.dispatched', () => {
     expect(isDatadogMirroredEvent('comfy.desktop.install.not_started')).toBe(true)
     expect(isDatadogMirroredEvent('comfy.desktop.install.dispatched')).toBe(false)
+  })
+
+  it.each([
+    ['comfy.desktop.auth.host_sign_in', true],
+    ['comfy.desktop.auth.sign_in_failed', true],
+    ['comfy.desktop.auth.signed_out', true],
+    ['comfy.desktop.auth.expired_grant_rejected', true],
+    ['comfy.desktop.auth.grant_revocation', true],
+    ['comfy.desktop.auth.partner_node_token_failed', true],
+    ['comfy.desktop.auth.partner_node_token_issued', false],
+    ['comfy.desktop.auth.session_sign_in', true],
+    ['comfy.desktop.auth.grant_refresh_failed', true],
+    ['comfy.desktop.auth.workspace_token_mint_failed', true],
+    ['comfy.desktop.auth.stored_session_failed', true],
+    ['comfy.desktop.auth.stored_session_restored', false],
+    ['comfy.desktop.auth.embedded_session_disabled', true],
+    ['comfy.desktop.auth.view_token_refused', true],
+    ['comfy.desktop.auth.sign_in_started', false]
+  ])('mirrors %s: %s', (name, mirrored) => {
+    expect(isDatadogMirroredEvent(name)).toBe(mirrored)
+  })
+
+  it.each([
+    ['comfy.desktop.comfyui.agent.startup_failed', true],
+    ['comfy.desktop.comfyui.agent.startup_stalled', true],
+    ['comfy.desktop.comfyui.agent.health_check_failed', true],
+    ['comfy.desktop.comfyui.agent.agent_error', true],
+    ['comfy.desktop.comfyui.agent.document_host_degraded', true],
+    ['comfy.desktop.comfyui.agent.startup_step', false],
+    ['comfy.desktop.comfyui.agent.agent_started', false]
+  ])('mirrors %s: %s', (name, mirrored) => {
+    expect(isDatadogMirroredEvent(name)).toBe(mirrored)
   })
 
   it('returns false for unknown event names', () => {
     expect(isDatadogMirroredEvent('comfy.desktop.not.a.real.event')).toBe(false)
   })
 
-  // The eight scan-pipeline failures from assetsTap's ALLOWED_EVENTS (prefix
-  // plus bare event name, verified against assetsTap.ts's own
-  // `${EVENT_PREFIX}${event}` construction).
   const ASSETS_ERROR_EVENTS = [
     'comfy.desktop.comfyui.assets.scanner.hash_failed',
     'comfy.desktop.comfyui.assets.scanner.enrich_failed',
@@ -40,30 +74,40 @@ describe('isDatadogMirroredEvent', () => {
     'comfy.desktop.comfyui.assets.scanner.temp_sync_failed',
     'comfy.desktop.comfyui.assets.scanner.mark_missing_failed',
     'comfy.desktop.comfyui.assets.scanner.stat_failed',
+    'comfy.desktop.comfyui.assets.scanner.watch_stat_failed',
+    'comfy.desktop.comfyui.assets.scanner.watch_spec_failed',
+    'comfy.desktop.comfyui.assets.scanner.watch_seed_failed',
+    'comfy.desktop.comfyui.assets.scanner.root_unreachable',
+    'comfy.desktop.comfyui.assets.scanner.walk_failed',
+    'comfy.desktop.comfyui.assets.scanner.metadata_failed',
     'comfy.desktop.comfyui.assets.seeder.batch_insert_failed',
     'comfy.desktop.comfyui.assets.seeder.scan_failed'
   ]
 
-  it('defines exactly eight assets error events', () => {
-    expect(ASSETS_ERROR_EVENTS).toHaveLength(8)
+  it('defines exactly fourteen assets error events', () => {
+    expect(ASSETS_ERROR_EVENTS).toHaveLength(14)
   })
 
   it.each(ASSETS_ERROR_EVENTS)('mirrors the assets error event %s', (name) => {
     expect(isDatadogMirroredEvent(name)).toBe(true)
   })
 
-  // Volume guard: scan_started fires once per scan (a funnel-timing event,
-  // not a failure signal) and must stay PostHog-only, same shape as
-  // boot_started / install.dispatched above.
   it('does not mirror seeder.scan_started (volume guard)', () => {
     expect(isDatadogMirroredEvent('comfy.desktop.comfyui.assets.seeder.scan_started')).toBe(false)
+  })
+
+  it('does not mirror scanner.failure_bucket', () => {
+    expect(isDatadogMirroredEvent('comfy.desktop.comfyui.assets.scanner.failure_bucket')).toBe(
+      false
+    )
+  })
+
+  it('does not mirror scanner.invalid_mtime', () => {
+    expect(isDatadogMirroredEvent('comfy.desktop.comfyui.assets.scanner.invalid_mtime')).toBe(false)
   })
 })
 
 describe('stripDatadogDroppedKeys', () => {
-  // Datadog is the alerting surface: the large / high-cardinality diagnostic
-  // fields belong in PostHog, not on RUM actions where they bloat payloads and
-  // pollute facets.
   it('drops the large / high-cardinality diagnostic fields', () => {
     const context = {
       installation_id: 'abc',
@@ -86,7 +130,6 @@ describe('stripDatadogDroppedKeys', () => {
       exit_code: 1,
       signal: null
     })
-    // Does not mutate the input (PostHog copy must keep the full schema).
     expect(context.error_message).toBe('boom')
   })
 

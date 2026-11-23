@@ -1,4 +1,3 @@
-// @vitest-environment node
 import { afterEach, describe, it, expect, vi } from 'vitest'
 
 vi.mock('../git', () => ({
@@ -34,7 +33,13 @@ vi.mock('../../settings', () => ({
 }))
 
 import fs from 'fs'
-import { isProtectedPackage, buildProtectedConstraints, protectedPackageDrift } from './restore'
+import {
+  isProtectedPackage,
+  buildProtectedConstraints,
+  protectedPackageDrift,
+  describePackageRevert
+} from './restore'
+import type { RestoreRevertOutcome } from './types'
 import { pipFreeze } from '../pip'
 import { getActivePythonPath } from '../pythonEnv'
 import type { InstallationRecord } from '../../installations'
@@ -59,17 +64,12 @@ describe('isProtectedPackage', () => {
     'cuda-bindings',
     'Torch',
     'TorchVision',
-    // AMD multi-arch stack: rocm-sdk family plus per-arch device overlays,
-    // installable only via [device-all] extras against AMD's index.
     'rocm',
     'rocm-sdk-core',
     'rocm-bootstrap',
     'amd-torch-device-gfx1100',
     'amd-torchvision-device-gfx908',
     'amd-torchaudio-device-gfx1200',
-    // Intel XPU stack: torch +xpu wheels pull the oneAPI runtime family as
-    // plain pip dependencies. Every name observed leaking across vendors in
-    // cross-vendor restore validation is pinned here.
     'dpcpp-cpp-rt',
     'intel-cmplr-lib-rt',
     'intel-cmplr-lib-ur',
@@ -96,9 +96,6 @@ describe('isProtectedPackage', () => {
     expect(isProtectedPackage(name)).toBe(true)
   })
 
-  // Ordinary torch-ecosystem deps (no `torch-`/`torch_` separator, not the
-  // stack itself) stay pip-managed — protecting them would make snapshots
-  // that record them unrestorable, since nothing else reconciles them.
   it.each([
     'numpy',
     'requests',
@@ -109,13 +106,8 @@ describe('isProtectedPackage', () => {
     'torchsde',
     'torchmetrics',
     'torchdiffeq',
-    // 'amd' alone is not a protected prefix: ordinary AMD-published libraries
-    // must stay snapshot-restorable.
     'amd-quark',
     'amdsmi',
-    // Intel/oneAPI protection is exact-name or narrow-prefix: ordinary
-    // Intel-published libraries must stay snapshot-restorable, and
-    // delimiter-based matching must not swallow lookalike names.
     'mkl-fft',
     'mkl-service',
     'mkl-random',
@@ -147,7 +139,6 @@ describe('buildProtectedConstraints', () => {
 
   it('skips editable installs and direct references', () => {
     const freeze = {
-      // pipFreeze stores direct refs as the bare RHS and editables as `-e ...`
       triton: 'https://example.com/wheels/triton-3.1.0-py3-none-any.whl',
       torchaudio: 'git+https://github.com/pytorch/audio@abc123',
       'torch-custom': '-e git+https://github.com/x/torch-custom@abc#egg=torch-custom',
@@ -235,5 +226,47 @@ describe('protectedPackageDrift', () => {
       torchsde: '0.2.5'
     })
     expect(drift).toEqual([])
+  })
+})
+
+describe('describePackageRevert', () => {
+  const outcome = (over: Partial<RestoreRevertOutcome> = {}): RestoreRevertOutcome => ({
+    reason: 'failures',
+    uninstalled: [],
+    keptPreexisting: [],
+    restoredFromBackup: false,
+    complete: true,
+    ...over
+  })
+
+  it('reports an unknown outcome when nothing was recorded', () => {
+    expect(describePackageRevert(undefined)).toBe(
+      'The state of the package changes is unknown — see the log for details.'
+    )
+  })
+
+  it('does not claim nothing was applied when packages were kept', () => {
+    expect(describePackageRevert(outcome({ keptPreexisting: ['aiohttp'] }))).toBe(
+      'The package changes this restore made were reverted.'
+    )
+  })
+
+  it('says so when the revert did not complete, instead of claiming one', () => {
+    const text = describePackageRevert(outcome({ complete: false }))
+    expect(text).toContain('could not be reverted')
+    expect(text).not.toContain('where possible')
+  })
+
+  it('says nothing was applied when the revert had nothing to undo', () => {
+    expect(describePackageRevert(outcome())).toBe('No package changes were applied.')
+  })
+
+  it('claims a revert only when there was something to revert', () => {
+    expect(describePackageRevert(outcome({ uninstalled: ['brand-new'] }))).toBe(
+      'The package changes this restore made were reverted.'
+    )
+    expect(describePackageRevert(outcome({ restoredFromBackup: true }))).toBe(
+      'The package changes this restore made were reverted.'
+    )
   })
 })

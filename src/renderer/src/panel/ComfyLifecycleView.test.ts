@@ -1,60 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { defineComponent, h, nextTick, ref } from 'vue'
 import { mount, flushPromises } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 import { createPinia, setActivePinia } from 'pinia'
 
 import ComfyLifecycleView from './ComfyLifecycleView.vue'
 import { useSessionStore } from '../stores/sessionStore'
+import { useProgressStore, type Operation } from '../stores/progressStore'
+import { provideBuildLogs } from '../composables/useBuildProgress'
 import type { Installation } from '../types/ipc'
-
-const messages = {
-  en: {
-    common: {
-      copy: 'Copy',
-      back: 'Back'
-    },
-    launch: {
-      viewLogs: 'View logs'
-    },
-    comfyLifecycle: {
-      preparingTitle: 'Preparing…',
-      launchingTitle: 'Starting ComfyUI…',
-      stoppingTitle: 'Stopping ComfyUI…',
-      crashedTitle: 'ComfyUI exited unexpectedly',
-      crashedDesc: 'The ComfyUI process exited. You can restart it below.',
-      crashedDescWithCode:
-        'The ComfyUI process exited (exit code {code}). You can restart it below.',
-      crashedDescWithSignal:
-        'The ComfyUI process was terminated by {signal}. You can restart it below.',
-      crashedDescWithCodeAndSignal:
-        'The ComfyUI process was terminated by {signal} (exit code {code}). You can restart it below.',
-      crashedDescWithCodeHex:
-        'The ComfyUI process exited (exit code {code} / {hex}). You can restart it below.',
-      crashedDescAccessViolation:
-        'ComfyUI crashed with a memory access violation (exit code {code} / {hex}). This is usually a faulty or missing native library — not a ComfyUI bug — often surfacing while a Python package loads on startup. You can restart it below.',
-      crashedDescVcRuntimeHint:
-        'Some Microsoft Visual C++ Redistributable runtime files appear to be missing; repairing or installing the latest redistributable may fix this.',
-      crashedDescLogsHint: 'See the logs for details.',
-      restart: 'Restart ComfyUI',
-      stoppedTitle: 'ComfyUI is stopped',
-      stoppedDesc:
-        "The ComfyUI server is stopped. This window stayed open — relaunch it below whenever you're ready.",
-      relaunch: 'Relaunch ComfyUI',
-      launchProgressTitle: 'Starting ComfyUI'
-    },
-    dashboard: {
-      confirmStopLocal: {
-        title: 'Return to Dashboard?',
-        message: 'This will stop the current ComfyUI.',
-        confirmLabel: 'Return to Dashboard'
-      }
-    }
-  }
-}
-
-function createTestI18n() {
-  return createI18n({ legacy: false, locale: 'en', messages })
-}
+import { TID } from '../../../shared/testIds'
 
 const SAMPLE_INSTALL: Installation = {
   id: 'inst-1',
@@ -70,6 +24,7 @@ interface MockApi {
   getRunningInstances: ReturnType<typeof vi.fn>
   getLastCrashError: ReturnType<typeof vi.fn>
   returnToDashboard: ReturnType<typeof vi.fn>
+  openLogsWindow: ReturnType<typeof vi.fn>
   onInstanceLaunching: ReturnType<typeof vi.fn>
   onInstanceLaunchFailed: ReturnType<typeof vi.fn>
   onInstanceStarted: ReturnType<typeof vi.fn>
@@ -86,6 +41,7 @@ function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
     getRunningInstances: vi.fn().mockResolvedValue([]),
     getLastCrashError: vi.fn().mockResolvedValue(null),
     returnToDashboard: vi.fn().mockResolvedValue(true),
+    openLogsWindow: vi.fn().mockResolvedValue(undefined),
     onInstanceLaunching: vi.fn(() => () => {}),
     onInstanceLaunchFailed: vi.fn(() => () => {}),
     onInstanceStarted: vi.fn(() => () => {}),
@@ -100,7 +56,6 @@ function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
   return api
 }
 
-// Stub BrandTakeoverLayout to skip its Teleport-to-body so assertions render inline.
 const brandTakeoverStub = {
   name: 'BrandTakeoverLayout',
   template: '<div class="brand-takeover-stub"><slot /><slot name="footer" /></div>'
@@ -109,9 +64,7 @@ const brandTakeoverStub = {
 function mountView(installationId = 'inst-1', installation: Installation | null = SAMPLE_INSTALL) {
   return mount(ComfyLifecycleView, {
     props: { installationId, installation },
-    // No createPinia() here — beforeEach's setActivePinia must own the instance so its mutations land.
     global: {
-      plugins: [createTestI18n()],
       stubs: { BrandTakeoverLayout: brandTakeoverStub }
     }
   })
@@ -121,31 +74,26 @@ describe('ComfyLifecycleView', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     installMockApi()
-    // The view gates on sessionStore.ready; tests bypass init() so flip it manually.
     useSessionStore().ready = true
   })
 
   it('renders the stopped surface in the not-running state so a clean stop is not a black window', async () => {
-    // A user-initiated Stop leaves no live ComfyUI view covering the panel, so
-    // the not-running state must paint its own relaunch card (regression: it
-    // previously rendered nothing → black window).
     const wrapper = mountView()
     await flushPromises()
     expect(wrapper.text()).toContain('ComfyUI is stopped')
-    // Neutral surface, not the crashed/error chrome.
     expect(wrapper.find('.brand-progress__banner--error').exists()).toBe(false)
     expect(wrapper.find('.lifecycle-placeholder').exists()).toBe(false)
-    const button = wrapper.find('button.brand-primary')
+    const button = wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`)
     expect(button.exists()).toBe(true)
-    expect(button.text()).toContain('Relaunch ComfyUI')
+    expect(button.text()).toContain('Restart ComfyUI')
   })
 
-  it('labels the stopped-surface back button "Return to Dashboard" and routes to the dashboard', async () => {
+  it('labels the stopped-surface back button "Back to Home" and routes to the dashboard', async () => {
     const wrapper = mountView()
     await flushPromises()
-    const back = wrapper.findAll('button').find((b) => b.text().includes('Return to Dashboard'))
+    const back = wrapper.findAll('button').find((b) => b.text().includes('Back to Home'))
     expect(back?.exists()).toBe(true)
-    expect(back!.classes()).toContain('brand-ghost')
+    expect(back!.attributes('data-testid')).toBe(TID.lifecycleReturnDashboard)
     await back!.trigger('click')
     await flushPromises()
     const api = (window as unknown as { api: MockApi }).api
@@ -155,7 +103,7 @@ describe('ComfyLifecycleView', () => {
   it('relaunches from the stopped surface via a launch show-progress', async () => {
     const wrapper = mountView()
     await flushPromises()
-    await wrapper.find('button.brand-primary').trigger('click')
+    await wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`).trigger('click')
     const evts = wrapper.emitted('show-progress')
     expect(evts).toBeTruthy()
     const opts = evts![0]![0] as { opKind: string; apiCall: () => unknown }
@@ -169,7 +117,7 @@ describe('ComfyLifecycleView', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('Starting ComfyUI')
     expect(wrapper.find('.lifecycle-placeholder').exists()).toBe(true)
-    expect(wrapper.find('button.brand-primary').exists()).toBe(false)
+    expect(wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`).exists()).toBe(false)
   })
 
   it('shows the in-flight placeholder while sessionStore reports the install as stopping', async () => {
@@ -179,7 +127,7 @@ describe('ComfyLifecycleView', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('Stopping ComfyUI')
     expect(wrapper.find('.lifecycle-placeholder').exists()).toBe(true)
-    expect(wrapper.find('button.brand-primary').exists()).toBe(false)
+    expect(wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`).exists()).toBe(false)
   })
 
   it('renders the crashed state in brand-error chrome with exit code', async () => {
@@ -193,7 +141,7 @@ describe('ComfyLifecycleView', () => {
     expect(wrapper.text()).toContain('ComfyUI exited unexpectedly')
     expect(wrapper.text()).toContain('exit code 137')
     expect(wrapper.find('.brand-progress__banner--error').exists()).toBe(true)
-    const button = wrapper.find('button.brand-primary')
+    const button = wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`)
     expect(button.exists()).toBe(true)
     expect(button.text()).toContain('Restart ComfyUI')
   })
@@ -210,7 +158,6 @@ describe('ComfyLifecycleView', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('memory access violation')
     expect(wrapper.text()).toContain('0xC0000005')
-    // No VC++ hint unless DLLs were actually found missing.
     expect(wrapper.text()).not.toContain('Visual C++ Redistributable')
   })
 
@@ -251,6 +198,34 @@ describe('ComfyLifecycleView', () => {
     expect(wrapper.text()).toContain('The ComfyUI process exited.')
     expect(wrapper.text()).not.toContain('exit code')
     expect(wrapper.text()).not.toContain('terminated by')
+  })
+
+  it('shows a refused launch as a failed start with its own message, not as a crash', async () => {
+    const wrapper = mountView()
+    const sessionStore = useSessionStore()
+    sessionStore.errorInstances.set('inst-1', {
+      installationName: 'My Local Install',
+      message: 'An earlier ComfyUI for this installation (PID 11944, 17348) did not exit.'
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('ComfyUI could not start')
+    expect(wrapper.text()).toContain('(PID 11944, 17348) did not exit.')
+    expect(wrapper.text()).not.toContain('ComfyUI exited unexpectedly')
+    expect(wrapper.text()).not.toContain('The ComfyUI process exited')
+    expect(wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`).exists()).toBe(true)
+  })
+
+  it('keeps crash copy for a crash even when a message is also recorded', async () => {
+    const wrapper = mountView()
+    const sessionStore = useSessionStore()
+    sessionStore.errorInstances.set('inst-1', {
+      installationName: 'My Local Install',
+      exitCode: 1,
+      message: 'irrelevant'
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('ComfyUI exited unexpectedly')
+    expect(wrapper.text()).not.toContain('ComfyUI could not start')
   })
 
   it('renders both signal and exit code in the crashed message when both are present', async () => {
@@ -298,9 +273,6 @@ describe('ComfyLifecycleView', () => {
     await flushPromises()
     const logs = wrapper.find('.brand-progress__logs')
     expect(logs.exists()).toBe(true)
-    // PII scrubbing belongs on the telemetry path, not the local-UI path.
-    // If any of these fail, we've regressed back to scrubbing logs the user
-    // sees on their own machine (issue #674).
     expect(logs.text()).toContain('C:\\Users\\alice\\ComfyUI\\main.py')
     expect(logs.text()).toContain('/Users/bob/ComfyUI/main.py')
     expect(logs.text()).toContain('/home/carol/ComfyUI/main.py')
@@ -372,8 +344,6 @@ describe('ComfyLifecycleView', () => {
     const wrapper = mountView()
     await flushPromises()
 
-    // A panel recreated after the live event must still get the rich copy + hint
-    // rather than regressing to the bare decimal code.
     expect(wrapper.text()).toContain('memory access violation')
     expect(wrapper.text()).toContain('0xC0000005')
     expect(wrapper.text()).toContain('Visual C++ Redistributable')
@@ -391,7 +361,6 @@ describe('ComfyLifecycleView', () => {
     })
 
     const wrapper = mountView()
-    // The live IPC handler wins over the on-mount fetch.
     const sessionStore = useSessionStore()
     sessionStore.errorInstances.set('inst-1', {
       installationName: 'My Local Install',
@@ -410,7 +379,6 @@ describe('ComfyLifecycleView', () => {
 
     expect(api.getLastCrashError).toHaveBeenCalledWith('inst-1')
     const stored = sessionStore.errorInstances.get('inst-1')
-    // The best-effort buffer fetch must not clobber the fresher live event.
     expect(stored?.lastStderr).toBe('live event stderr')
     expect(stored?.exitCode).toBe(137)
     expect(wrapper.find('.brand-progress__logs').text()).toContain('live event stderr')
@@ -429,7 +397,7 @@ describe('ComfyLifecycleView', () => {
     mount(ComfyLifecycleView, {
       props: { installationId: 'inst-1', installation: SAMPLE_INSTALL },
       global: {
-        plugins: [createTestI18n(), pinia],
+        plugins: [pinia],
         stubs: { BrandTakeoverLayout: brandTakeoverStub }
       }
     })
@@ -445,7 +413,7 @@ describe('ComfyLifecycleView', () => {
       exitCode: 1
     })
     await flushPromises()
-    await wrapper.find('button.brand-primary').trigger('click')
+    await wrapper.find(`[data-testid="${TID.lifecycleRelaunch}"]`).trigger('click')
     const events = wrapper.emitted('show-progress')
     expect(events).toBeDefined()
     expect(events!.length).toBe(1)
@@ -478,13 +446,170 @@ describe('ComfyLifecycleView', () => {
     const buttons = errorActions.findAll('button')
     const back = buttons.find((b) => b.text().includes('Back'))
     expect(back?.exists()).toBe(true)
-    expect(back!.classes()).toContain('brand-ghost')
-    // Back on the left, Restart on the right.
+    expect(back!.attributes('data-testid')).toBe(TID.lifecycleReturnDashboard)
     expect(buttons[0]!.text()).toContain('Back')
     expect(buttons[1]!.text()).toContain('Restart')
     await back!.trigger('click')
     await flushPromises()
     const api = (window as unknown as { api: MockApi }).api
     expect(api.returnToDashboard).toHaveBeenCalled()
+  })
+
+  describe('starting placeholder', () => {
+    function mountWithLogs(
+      installation: Installation | null = SAMPLE_INSTALL,
+      installationId = ref('inst-1')
+    ) {
+      const viewLogs = vi.fn()
+      const Host = defineComponent({
+        setup() {
+          provideBuildLogs(viewLogs)
+          return () => h(ComfyLifecycleView, { installationId: installationId.value, installation })
+        }
+      })
+      return { wrapper: mount(Host), viewLogs }
+    }
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('shows the build name and version under the title', async () => {
+      const { wrapper } = mountWithLogs({ ...SAMPLE_INSTALL, version: 'v0.3.62' })
+      useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      await flushPromises()
+      expect(wrapper.find('.lifecycle-placeholder__build').text()).toBe(
+        'My Local Install · v0.3.62'
+      )
+    })
+
+    it('shows only the name when the version is missing or unknown', async () => {
+      const { wrapper } = mountWithLogs({ ...SAMPLE_INSTALL, version: 'unknown' })
+      useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      await flushPromises()
+      expect(wrapper.find('.lifecycle-placeholder__build').text()).toBe('My Local Install')
+    })
+
+    it('shows no build line for an unnamed build, even with a version', async () => {
+      const { wrapper } = mountWithLogs({ ...SAMPLE_INSTALL, name: '', version: 'v0.3.62' })
+      useSessionStore().launchingInstances.set('inst-1', { installationName: '' })
+      await flushPromises()
+      expect(wrapper.find('.lifecycle-placeholder').exists()).toBe(true)
+      expect(wrapper.find('.lifecycle-placeholder__build').exists()).toBe(false)
+    })
+
+    it('shows no build line when there is no installation', async () => {
+      const { wrapper } = mountWithLogs(null)
+      useSessionStore().launchingInstances.set('inst-1', { installationName: '' })
+      await flushPromises()
+      expect(wrapper.find('.lifecycle-placeholder').exists()).toBe(true)
+      expect(wrapper.find('.lifecycle-placeholder__build').exists()).toBe(false)
+    })
+
+    function seedLocalOperation(opKind: Operation['opKind']): void {
+      useProgressStore().operations.set('inst-1', {
+        opKind,
+        finished: false,
+        steps: null,
+        activePhase: null,
+        flatPercent: -1,
+        flatStatus: '',
+        cancelRequested: false
+      } as unknown as Operation)
+    }
+
+    function seedLocalLaunchOperation(): void {
+      seedLocalOperation('launch')
+    }
+
+    it('offers View logs only after 15 seconds of starting, and opens the build logs', async () => {
+      vi.useFakeTimers()
+      const { wrapper, viewLogs } = mountWithLogs()
+      seedLocalLaunchOperation()
+      useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      await flushPromises()
+      const logs = () => wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`)
+      expect(logs().exists()).toBe(false)
+      await vi.advanceTimersByTimeAsync(14_999)
+      expect(logs().exists()).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(logs().exists()).toBe(true)
+      expect(logs().text()).toBe('View logs')
+      await logs().trigger('click')
+      expect(viewLogs).toHaveBeenCalledWith('inst-1')
+      const api = (window as unknown as { api: MockApi }).api
+      expect(api.openLogsWindow).not.toHaveBeenCalled()
+    })
+
+    it('opens the log window when the launch has no local progress operation', async () => {
+      vi.useFakeTimers()
+      const { wrapper, viewLogs } = mountWithLogs()
+      useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(15_000)
+      const logs = wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`)
+      expect(logs.exists()).toBe(true)
+      await logs.trigger('click')
+      await flushPromises()
+      const api = (window as unknown as { api: MockApi }).api
+      expect(api.openLogsWindow).toHaveBeenCalledExactlyOnceWith('inst-1')
+      expect(viewLogs).not.toHaveBeenCalled()
+    })
+
+    it.each(['update', 'install'] as const)(
+      'opens the log window, not the build logs, while an unfinished %s operation is running',
+      async (opKind) => {
+        vi.useFakeTimers()
+        const { wrapper, viewLogs } = mountWithLogs()
+        seedLocalOperation(opKind)
+        useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+        await flushPromises()
+        await vi.advanceTimersByTimeAsync(15_000)
+        const logs = wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`)
+        expect(logs.exists()).toBe(true)
+        await logs.trigger('click')
+        await flushPromises()
+        const api = (window as unknown as { api: MockApi }).api
+        expect(api.openLogsWindow).toHaveBeenCalledExactlyOnceWith('inst-1')
+        expect(viewLogs).not.toHaveBeenCalled()
+      }
+    )
+
+    it('announces View logs politely when it appears', async () => {
+      vi.useFakeTimers()
+      const { wrapper } = mountWithLogs()
+      useSessionStore().launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(15_000)
+      const logs = wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`)
+      expect(logs.element.closest('[aria-live]')?.getAttribute('aria-live')).toBe('polite')
+    })
+
+    it('restarts the 15 second wait when the view switches to another starting build', async () => {
+      vi.useFakeTimers()
+      const installationId = ref('inst-1')
+      const { wrapper } = mountWithLogs(SAMPLE_INSTALL, installationId)
+      const sessionStore = useSessionStore()
+      sessionStore.launchingInstances.set('inst-1', { installationName: 'My Local Install' })
+      sessionStore.launchingInstances.set('inst-2', { installationName: 'Other build' })
+      await flushPromises()
+      const logs = () => wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`)
+      await vi.advanceTimersByTimeAsync(10_000)
+      installationId.value = 'inst-2'
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(logs().exists()).toBe(false)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(logs().exists()).toBe(true)
+    })
+
+    it('does not offer View logs while stopping, however long it takes', async () => {
+      vi.useFakeTimers()
+      const { wrapper } = mountWithLogs()
+      useSessionStore().stoppingInstances.add('inst-1')
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(wrapper.find(`[data-testid="${TID.lifecycleViewLogs}"]`).exists()).toBe(false)
+    })
   })
 })

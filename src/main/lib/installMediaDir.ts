@@ -4,10 +4,6 @@ import { installInputDir, installOutputDir } from './models'
 
 export type MediaDirKind = 'input' | 'output'
 
-/** The input/output folder ComfyUI is launched against for this install.
- *  Mirrors the `--input-directory` / `--output-directory` selection in
- *  `sessionActions/launch.ts`: shared (global setting) unless the install
- *  opted out, then the per-install path, then the install's own default. */
 export function resolveInstallMediaDir(
   installation: InstallationRecord,
   kind: MediaDirKind

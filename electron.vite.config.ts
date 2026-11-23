@@ -9,17 +9,14 @@ const { resolveDatadogReleaseVersion } = require('./scripts/datadog-release-vers
   resolveDatadogReleaseVersion: (env?: NodeJS.ProcessEnv) => string
 }
 
-if (!process.env.VITE_DATADOG_RUM_VERSION) {
-  process.env.VITE_DATADOG_RUM_VERSION = resolveDatadogReleaseVersion(process.env)
-}
+process.env.VITE_DATADOG_RUM_VERSION = resolveDatadogReleaseVersion(process.env)
 
 export default defineConfig({
   main: {
+    plugins: [tailwindcss()],
     build: {
       sourcemap: 'hidden',
       rollupOptions: {
-        // node-pty is a native addon; it must stay external (its .node binary
-        // can't be bundled) and is loaded from the unpacked node_modules.
         external: ['node-pty']
       }
     }
@@ -31,6 +28,7 @@ export default defineConfig({
         input: {
           index: resolve(__dirname, 'src/preload/index.ts'),
           comfyPreload: resolve(__dirname, 'src/preload/comfyPreload.ts'),
+          appsPreload: resolve(__dirname, 'src/preload/appsPreload.ts'),
           terminalPreload: resolve(__dirname, 'src/preload/terminalPreload.ts'),
           comfyTitleBarPreload: resolve(__dirname, 'src/preload/comfyTitleBarPreload.ts'),
           comfyTitlePopupPreload: resolve(__dirname, 'src/preload/comfyTitlePopupPreload.ts'),

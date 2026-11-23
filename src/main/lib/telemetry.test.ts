@@ -4,6 +4,7 @@ import os from 'os'
 import path from 'path'
 import { EventEmitter } from 'events'
 import type { TelemetryValue } from './telemetry'
+import { DEFAULT_POSTHOG_API_KEY, DEFAULT_POSTHOG_HOST } from '../../shared/posthogConfig'
 
 vi.mock('electron', () => ({
   app: {
@@ -14,11 +15,6 @@ vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] }
 }))
 
-/**
- * Build a stub WebContents that records `send()` calls and emits
- * `'destroyed'` so the relay registry can self-clean. Mirrors the surface
- * the production registry actually consumes.
- */
 function makeStubWebContents(): {
   wc: Electron.WebContents
   sends: { channel: string; data: unknown }[]
@@ -68,26 +64,43 @@ interface ExceptionCall {
   properties?: Record<string, unknown>
 }
 const exceptions: ExceptionCall[] = []
+interface FlagEvaluationOptions {
+  sendFeatureFlagEvents?: boolean
+  personProperties?: Record<string, string>
+}
 const featureFlagResultCalls: Array<{
   key: string
   distinctId: string
-  options?: { sendFeatureFlagEvents?: boolean }
+  options?: FlagEvaluationOptions
 }> = []
-/** Constructor arguments the SDK actually received. An option the app "sets" but never passes
- *  through to `new PostHog(...)` has no effect at all, which is the failure this records. */
 const posthogConstructorCalls: Array<{ apiKey: string; options: Record<string, unknown> }> = []
+
+interface MockPostHogClient {
+  shutdownCalls: number
+  emitError(error: Error): void
+}
+const posthogInstances: MockPostHogClient[] = []
+
+interface PendingImmediateCapture {
+  call: CapturedCall
+  accept(): void
+  reportError(): void
+}
+const pendingImmediateCaptures: PendingImmediateCapture[] = []
 
 const posthogClientMock = vi.hoisted(() => ({
   failNextCaptures: 0,
+  immediateCaptureOutcome: 'sent' as 'sent' | 'rejected' | 'reported-error' | 'deferred',
   failNextFlushes: 0,
   autoFailNextIdentifies: 0,
   featureFlagResult: undefined as
-    | { enabled: boolean; variant?: string; payload?: unknown }
-    | undefined,
-  /** `hang` never settles, so only the caller's timeout can win the race. `defer` hands the
-   *  test the settle functions instead, so an outcome can be staged AFTER the deadline has
-   *  already answered — the only way to exercise the late-result path. */
+    { enabled: boolean; variant?: string; payload?: unknown } | undefined,
   featureFlagBehavior: 'resolve' as 'resolve' | 'throw' | 'hang' | 'defer',
+  evaluateCondition: undefined as
+    | ((options?: {
+        personProperties?: Record<string, string>
+      }) => { enabled: boolean; variant?: string; payload?: unknown } | undefined)
+    | undefined,
   deferred: null as {
     resolve: (value: { enabled: boolean; variant?: string; payload?: unknown } | undefined) => void
     reject: (reason: unknown) => void
@@ -98,9 +111,15 @@ vi.mock('posthog-node', () => ({
   PostHog: class {
     private listeners = new Map<string, Set<(...args: unknown[]) => void>>()
     private queuedIdentifies: Array<Record<string, unknown>> = []
+    shutdownCalls = 0
 
     constructor(apiKey: string, options: Record<string, unknown>) {
       posthogConstructorCalls.push({ apiKey, options })
+      posthogInstances.push(this)
+    }
+
+    emitError(error: Error): void {
+      this.emit('error', error)
     }
 
     on(event: string, listener: (...args: unknown[]) => void): () => void {
@@ -116,6 +135,31 @@ vi.mock('posthog-node', () => ({
       if (posthogClientMock.failNextCaptures > 0) {
         posthogClientMock.failNextCaptures--
         throw new Error('sdk rejected capture')
+      }
+      captured.push(call)
+    }
+    async captureImmediate(call: CapturedCall): Promise<void> {
+      if (posthogClientMock.immediateCaptureOutcome === 'rejected') {
+        throw new Error('sdk rejected immediate capture')
+      }
+      if (posthogClientMock.immediateCaptureOutcome === 'reported-error') {
+        this.emit('error', new Error('batch request failed'))
+        return
+      }
+      if (posthogClientMock.immediateCaptureOutcome === 'deferred') {
+        return new Promise<void>((resolve) => {
+          pendingImmediateCaptures.push({
+            call,
+            accept: () => {
+              captured.push(call)
+              resolve()
+            },
+            reportError: () => {
+              this.emit('error', new Error('batch request failed'))
+              resolve()
+            }
+          })
+        })
       }
       captured.push(call)
     }
@@ -152,14 +196,18 @@ vi.mock('posthog-node', () => ({
       return Promise.resolve()
     }
     shutdown(): Promise<void> {
+      this.shutdownCalls++
       return Promise.resolve()
     }
     getFeatureFlagResult(
       key: string,
       distinctId: string,
-      options?: { sendFeatureFlagEvents?: boolean }
+      options?: FlagEvaluationOptions
     ): Promise<{ enabled: boolean; variant?: string; payload?: unknown } | undefined> {
       featureFlagResultCalls.push({ key, distinctId, options })
+      if (posthogClientMock.evaluateCondition) {
+        return Promise.resolve(posthogClientMock.evaluateCondition(options))
+      }
       if (posthogClientMock.featureFlagBehavior === 'throw') {
         return Promise.reject(new Error('flag evaluation failed'))
       }
@@ -224,9 +272,6 @@ vi.mock('./pendingIdentityMerge', () => ({
   }
 }))
 
-/** `opsFlag` resolves `ops-flags.json` under `configDir()`; pinning it to a temp dir is what lets
- *  the real persistence layer run against the real `getOpsFlagResult` below. `telemetry.ts` itself
- *  never imports this module, so the mock reaches `opsFlag` alone. */
 let testConfigDir = ''
 vi.mock('./paths', () => ({
   configDir: () => testConfigDir
@@ -240,38 +285,71 @@ function bindTestAnonymous(id: string, properties: Record<string, TelemetryValue
 }
 
 interface SetupTelemetryOptions {
-  /** Consent state to apply after init; `null` leaves the post-reset 'undecided'. */
   consent?: 'granted' | 'denied' | 'undecided' | null
-  /** Anonymous D to bind after the consent transition; `null` skips binding. */
   bind?: string | null
   appVersion?: string
   appEnv?: string
+  isPackaged?: boolean
+  env?: Partial<Record<PostHogEnvName, string | undefined>>
 }
 
-/**
- * Reset module state and the capture buffers, then run the standard boot
- * sequence: init → consent → bind D. Volume guards are reset LAST so the
- * `session.started` flushed by a granted-consent bind never counts toward a
- * test's rate-limit or session-cap totals. Buffers are cleared at the start
- * only — tests that measure from a later point clear `captured` themselves.
- */
+type PostHogEnvName =
+  | 'POSTHOG_API_KEY'
+  | 'POSTHOG_HOST'
+  | 'POSTHOG_ENABLED'
+  | 'COMFY_DESKTOP_POSTHOG_API_KEY'
+  | 'COMFY_DESKTOP_POSTHOG_HOST'
+  | 'COMFY_DESKTOP_POSTHOG_ENABLED'
+  | 'COMFY_DESKTOP_POSTHOG_EXCEPTIONS'
+  | 'POSTHOG_EXCEPTIONS'
+
+const postHogEnvNames: PostHogEnvName[] = [
+  'POSTHOG_API_KEY',
+  'POSTHOG_HOST',
+  'POSTHOG_ENABLED',
+  'COMFY_DESKTOP_POSTHOG_API_KEY',
+  'COMFY_DESKTOP_POSTHOG_HOST',
+  'COMFY_DESKTOP_POSTHOG_ENABLED',
+  'COMFY_DESKTOP_POSTHOG_EXCEPTIONS',
+  'POSTHOG_EXCEPTIONS'
+]
+let previousPostHogEnv: Partial<Record<PostHogEnvName, string>> = {}
+
+beforeEach(() => {
+  previousPostHogEnv = Object.fromEntries(
+    postHogEnvNames.flatMap((name) =>
+      process.env[name] === undefined ? [] : [[name, process.env[name]!]]
+    )
+  )
+})
+
 function setupTelemetry(options: SetupTelemetryOptions = {}): void {
   const {
     consent = 'granted',
     bind = 'test-distinct-id',
     appVersion = '0.0.0',
-    appEnv = 'test'
+    appEnv = 'test',
+    isPackaged = true,
+    env = {}
   } = options
   captured.length = 0
   identifies.length = 0
   exceptions.length = 0
   featureFlagResultCalls.length = 0
   posthogConstructorCalls.length = 0
-  process.env['POSTHOG_API_KEY'] = 'test-key'
-  process.env['POSTHOG_ENABLED'] = '1'
+  posthogInstances.length = 0
+  pendingImmediateCaptures.length = 0
+  for (const name of postHogEnvNames) delete process.env[name]
+  process.env[isPackaged ? 'COMFY_DESKTOP_POSTHOG_API_KEY' : 'POSTHOG_API_KEY'] = 'test-key'
+  process.env['COMFY_DESKTOP_POSTHOG_ENABLED'] = '1'
+  process.env['COMFY_DESKTOP_POSTHOG_EXCEPTIONS'] = '1'
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[name]
+    else process.env[name] = value
+  }
   telemetry._resetForTest()
   telemetry._resetTelemetryRelayTargets()
-  telemetry.initTelemetry({ appVersion, appEnv, isPackaged: true })
+  telemetry.initTelemetry({ appVersion, appEnv, isPackaged })
   if (consent) telemetry.setConsentState(consent)
   if (bind) bindTestAnonymous(bind)
   telemetry._test_resetVolumeGuards()
@@ -281,15 +359,20 @@ afterEach(() => {
   anonymousIdentityMock.index = 0
   anonymousIdentityMock.fail = false
   posthogClientMock.failNextCaptures = 0
+  posthogClientMock.immediateCaptureOutcome = 'sent'
   posthogClientMock.failNextFlushes = 0
   posthogClientMock.autoFailNextIdentifies = 0
   posthogClientMock.featureFlagResult = undefined
   posthogClientMock.featureFlagBehavior = 'resolve'
+  posthogClientMock.evaluateCondition = undefined
   posthogClientMock.deferred = null
   pendingIdentityMergeMock.entries = []
   pendingIdentityMergeMock.nextId = 1
-  delete process.env['POSTHOG_API_KEY']
-  delete process.env['POSTHOG_ENABLED']
+  for (const name of postHogEnvNames) {
+    const previous = previousPostHogEnv[name]
+    if (previous === undefined) delete process.env[name]
+    else process.env[name] = previous
+  }
   telemetry._resetForTest()
   telemetry._resetTelemetryRelayTargets()
 })
@@ -301,7 +384,6 @@ describe('telemetry.bucketError', () => {
     ['fetch failed: network unreachable', 'network'],
     ['No space left on disk', 'disk'],
     ['permission denied: /var/log', 'permissions'],
-    // CUDA / system / Linux OOM-killer
     ['CUDA out of memory', 'oom'],
     ['torch.cuda.OutOfMemoryError: blah', 'oom'],
     ['Killed: process exceeded memory', 'oom'],
@@ -311,41 +393,25 @@ describe('telemetry.bucketError', () => {
     ['ModuleNotFoundError: No module named foo', 'import_error'],
     ['node not found: SomeCustomNode', 'node_missing'],
     ['Unknown node type FooNode', 'node_missing'],
-    // Generic <Class>Error messages fall back to "python".
     ['RuntimeError: something broke', 'python'],
     ['ValueError: bad input', 'python'],
-    // scrubAll can strip a leading path and leave the class name in the
-    // middle; previously the `^`-anchored regex would miss this and the
-    // event landed in `other`.
     ['execution failed -> RuntimeError: bad input', 'python'],
     ['Got AttributeError while computing', 'python'],
-    // The python regex requires an uppercase first letter on the class
-    // name — without that, lowercase noise like "user.error: oops" or
-    // "config.exception in foo" would slide into the python bucket and
-    // pollute the dashboard.
     ['see module.error somewhere in foo.py', 'other'],
     ['the user.exception field is set', 'other'],
-    // Tensor / shape mismatches
     ['size mismatch for transformer.h.0.weight', 'shape_mismatch'],
     ["shape '[1, 4, 64, 64]' is invalid for input of size 16384", 'shape_mismatch'],
     ['expected 4 dimensions but got 3', 'shape_mismatch'],
-    // Model-load failures
     ['Error while deserializing header: invalid byte 0x12', 'model_load'],
     ['Missing key(s) in state_dict: "transformer.h.0.weight"', 'model_load'],
     ['safetensors_rust.SafetensorError: corrupted', 'model_load'],
-    // Workflow-validation failures
     ['Prompt outputs failed validation', 'validation'],
     ['validation_failed for node 5', 'validation'],
-    // Migration source-missing failures, observed at launch: gitcode mirror
-    // clones that stall mid-stream, and Desktop 1 trees that lost their
-    // ComfyUI source path so the adopter has neither a staged copy nor a
-    // working clone to source.
     [
       'source-missing: Downloading ComfyUI source from https://gitcode.com/gh_mirrors/co/ComfyUI.git',
       'source_missing'
     ],
     ['source_missing', 'source_missing'],
-    // No known signal
     ['something blew up', 'other'],
     ['this is just a sentence', 'other'],
     ['', 'unknown']
@@ -363,6 +429,46 @@ describe('telemetry.bucketError', () => {
 })
 
 describe('telemetry default event properties', () => {
+  it('carries sac_state on session.started when read before binding, as boot does', () => {
+    setupTelemetry({ bind: null })
+    telemetry.setSmartAppControlState('on')
+    bindTestAnonymous('boot-id')
+
+    const started = captured.find((c) => c.event === 'comfy.desktop.session.started')
+    expect(started?.properties).toMatchObject({ sac_state: 'on' })
+  })
+
+  it('carries apps_enabled on session.started when boot passes it in', () => {
+    setupTelemetry({ consent: null, bind: null })
+    telemetry._resetForTest()
+    telemetry.initTelemetry({
+      appVersion: '0.0.0',
+      appEnv: 'test',
+      isPackaged: true,
+      sessionStartProps: { prior_session_unclean: false, apps_enabled: true }
+    })
+    telemetry.setConsentState('granted')
+    bindTestAnonymous('boot-id')
+
+    const started = captured.filter((c) => c.event === 'comfy.desktop.session.started')
+    expect(started).toHaveLength(1)
+    expect(started[0]?.properties).toMatchObject({
+      apps_enabled: true,
+      prior_session_unclean: false
+    })
+  })
+
+  it('adds sac_state to every capture once read, keeping installation_id', () => {
+    setupTelemetry({ bind: 'id' })
+    telemetry.setSmartAppControlState('off')
+    captured.length = 0
+
+    telemetry.capture('comfy.desktop.test.event', {})
+
+    expect(captured[0]!.properties).toMatchObject({ sac_state: 'off', platform: process.platform })
+    expect(captured[0]!.properties).toHaveProperty('installation_id')
+  })
+
   it('injects app_version, app_channel, app_env, platform, arch, client on every capture', () => {
     setupTelemetry({ appVersion: '0.7.0-beta.3', appEnv: 'prod', bind: 'id' })
     captured.length = 0
@@ -381,6 +487,15 @@ describe('telemetry default event properties', () => {
       client: 'desktop',
       $process_person_profile: false
     })
+  })
+
+  it('lists every default property in DEFAULT_EVENT_PROPERTY_NAMES', () => {
+    setupTelemetry({ bind: 'id' })
+    telemetry.setSmartAppControlState('off')
+    captured.length = 0
+    telemetry.capture('any.event')
+    const keys = Object.keys(captured[0]!.properties ?? {}).filter((key) => !key.startsWith('$'))
+    expect(new Set(keys)).toEqual(telemetry.DEFAULT_EVENT_PROPERTY_NAMES)
   })
 
   it('derives stable channel for a clean semver and unknown for an unfamiliar suffix', () => {
@@ -413,11 +528,13 @@ describe('telemetry default event properties', () => {
     setupTelemetry({ appVersion: '1.0.0', appEnv: 'prod', bind: 'id' })
     exceptions.length = 0
 
-    telemetry.captureException(new Error('boom'), { foo: 'bar' })
+    telemetry.captureException(new Error('boom'), {
+      error_type: 'workspace_auth_gate_initialization_failure'
+    })
 
     expect(exceptions).toHaveLength(1)
     expect(exceptions[0]!.properties).toMatchObject({
-      foo: 'bar',
+      error_type: 'workspace_auth_gate_initialization_failure',
       app_version: '1.0.0',
       client: 'desktop',
       $process_person_profile: false
@@ -443,8 +560,6 @@ describe('telemetry default event properties', () => {
     setupTelemetry({ appVersion: '1.0.0', appEnv: 'prod', bind: 'install-abc123' })
     captured.length = 0
 
-    // A main-process event and a renderer-routed event both go through
-    // capture(), so both must carry installation_id from the defaults.
     telemetry.capture('comfy.desktop.execution.session_summary', { foo: 'bar' })
     telemetry.capture('comfy.desktop.template.fork', { template_id: 't1' })
 
@@ -456,17 +571,10 @@ describe('telemetry default event properties', () => {
   it('does not identify installation_id or anonymous D at boot', () => {
     setupTelemetry({ appVersion: '1.0.0', appEnv: 'prod', bind: 'install-abc123' })
 
-    // bindAnonymousId stamps installation_id only as a property. Only the
-    // Firebase UID login path may call the SDK's identify.
     expect(identifies).toHaveLength(0)
   })
 })
 
-// The SDK bounds a `/flags` POST at `featureFlagsRequestTimeoutMs` (default 3000 ms) with retries
-// disabled. A cold POST measured ~2572 ms and is always cold at boot, so the default leaves ~430 ms
-// of headroom: on a slower link the SDK yields nothing at all, the late continuation never fires,
-// and a revocation can never land. The launch deadline is unaffected — that is `opsFlag`'s own
-// 2000 ms race, which still answers on time.
 describe('telemetry PostHog client options', () => {
   function constructorOptions(): Record<string, unknown> {
     expect(posthogConstructorCalls).toHaveLength(1)
@@ -476,8 +584,6 @@ describe('telemetry PostHog client options', () => {
   it('passes a feature-flag request timeout above the SDK default to the client', () => {
     setupTelemetry()
 
-    // Asserted on the CONSTRUCTOR argument, not on a local constant: an option the SDK never
-    // receives changes nothing, and is indistinguishable from the default at every other seam.
     expect(constructorOptions().featureFlagsRequestTimeoutMs).toBe(10_000)
   })
 
@@ -492,23 +598,155 @@ describe('telemetry PostHog client options', () => {
   })
 
   it('does not set requestTimeout, which governs a path this app never takes', () => {
-    // `requestTimeout` only reaches `FeatureFlagsPoller`, built solely when `personalApiKey` is
-    // set. Desktop never sets one, so touching it would be cargo-culted config.
     setupTelemetry()
 
     expect(constructorOptions()).not.toHaveProperty('requestTimeout')
   })
+
+  it('ignores generic PostHog key and host environment variables in packaged builds', () => {
+    setupTelemetry({
+      env: {
+        POSTHOG_API_KEY: 'phx-unrelated-personal-key',
+        POSTHOG_HOST: 'https://unrelated-posthog.example'
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: 'test-key',
+      options: { host: DEFAULT_POSTHOG_HOST }
+    })
+  })
+
+  it('uses packaged defaults when the scoped key and host are absent', () => {
+    setupTelemetry({
+      env: {
+        POSTHOG_API_KEY: 'phx-unrelated-personal-key',
+        POSTHOG_HOST: 'https://unrelated-posthog.example',
+        COMFY_DESKTOP_POSTHOG_API_KEY: undefined,
+        COMFY_DESKTOP_POSTHOG_HOST: undefined
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: DEFAULT_POSTHOG_API_KEY,
+      options: { host: DEFAULT_POSTHOG_HOST }
+    })
+  })
+
+  it('preserves the generic PostHog disable switch in packaged builds', () => {
+    setupTelemetry({ env: { POSTHOG_ENABLED: '0' } })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
+
+  it('accepts product-scoped PostHog overrides in packaged builds', () => {
+    setupTelemetry({
+      env: {
+        COMFY_DESKTOP_POSTHOG_API_KEY: 'scoped-key',
+        COMFY_DESKTOP_POSTHOG_HOST: 'https://scoped-posthog.example'
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: 'scoped-key',
+      options: { host: 'https://scoped-posthog.example' }
+    })
+  })
+
+  it('keeps generic PostHog overrides available for unpackaged development', () => {
+    setupTelemetry({
+      isPackaged: false,
+      env: {
+        POSTHOG_API_KEY: 'dev-key',
+        POSTHOG_HOST: 'https://dev-posthog.example'
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: 'dev-key',
+      options: { host: 'https://dev-posthog.example' }
+    })
+  })
+
+  it('prefers product-scoped PostHog overrides during unpackaged development', () => {
+    setupTelemetry({
+      isPackaged: false,
+      env: {
+        POSTHOG_API_KEY: 'generic-key',
+        POSTHOG_HOST: 'https://generic-posthog.example',
+        COMFY_DESKTOP_POSTHOG_API_KEY: 'scoped-key',
+        COMFY_DESKTOP_POSTHOG_HOST: 'https://scoped-posthog.example'
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: 'scoped-key',
+      options: { host: 'https://scoped-posthog.example' }
+    })
+  })
+
+  it('honors the product-scoped disable switch during unpackaged development', () => {
+    setupTelemetry({ isPackaged: false, env: { COMFY_DESKTOP_POSTHOG_ENABLED: '0' } })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
+
+  it('accepts common privacy opt-out spellings', () => {
+    setupTelemetry({ env: { COMFY_DESKTOP_POSTHOG_ENABLED: 'disabled' } })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
+
+  it('does not let an unrelated inherited spelling disable telemetry', () => {
+    setupTelemetry({ env: { POSTHOG_ENABLED: 'unrelated-tool-value' } })
+
+    expect(posthogConstructorCalls).toHaveLength(1)
+  })
+
+  it('preserves the generic disable switch during unpackaged development', () => {
+    setupTelemetry({ isPackaged: false, env: { POSTHOG_ENABLED: '0' } })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
+
+  it('falls back from whitespace-only overrides to packaged defaults', () => {
+    setupTelemetry({
+      env: {
+        COMFY_DESKTOP_POSTHOG_API_KEY: '  ',
+        COMFY_DESKTOP_POSTHOG_HOST: '\t'
+      }
+    })
+
+    expect(posthogConstructorCalls[0]).toMatchObject({
+      apiKey: DEFAULT_POSTHOG_API_KEY,
+      options: { host: DEFAULT_POSTHOG_HOST }
+    })
+  })
+
+  it('rejects a non-HTTPS packaged host override', () => {
+    setupTelemetry({ env: { COMFY_DESKTOP_POSTHOG_HOST: 'http://posthog.example' } })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
+
+  it('rejects credentials embedded in a packaged host override', () => {
+    setupTelemetry({
+      env: { COMFY_DESKTOP_POSTHOG_HOST: 'https://user:password@posthog.example' }
+    })
+
+    expect(posthogConstructorCalls).toHaveLength(0)
+  })
 })
 
-// Revocation semantics hang off this classification: a `value` (including an explicit
-// `false`) overwrites the persisted treatment, `unreachable` holds it. Collapsing the two
-// lets an offline launch silently revoke, or a disable silently fail to.
+const PLATFORM = { platform: process.platform }
+const BASE_PROPS = { ...PLATFORM, app_version: '0.0.0' }
+
 describe('telemetry anonymous flag reads', () => {
   it('classifies an enabled flag as a value result, without implicit capture', async () => {
     setupTelemetry({ consent: null, bind: null })
     posthogClientMock.featureFlagResult = {
       enabled: true,
-      variant: 'canary',
+      variant: 'beta',
       payload: { flags: ['enable-assets'] }
     }
 
@@ -516,35 +754,35 @@ describe('telemetry anonymous flag reads', () => {
       telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
     ).resolves.toEqual({
       kind: 'value',
-      value: 'canary',
+      value: 'beta',
       payload: { flags: ['enable-assets'] }
     })
     expect(featureFlagResultCalls).toEqual([
       {
         key: 'desktop_core_beta_features',
         distinctId: 'installation-id',
-        options: { sendFeatureFlagEvents: false }
+        options: {
+          sendFeatureFlagEvents: false,
+          personProperties: BASE_PROPS
+        }
       }
     ])
   })
 
   it('classifies a disabled flag as a value result carrying false', async () => {
-    // Given a flag turned off on the server, with a variant left over from when it was on
     setupTelemetry({ consent: null, bind: null })
     posthogClientMock.featureFlagResult = {
       enabled: false,
-      variant: 'canary',
+      variant: 'beta',
       payload: { flags: ['enable-assets'] }
     }
 
-    // Then it reads as a VALUE of false, not as a miss — this is the revocation signal
     await expect(
       telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
     ).resolves.toMatchObject({ kind: 'value', value: false })
   })
 
   it('classifies a missing flag result as unreachable', async () => {
-    // Given the SDK resolves undefined — a key the server did not return
     setupTelemetry({ consent: null, bind: null })
     posthogClientMock.featureFlagResult = undefined
 
@@ -563,7 +801,6 @@ describe('telemetry anonymous flag reads', () => {
   })
 
   it('classifies a timed-out evaluation request as unreachable', async () => {
-    // Given a request that never settles, so only the caller's timeout can win the race
     setupTelemetry({ consent: null, bind: null })
     posthogClientMock.featureFlagBehavior = 'hang'
 
@@ -573,17 +810,378 @@ describe('telemetry anonymous flag reads', () => {
   })
 })
 
-// A cold `/flags` POST measured ~2572 ms on Windows and is always cold at boot, so a 2000 ms
-// deadline loses every launch and an abandoned explicit `false` never reaches disk — a grant
-// cannot be withdrawn at all. `onLateResult` recovers that answer for the NEXT launch.
-//
-// The write rule does not change, only its timing: `value` may be persisted, `unreachable` never
-// may. So this callback fires for a truthy resolution and NOTHING else. Routing a late miss
-// through it would turn deleting a flag into revoking it, which is precisely what the ops
-// disable-then-delete sequence exists to avoid.
+describe('ops-flag person targeting', () => {
+  function lastPersonProperties(): unknown {
+    const call = featureFlagResultCalls.at(-1)
+    return (call?.options as { personProperties?: unknown } | undefined)?.personProperties
+  }
+
+  async function evaluate(): Promise<void> {
+    await telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+  }
+
+  it('attaches comfy_staff for a staff install once consent is granted', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      comfy_staff: 'true'
+    })
+  })
+
+  it('leaves the distinct id the installation hash, so bucketing is unchanged', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+
+    await evaluate()
+
+    expect(featureFlagResultCalls.at(-1)?.distinctId).toBe('installation-id')
+  })
+
+  it('never captures an event for the evaluation, so no person is created', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+
+    await evaluate()
+
+    expect(
+      (featureFlagResultCalls.at(-1)?.options as { sendFeatureFlagEvents?: boolean } | undefined)
+        ?.sendFeatureFlagEvents
+    ).toBe(false)
+    expect(captured.map((event) => event.event)).not.toContain('$feature_flag_called')
+  })
+
+  it('sends the OS the app is running on, not a fixed value', async () => {
+    setupTelemetry({ consent: null })
+    const original = Object.getOwnPropertyDescriptor(process, 'platform')!
+    const other = process.platform === 'win32' ? 'darwin' : 'win32'
+    Object.defineProperty(process, 'platform', { value: other, configurable: true })
+    try {
+      await evaluate()
+    } finally {
+      Object.defineProperty(process, 'platform', original)
+    }
+
+    expect(lastPersonProperties()).toEqual({ platform: other, app_version: '0.0.0' })
+  })
+
+  it('sends no comfy_staff for a non-staff install', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(false)
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('sends no comfy_staff when consent is undecided', async () => {
+    setupTelemetry({ consent: null })
+    telemetry.setFlagEvaluationStaff(true)
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('sends no comfy_staff when consent is denied', async () => {
+    setupTelemetry({ consent: 'denied' })
+    telemetry.setFlagEvaluationStaff(true)
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('still evaluates the flag without consent, carrying no staff property', async () => {
+    setupTelemetry({ consent: 'denied' })
+    telemetry.setFlagEvaluationStaff(true)
+    posthogClientMock.featureFlagResult = { enabled: true, variant: 'beta', payload: null }
+
+    await expect(
+      telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+    ).resolves.toMatchObject({ kind: 'value', value: 'beta' })
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it.each(['granted', 'denied', null] as const)(
+    'sends sac_state once read, with consent %s',
+    async (consent) => {
+      setupTelemetry({ consent })
+      telemetry.setSmartAppControlState('on')
+
+      await evaluate()
+
+      expect(lastPersonProperties()).toEqual({ ...BASE_PROPS, sac_state: 'on' })
+    }
+  )
+
+  it('sends no sac_state before it has been read', async () => {
+    setupTelemetry({ consent: 'granted' })
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('attaches user_tier once consent is granted', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationUserTier('paid')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      user_tier: 'paid'
+    })
+    expect(featureFlagResultCalls.at(-1)?.distinctId).toBe('installation-id')
+  })
+
+  it('sends a known free tier too, so a condition can tell free from unknown', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationUserTier('free')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      user_tier: 'free'
+    })
+  })
+
+  it('sends no user_tier while the tier is unknown', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationUserTier('paid')
+    telemetry.setFlagEvaluationUserTier('unknown')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it.each(['denied', null] as const)('sends no user_tier with consent %s', async (consent) => {
+    setupTelemetry({ consent })
+    telemetry.setFlagEvaluationUserTier('paid')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('sends user_tier alongside comfy_staff for a consented paid staff install', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+    telemetry.setFlagEvaluationUserTier('paid')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      comfy_staff: 'true',
+      user_tier: 'paid'
+    })
+  })
+
+  it('drops the consented properties when consent is revoked after binding', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationUserTier('paid')
+    telemetry.setConsentState('denied')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('sends a tier bound before consent once consent is granted', async () => {
+    setupTelemetry({ consent: null })
+    telemetry.setFlagEvaluationUserTier('paid')
+    telemetry.setConsentState('granted')
+
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      user_tier: 'paid'
+    })
+  })
+
+  it('stops sending once the install is reclassified, as on sign-out', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+    await evaluate()
+    expect(lastPersonProperties()).toEqual({
+      ...PLATFORM,
+      app_version: '0.0.0',
+      comfy_staff: 'true'
+    })
+
+    telemetry.setFlagEvaluationStaff(false)
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  it('does not survive a reset, so no classification leaks between launches in-process', async () => {
+    setupTelemetry({ consent: 'granted' })
+    telemetry.setFlagEvaluationStaff(true)
+    telemetry.setFlagEvaluationUserTier('paid')
+
+    setupTelemetry({ consent: 'granted' })
+    await evaluate()
+
+    expect(lastPersonProperties()).toEqual(BASE_PROPS)
+  })
+
+  describe('against a stand-in `comfy_staff = true` condition', () => {
+    function serveStaffOnlyFlag(): void {
+      posthogClientMock.evaluateCondition = (options) => {
+        if (options?.personProperties?.['comfy_staff'] !== 'true') return { enabled: false }
+        return { enabled: true, variant: 'beta', payload: { flags: [{ arg: '--enable-agent' }] } }
+      }
+    }
+
+    it('matches for a staff install', async () => {
+      setupTelemetry({ consent: 'granted' })
+      serveStaffOnlyFlag()
+      telemetry.setFlagEvaluationStaff(true)
+
+      await expect(
+        telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+      ).resolves.toEqual({
+        kind: 'value',
+        value: 'beta',
+        payload: { flags: [{ arg: '--enable-agent' }] }
+      })
+    })
+
+    it('does not match a non-staff install', async () => {
+      setupTelemetry({ consent: 'granted' })
+      serveStaffOnlyFlag()
+      telemetry.setFlagEvaluationStaff(false)
+
+      await expect(
+        telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+      ).resolves.toEqual({ kind: 'value', value: false, payload: undefined })
+    })
+
+    it('does not match on the installation hash alone — the bug this fixes', async () => {
+      setupTelemetry({ consent: 'granted' })
+      serveStaffOnlyFlag()
+
+      await expect(
+        telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+      ).resolves.toEqual({ kind: 'value', value: false, payload: undefined })
+    })
+
+    it('does not match a staff install that withheld consent', async () => {
+      setupTelemetry({ consent: 'denied' })
+      serveStaffOnlyFlag()
+      telemetry.setFlagEvaluationStaff(true)
+
+      await expect(
+        telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+      ).resolves.toEqual({ kind: 'value', value: false, payload: undefined })
+    })
+  })
+
+  describe('app_version', () => {
+    it.each([
+      ['undecided', null],
+      ['denied', 'denied'],
+      ['granted', 'granted']
+    ] as const)('is sent when consent is %s', async (_label, consent) => {
+      setupTelemetry({ consent, appVersion: '1.1.4' })
+
+      await evaluate()
+
+      expect(lastPersonProperties()).toEqual({
+        ...PLATFORM,
+        app_version: '1.1.4'
+      })
+    })
+
+    it('rides alongside comfy_staff for a consented staff install', async () => {
+      setupTelemetry({ consent: 'granted', appVersion: '1.1.4' })
+      telemetry.setFlagEvaluationStaff(true)
+
+      await evaluate()
+
+      expect(lastPersonProperties()).toEqual({
+        ...PLATFORM,
+        app_version: '1.1.4',
+        comfy_staff: 'true'
+      })
+    })
+
+    it('is the version initTelemetry was given, verbatim, prerelease included', async () => {
+      setupTelemetry({ consent: null, appVersion: '1.1.4-rc.1' })
+
+      await evaluate()
+
+      expect(lastPersonProperties()).toEqual({ ...PLATFORM, app_version: '1.1.4-rc.1' })
+    })
+
+    it('is omitted rather than sent empty when the version is unknown', async () => {
+      setupTelemetry({ consent: null, appVersion: '' })
+
+      await evaluate()
+
+      expect(lastPersonProperties()).toEqual(PLATFORM)
+    })
+
+    describe('against a stand-in `app_version semver_gte 1.1.4` condition', () => {
+      function isAtLeast(version: string | undefined, min: [number, number, number]): boolean {
+        if (!version) return false
+        const [release = '', ...prerelease] = version.split('-')
+        const [major = 0, minor = 0, patch = 0] = release.split('.').map(Number)
+        if (major !== min[0]) return major > min[0]
+        if (minor !== min[1]) return minor > min[1]
+        if (patch !== min[2]) return patch > min[2]
+        return prerelease.length === 0
+      }
+
+      function serveVersionGatedFlag(): void {
+        posthogClientMock.evaluateCondition = (options) => {
+          if (!isAtLeast(options?.personProperties?.['app_version'], [1, 1, 4])) {
+            return { enabled: false }
+          }
+          return {
+            enabled: true,
+            variant: 'beta',
+            payload: { flags: [{ arg: '--enable-assets-output-scanning' }] }
+          }
+        }
+      }
+
+      it.each(['1.1.4', '1.2.0'])('matches %s, even before consent', async (appVersion) => {
+        setupTelemetry({ consent: null, appVersion })
+        serveVersionGatedFlag()
+
+        await expect(
+          telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+        ).resolves.toMatchObject({ kind: 'value', value: 'beta' })
+      })
+
+      it.each(['1.1.3', '1.1.4-rc.1'])('does not match %s', async (appVersion) => {
+        setupTelemetry({ consent: 'granted', appVersion })
+        serveVersionGatedFlag()
+
+        await expect(
+          telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100)
+        ).resolves.toEqual({ kind: 'value', value: false, payload: undefined })
+      })
+    })
+  })
+})
+
 describe('telemetry late ops-flag results', () => {
-  /** Lose the race deliberately: a deferred fetch plus a 0 ms deadline, so the timeout always
-   *  answers first and the settle functions are still in the test's hands afterwards. */
   async function raceLostWith(onLate: (result: unknown) => void): Promise<void> {
     setupTelemetry({ consent: null, bind: null })
     posthogClientMock.featureFlagBehavior = 'defer'
@@ -592,8 +1190,6 @@ describe('telemetry late ops-flag results', () => {
     ).resolves.toEqual({ kind: 'unreachable' })
   }
 
-  /** Let the detached continuation run. It is deliberately unawaited by production code, so a
-   *  microtask turn is the only synchronisation available. */
   function flush(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0))
   }
@@ -602,12 +1198,9 @@ describe('telemetry late ops-flag results', () => {
     const late: unknown[] = []
     await raceLostWith((result) => late.push(result))
 
-    // When the abandoned fetch finally answers — the disable that lost the race
-    posthogClientMock.deferred?.resolve({ enabled: false, variant: 'canary', payload: { a: 1 } })
+    posthogClientMock.deferred?.resolve({ enabled: false, variant: 'beta', payload: { a: 1 } })
     await flush()
 
-    // Then it is handed back mapped exactly as the in-band path would have mapped it: a
-    // disabled flag is a VALUE of false, with its variant discarded and its payload kept.
     expect(late).toEqual([{ kind: 'value', value: false, payload: { a: 1 } }])
   })
 
@@ -615,29 +1208,23 @@ describe('telemetry late ops-flag results', () => {
     const late: unknown[] = []
     await raceLostWith((result) => late.push(result))
 
-    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'canary', payload: null })
+    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'beta', payload: null })
     await flush()
 
-    expect(late).toEqual([{ kind: 'value', value: 'canary', payload: null }])
+    expect(late).toEqual([{ kind: 'value', value: 'beta', payload: null }])
   })
 
   it('withholds a late result that carries no result for the key', async () => {
-    // Given a launch that lost the race, whose fetch then answers with nothing — a deleted or
-    // archived flag, indistinguishable from a server that never knew the key
     const late: unknown[] = []
     await raceLostWith((result) => late.push(result))
 
     posthogClientMock.deferred?.resolve(undefined)
     await flush()
 
-    // Then nothing is reported. This is `unreachable`, and persisting it would make deletion
-    // revoke the grant that deletion is documented to HOLD.
     expect(late).toEqual([])
   })
 
   it('withholds a late rejection, without an unhandled rejection', async () => {
-    // Given a launch that lost the race, whose abandoned fetch later errors. Nothing awaits
-    // that promise any more, so the continuation must swallow it itself.
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
@@ -650,7 +1237,6 @@ describe('telemetry late ops-flag results', () => {
       posthogClientMock.deferred?.reject(new Error('connection reset'))
       await flush()
 
-      // Then it is neither reported as a value nor escalated to the process
       expect(late).toEqual([])
       expect(unhandled).toEqual([])
     } finally {
@@ -659,26 +1245,23 @@ describe('telemetry late ops-flag results', () => {
   })
 
   it('does not report late when the fetch wins the race', async () => {
-    // Given a fetch that beats the deadline, so its value is delivered in band
     setupTelemetry({ consent: null, bind: null })
-    posthogClientMock.featureFlagResult = { enabled: true, variant: 'canary', payload: null }
+    posthogClientMock.featureFlagResult = { enabled: true, variant: 'beta', payload: null }
     const late: unknown[] = []
 
     await expect(
       telemetry.getOpsFlagResult('desktop_core_beta_features', 'installation-id', 100, (result) =>
         late.push(result)
       )
-    ).resolves.toMatchObject({ kind: 'value', value: 'canary' })
+    ).resolves.toMatchObject({ kind: 'value', value: 'beta' })
     await flush()
 
-    // Then the caller is told exactly once — a second delivery would double every persist
     expect(late).toEqual([])
   })
 
   it('does not report late when the client is not initialised', async () => {
-    // Given telemetry disabled, so there is no fetch to abandon in the first place
-    delete process.env['POSTHOG_API_KEY']
-    delete process.env['POSTHOG_ENABLED']
+    delete process.env['COMFY_DESKTOP_POSTHOG_API_KEY']
+    delete process.env['COMFY_DESKTOP_POSTHOG_ENABLED']
     telemetry._resetForTest()
     const late: unknown[] = []
 
@@ -693,12 +1276,6 @@ describe('telemetry late ops-flag results', () => {
   })
 })
 
-// A fetch that times out INSIDE the SDK and a key the server genuinely has no result for are the
-// same falsy value to us, and both classify `unreachable`. That indistinguishability is what let
-// the sticky-grant bug live unnoticed, and it is what would hide the `/flags` ceiling being hit in
-// the field. The separator is the elapsed time: a miss at ~3000 ms is the SDK's own timeout, a miss
-// at ~200 ms is a deleted key. One event name, an `outcome` field, and a duration make the three
-// late outcomes tellable apart without changing which of them may be persisted — still values only.
 describe('telemetry late ops-flag reporting', () => {
   const EVENT = 'comfy.desktop.ops_flag.late_result'
 
@@ -711,8 +1288,6 @@ describe('telemetry late ops-flag reporting', () => {
     return lateEvents()[0]!.properties ?? {}
   }
 
-  /** Lose the race under GRANTED consent, unlike `raceLostWith` above: reads bypass the consent
-   *  gate, reporting must not, so a report is only observable once consent admits it. */
   async function raceLostReporting(
     onLate?: (result: unknown) => void,
     options: SetupTelemetryOptions = {}
@@ -737,11 +1312,10 @@ describe('telemetry late ops-flag reporting', () => {
     const late: unknown[] = []
     await raceLostReporting((result) => late.push(result))
 
-    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'canary', payload: { a: 1 } })
+    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'beta', payload: { a: 1 } })
     await flush()
 
-    // Then reporting is purely additive: the value still reaches the caller that persists it
-    expect(late).toEqual([{ kind: 'value', value: 'canary', payload: { a: 1 } }])
+    expect(late).toEqual([{ kind: 'value', value: 'beta', payload: { a: 1 } }])
     expect(lateEvent()).toMatchObject({
       flag_key: 'desktop_core_beta_features',
       outcome: 'value'
@@ -749,16 +1323,12 @@ describe('telemetry late ops-flag reporting', () => {
   })
 
   it('reports a late miss, and withholds it from the caller', async () => {
-    // Given an abandoned fetch that answers with nothing — an SDK timeout and a deleted key are
-    // the same `undefined` here, which is exactly why the event has to exist
     const late: unknown[] = []
     await raceLostReporting((result) => late.push(result))
 
     posthogClientMock.deferred?.resolve(undefined)
     await flush()
 
-    // Then the outcome is observable, and the write rule is untouched: `unreachable` never
-    // reaches the caller, so deleting a flag still cannot revoke it
     expect(lateEvent()).toMatchObject({
       flag_key: 'desktop_core_beta_features',
       outcome: 'no_result'
@@ -773,30 +1343,23 @@ describe('telemetry late ops-flag reporting', () => {
     posthogClientMock.deferred?.reject(new Error('request timeout after 30s'))
     await flush()
 
-    // The bucket is what separates "the SDK gave up" from "the socket died" once both land here
     expect(lateEvent()).toMatchObject({ outcome: 'rejected', error_bucket: 'timeout' })
     expect(late).toEqual([])
   })
 
   it('reports how long the abandoned fetch actually ran, not how long it ran past the deadline', async () => {
-    // Given a fetch abandoned at a 0 ms deadline that only settles well afterwards. `setTimeout`
-    // guarantees a MINIMUM delay, so this measures a floor and cannot fire early.
     await raceLostReporting()
     await sleep(40)
 
     posthogClientMock.deferred?.resolve(undefined)
     await flush()
 
-    // Then the duration spans the whole fetch. Measured from the deadline it would read ~0 and
-    // could never be compared against the SDK's own 3000 ms ceiling, which is its only purpose.
     const durationMs = lateEvent()['duration_ms']
     expect(typeof durationMs).toBe('number')
     expect(durationMs as number).toBeGreaterThanOrEqual(25)
   })
 
   it('reports a timed-out fetch even when no caller registered for late values', async () => {
-    // `cloudFreeRuns` passes no callback because it must never persist. It can still hit the
-    // ceiling, and a flag whose timeouts are invisible is the state this event exists to end.
     await raceLostReporting()
 
     posthogClientMock.deferred?.resolve(undefined)
@@ -807,7 +1370,7 @@ describe('telemetry late ops-flag reporting', () => {
 
   it('reports nothing when the fetch wins the race', async () => {
     setupTelemetry()
-    posthogClientMock.featureFlagResult = { enabled: true, variant: 'canary', payload: null }
+    posthogClientMock.featureFlagResult = { enabled: true, variant: 'beta', payload: null }
     captured.length = 0
 
     await expect(
@@ -819,9 +1382,6 @@ describe('telemetry late ops-flag reporting', () => {
   })
 
   it('reports nothing when the fetch answers IN BAND with no result for the key', async () => {
-    // Given a miss that beats the deadline. It classifies `unreachable` exactly like a timeout,
-    // but nothing was ever abandoned — reporting here would invent a timeout that never happened
-    // and put a ~0 ms sample into the only field that separates the two.
     setupTelemetry()
     posthogClientMock.featureFlagResult = undefined
     captured.length = 0
@@ -835,21 +1395,17 @@ describe('telemetry late ops-flag reporting', () => {
   })
 
   it('does not report without consent, though the read itself still happens', async () => {
-    // Ops-flag READS bypass the consent gate by design; emission must not. This is the whole
-    // reason the report goes through `capture` rather than the client the read already holds.
     const late: unknown[] = []
     await raceLostReporting((result) => late.push(result), { consent: 'denied' })
 
-    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'canary', payload: null })
+    posthogClientMock.deferred?.resolve({ enabled: true, variant: 'beta', payload: null })
     await flush()
 
     expect(lateEvents()).toEqual([])
-    expect(late).toEqual([{ kind: 'value', value: 'canary', payload: null }])
+    expect(late).toEqual([{ kind: 'value', value: 'beta', payload: null }])
   })
 
   it('still hands the caller its late value when the capture path throws', async () => {
-    // Given an SDK that rejects the report. Nothing awaits this continuation, so a throw here
-    // would strand the value AND surface as an unhandled rejection.
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
@@ -860,7 +1416,7 @@ describe('telemetry late ops-flag reporting', () => {
       await raceLostReporting((result) => late.push(result))
       posthogClientMock.failNextCaptures = 1
 
-      posthogClientMock.deferred?.resolve({ enabled: false, variant: 'canary', payload: null })
+      posthogClientMock.deferred?.resolve({ enabled: false, variant: 'beta', payload: null })
       await flush()
 
       expect(late).toEqual([{ kind: 'value', value: false, payload: null }])
@@ -871,9 +1427,6 @@ describe('telemetry late ops-flag reporting', () => {
   })
 
   it('reports the outcome exactly once when the caller itself throws', async () => {
-    // Given a caller whose persist step throws. A single `.catch` covering both the fetch and the
-    // callback would bill that throw as a REJECTED fetch — a second event, blaming the network
-    // for a local bug.
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason)
@@ -884,7 +1437,7 @@ describe('telemetry late ops-flag reporting', () => {
         throw new Error('persist failed')
       })
 
-      posthogClientMock.deferred?.resolve({ enabled: true, variant: 'canary', payload: null })
+      posthogClientMock.deferred?.resolve({ enabled: true, variant: 'beta', payload: null })
       await flush()
 
       expect(lateEvent()).toMatchObject({ outcome: 'value' })
@@ -895,10 +1448,6 @@ describe('telemetry late ops-flag reporting', () => {
   })
 })
 
-// The two modules that split this invariant are mocked out of each other's unit tests: `opsFlag`
-// stubs `getOpsFlagResult`, so it cannot tell WHY no late value arrived, and the tests above stop
-// at the callback without a disk. Reporting and persistence are now driven from the same
-// continuation, so "reports but does not write" has to be proven somewhere both really run.
 describe('late ops-flag results reaching real persistence', () => {
   const EVENT = 'comfy.desktop.ops_flag.late_result'
   const KEY = 'grant-flag'
@@ -908,9 +1457,11 @@ describe('late ops-flag results reaching real persistence', () => {
   }
 
   function seedGrant(): string {
-    // Indented on purpose: canonical `JSON.stringify` output cannot tell "never written" from
-    // "rewritten identically", and rewriting is the bug under test.
-    const stored = JSON.stringify({ [KEY]: { value: true, payload: null } }, null, 2)
+    const stored = JSON.stringify(
+      { [KEY]: { value: true, payload: null, fetchedAt: Date.now() } },
+      null,
+      2
+    )
     fs.writeFileSync(flagsFilePath(), stored, 'utf-8')
     fs.writeFileSync(flagsFilePath() + '.bak', stored, 'utf-8')
     return stored
@@ -925,14 +1476,13 @@ describe('late ops-flag results reaching real persistence', () => {
     })
   }
 
-  /** A real launch that loses its race: the deadline answers while the fetch is still in flight,
-   *  leaving the production continuation attached to a promise this test still controls. */
   async function launchLosingTheRace(): Promise<ReturnType<typeof makeGrantFlag>> {
     setupTelemetry()
     posthogClientMock.featureFlagBehavior = 'defer'
     captured.length = 0
     const flag = makeGrantFlag()
     await flag.init({ distinctId: 'installation-id', timeoutMs: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
     return flag
   }
 
@@ -951,33 +1501,30 @@ describe('late ops-flag results reaching real persistence', () => {
   })
 
   it('writes a late VALUE through to disk while reporting it', async () => {
-    // The positive control for the two tests below: without it, "the file was not written" would
-    // also pass if this harness could not write at all.
     seedGrant()
     const flag = await launchLosingTheRace()
 
+    const answeredAt = Date.now()
     posthogClientMock.deferred?.resolve({ enabled: false, payload: null })
     await flush()
 
     expect(lateEventOutcome()).toBe('value')
-    expect(JSON.parse(fs.readFileSync(flagsFilePath(), 'utf-8'))).toEqual({
-      [KEY]: { value: false, payload: null }
+    const stored = JSON.parse(fs.readFileSync(flagsFilePath(), 'utf-8'))
+    expect(stored).toEqual({
+      [KEY]: { value: false, payload: null, fetchedAt: expect.any(Number) }
     })
-    // And this launch keeps what the deadline decided — convergence happens on the NEXT one
-    expect(await flag.get()).toBe('granted')
+    expect(stored[KEY].fetchedAt).toBeGreaterThanOrEqual(answeredAt)
+    expect(stored[KEY].fetchedAt).toBeLessThanOrEqual(Date.now())
+    expect(await flag.get()).toBe('revoked')
   })
 
   it('reports a late MISS without letting it reach the file', async () => {
-    // Given a grant on disk and an abandoned fetch that answers with nothing — deleted, archived,
-    // or the SDK's own timeout, all indistinguishable at this seam
     const stored = seedGrant()
     const flag = await launchLosingTheRace()
 
     posthogClientMock.deferred?.resolve(undefined)
     await flush()
 
-    // Then the timeout became visible, and the grant stands byte for byte: deletion is still not
-    // revocation, which is the contract `persist` documents against
     expect(lateEventOutcome()).toBe('no_result')
     expect(fs.readFileSync(flagsFilePath(), 'utf-8')).toBe(stored)
     expect(await flag.get()).toBe('granted')
@@ -1025,7 +1572,6 @@ describe('telemetry.captureInstallCompleted', () => {
       express: false
     })
 
-    // The milestone stays deferred while anonymous and lands on Firebase UID.
     expect(captured.find((c) => c.event === 'comfy.desktop.person.set')).toBeUndefined()
     telemetry.applyFirebaseUserConsensus('firebase-user')
     expect(identifies.at(-1)?.properties?.$set_once).toHaveProperty(
@@ -1046,10 +1592,6 @@ describe('telemetry.captureInstallCompleted', () => {
   })
 
   it('boot_completed is a distinct success event carrying the boot_id join key', () => {
-    // boot_started -> boot_completed is the per-attempt boot-success funnel.
-    // Both must carry the same boot_id (the per-launch correlation id) and
-    // installation_id (the cross-event join key from defaults) so the rate is
-    // count(boot_completed.boot_id) / count(distinct boot_started.boot_id).
     telemetry.capture('comfy.desktop.comfyui.boot_completed', {
       installation_id: 'install-xyz',
       boot_id: 'boot-1',
@@ -1064,8 +1606,6 @@ describe('telemetry.captureInstallCompleted', () => {
   })
 
   it('does NOT fire on boot — boot_started is a distinct, separately-emitted event', () => {
-    // A boot is the per-launch event; install.completed is once-per-install.
-    // Emitting boot_started must never produce an install.completed.
     telemetry.capture('comfy.desktop.comfyui.boot_started', { installation_id: 'install-xyz' })
     expect(captured.map((c) => c.event)).toEqual(['comfy.desktop.comfyui.boot_started'])
     expect(captured.some((c) => c.event === 'comfy.desktop.install.completed')).toBe(false)
@@ -1188,9 +1728,6 @@ describe('telemetry SDK-level privacy safety nets', () => {
   })
 
   it('does not strip $ip: PostHog needs it to derive country (GeoIP enabled)', () => {
-    // The raw IP and sub-country geo are dropped by a PostHog ingestion
-    // transformation, not at the SDK; the SDK must send the IP so the
-    // server can resolve $geoip_country_code. So no forced `$ip: ''`.
     captured.length = 0
     telemetry.capture('comfy.desktop.session.started', { foo: 'bar' })
     expect(captured).toHaveLength(1)
@@ -1199,8 +1736,6 @@ describe('telemetry SDK-level privacy safety nets', () => {
 
   it('scrubs string properties as a last-resort safety net for emit sites that forget', () => {
     captured.length = 0
-    // Simulates a call site that forgot to scrub locally — typical
-    // future-regression risk. The SDK pass redacts the path.
     telemetry.capture('comfy.desktop.execution.error', {
       error_class: 'FileNotFoundError',
       error_message: "ENOENT 'C:\\Users\\64911\\Documents\\workflow.json'"
@@ -1237,7 +1772,6 @@ describe('telemetry SDK-level privacy safety nets', () => {
 
 describe('telemetry consent state (3-state)', () => {
   beforeEach(() => {
-    // Bind D after state changes per test so the deferral path is exercised.
     setupTelemetry({ consent: null, bind: null })
   })
 
@@ -1254,12 +1788,6 @@ describe('telemetry consent state (3-state)', () => {
   })
 
   it('denied suppresses everything EXCEPT the consent_decision allow-list entry', () => {
-    // Regression for the 2026-06-03 finding: 232 accepts and 0 declines in
-    // 30 days, traced to the renderer's "Continue" handler awaiting the
-    // setting write (which flips state to 'denied') BEFORE emitting the
-    // decline event. If denied short-circuits without consulting the
-    // allow-list, every decline is dropped by its own decision and we
-    // lose 100% of decline signal.
     telemetry.setConsentState('denied')
     bindTestAnonymous('test-distinct-id')
     captured.length = 0
@@ -1281,7 +1809,6 @@ describe('telemetry consent state (3-state)', () => {
     telemetry.setConsentState('undecided')
     bindTestAnonymous('deferred-id', { app_version: '1.2.3' })
 
-    // Nothing should have shipped yet.
     expect(captured).toHaveLength(0)
 
     telemetry.setConsentState('granted')
@@ -1318,7 +1845,6 @@ describe('telemetry consent state (3-state)', () => {
     telemetry.captureException(new Error('boom'), {})
     expect(exceptions).toHaveLength(0)
 
-    // Sanity: granted DOES capture.
     telemetry.setConsentState('granted')
     exceptions.length = 0
     telemetry.captureException(new Error('boom'), {})
@@ -1343,6 +1869,239 @@ describe('telemetry consent state (3-state)', () => {
     expect(identifies.at(-1)?.properties?.$set).not.toHaveProperty('plan')
     expect(identifies.at(-1)?.properties?.$set).not.toHaveProperty('locale')
     expect(identifies.at(-1)?.properties?.$set_once).toBeUndefined()
+  })
+})
+
+describe('telemetry.sendSurveyResponse', () => {
+  const SURVEY_KEYS = {
+    $survey_id: 'survey-id',
+    '$survey_response_question-id': 'An app that colors line art'
+  }
+
+  beforeEach(() => {
+    setupTelemetry({ consent: null, bind: null })
+  })
+
+  it.each(['denied', 'undecided'] as const)(
+    'sends the answer the person submitted while consent is %s, and nothing else',
+    async (state) => {
+      telemetry.setConsentState(state)
+      bindTestAnonymous('test-distinct-id')
+      captured.length = 0
+
+      telemetry.capture('comfy.desktop.session.started', {})
+      const sent = await telemetry.sendSurveyResponse(
+        'survey-id',
+        'question-id',
+        'An app that colors line art'
+      )
+
+      expect(sent).toBe(true)
+      expect(captured.map((c) => c.event)).toEqual(['survey sent'])
+      expect(captured[0]).toMatchObject({
+        distinctId: 'test-distinct-id',
+        properties: { ...SURVEY_KEYS, app_version: '0.0.0', $process_person_profile: false }
+      })
+    }
+  )
+
+  it('keeps survey answers out of the consent-gated capture path', () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+
+    expect(telemetry.capture('survey sent', SURVEY_KEYS)).toBe(false)
+    expect(captured).toHaveLength(0)
+  })
+
+  it('cuts a long answer to 2048 characters', async () => {
+    telemetry.setConsentState('granted')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'x'.repeat(3000))).toBe(
+      true
+    )
+
+    expect(captured[0]?.properties?.['$survey_response_question-id']).toBe('x'.repeat(2048))
+  })
+
+  it('returns false and sends nothing when PostHog is turned off', async () => {
+    setupTelemetry({ consent: 'granted', env: { COMFY_DESKTOP_POSTHOG_ENABLED: '0' } })
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
+    expect(posthogConstructorCalls).toHaveLength(0)
+    expect(captured).toHaveLength(0)
+  })
+
+  it('returns false and sends nothing without a distinct id', async () => {
+    telemetry.setConsentState('granted')
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
+    expect(captured).toHaveLength(0)
+  })
+
+  it('returns false when PostHog rejects the immediate capture', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+    posthogClientMock.immediateCaptureOutcome = 'rejected'
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
+    expect(captured).toHaveLength(0)
+  })
+
+  it('returns false when PostHog reports that the request failed', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+    posthogClientMock.immediateCaptureOutcome = 'reported-error'
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
+
+    posthogClientMock.immediateCaptureOutcome = 'sent'
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(true)
+  })
+
+  it('stops sending once the answer hits the per-event rate limit', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+
+    for (let i = 0; i < 60; i++) {
+      expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', `An app ${i}`)).toBe(
+        true
+      )
+    }
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'One more')).toBe(false)
+    expect(captured.filter((c) => c.event === 'survey sent')).toHaveLength(60)
+    expect(captured.map((c) => c.event)).not.toContain('comfy.desktop.telemetry.rate_limited')
+  })
+
+  it('returns false and sends nothing while the signed-in identity is being confirmed', async () => {
+    telemetry.setConsentState('granted')
+    bindTestAnonymous('test-distinct-id')
+    telemetry.applyFirebaseUserConsensus('user-123')
+    telemetry.applyFirebasePendingConsensus()
+    captured.length = 0
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
+
+    telemetry.releaseFirebasePendingConsensus()
+    expect(captured.filter((c) => c.event === 'survey sent')).toHaveLength(0)
+  })
+
+  it('drops a queued answer when identity confirmation starts before its turn to send', async () => {
+    telemetry.setConsentState('granted')
+    bindTestAnonymous('test-distinct-id')
+    telemetry.applyFirebaseUserConsensus('user-123')
+    captured.length = 0
+    posthogClientMock.immediateCaptureOutcome = 'deferred'
+
+    const first = telemetry.sendSurveyResponse('survey-id', 'question-id', 'First app')
+    const second = telemetry.sendSurveyResponse('survey-id', 'question-id', 'Second app')
+    await vi.waitFor(() => expect(pendingImmediateCaptures).toHaveLength(1))
+    telemetry.applyFirebasePendingConsensus()
+    pendingImmediateCaptures[0]!.accept()
+
+    expect(await first).toBe(true)
+    expect(await second).toBe(false)
+    expect(pendingImmediateCaptures).toHaveLength(1)
+    expect(
+      captured
+        .filter((c) => c.event === 'survey sent')
+        .map((c) => c.properties?.['$survey_response_question-id'])
+    ).toEqual(['First app'])
+  })
+
+  it('drops a queued answer when a different user is confirmed before its turn to send', async () => {
+    telemetry.setConsentState('granted')
+    bindTestAnonymous('test-distinct-id')
+    telemetry.applyFirebaseUserConsensus('user-a')
+    captured.length = 0
+    posthogClientMock.immediateCaptureOutcome = 'deferred'
+
+    const first = telemetry.sendSurveyResponse('survey-id', 'question-id', 'First app')
+    const second = telemetry.sendSurveyResponse('survey-id', 'question-id', 'Second app')
+    await vi.waitFor(() => expect(pendingImmediateCaptures).toHaveLength(1))
+    telemetry.applyFirebasePendingConsensus()
+    telemetry.applyFirebaseUserConsensus('user-b')
+    pendingImmediateCaptures[0]!.accept()
+
+    expect(await first).toBe(true)
+    expect(await second).toBe(false)
+    expect(pendingImmediateCaptures).toHaveLength(1)
+    expect(
+      captured
+        .filter((c) => c.event === 'survey sent')
+        .map((c) => c.properties?.['$survey_response_question-id'])
+    ).toEqual(['First app'])
+  })
+
+  it('sends answers on a PostHog client of their own, made on the first send and reused', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    expect(posthogInstances).toHaveLength(1)
+
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(true)
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'Another app')).toBe(true)
+
+    expect(posthogInstances).toHaveLength(2)
+    expect(posthogConstructorCalls[1]).toEqual({
+      apiKey: 'test-key',
+      options: { host: DEFAULT_POSTHOG_HOST, disableGeoip: false }
+    })
+  })
+
+  it('still reports a sent answer when the main client fails a request meanwhile', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    posthogClientMock.immediateCaptureOutcome = 'deferred'
+
+    const result = telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')
+    await vi.waitFor(() => expect(pendingImmediateCaptures).toHaveLength(1))
+    posthogInstances[0]!.emitError(new Error('flag request failed'))
+    pendingImmediateCaptures[0]!.accept()
+
+    expect(await result).toBe(true)
+  })
+
+  it('sends overlapping answers one after the other, each with its own result', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    captured.length = 0
+    posthogClientMock.immediateCaptureOutcome = 'deferred'
+
+    const first = telemetry.sendSurveyResponse('survey-id', 'question-id', 'First app')
+    const second = telemetry.sendSurveyResponse('survey-id', 'question-id', 'Second app')
+    await vi.waitFor(() => expect(pendingImmediateCaptures).toHaveLength(1))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(pendingImmediateCaptures).toHaveLength(1)
+
+    pendingImmediateCaptures[0]!.reportError()
+    expect(await first).toBe(false)
+
+    await vi.waitFor(() => expect(pendingImmediateCaptures).toHaveLength(2))
+    pendingImmediateCaptures[1]!.accept()
+    expect(await second).toBe(true)
+
+    expect(
+      captured
+        .filter((c) => c.event === 'survey sent')
+        .map((c) => c.properties?.['$survey_response_question-id'])
+    ).toEqual(['Second app'])
+  })
+
+  it('shuts the survey client down with the main client', async () => {
+    telemetry.setConsentState('denied')
+    bindTestAnonymous('test-distinct-id')
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(true)
+
+    await telemetry.shutdown('quit')
+
+    expect(posthogInstances.map((instance) => instance.shutdownCalls)).toEqual([1, 1])
+    expect(await telemetry.sendSurveyResponse('survey-id', 'question-id', 'An app')).toBe(false)
   })
 })
 
@@ -1382,8 +2141,6 @@ describe('telemetry.captureFirstLaunch (deferred once-ever event)', () => {
   })
 
   it('queues on a fresh install (undecided) and ships on the grant transition', () => {
-    // This is the real first-boot path: consent undecided, guard already
-    // consumed. A plain capture would be dropped here and never re-fire.
     telemetry.setConsentState('undecided')
     bindTestAnonymous('install-id')
     captured.length = 0
@@ -1460,8 +2217,6 @@ describe('telemetry Firebase consensus identity lifecycle', () => {
   })
 
   it('replays an unacknowledged identity merge after restart', async () => {
-    // Reproduce posthog-node's auto-flush race: identify is removed from the
-    // SDK queue after an HTTP failure, then our explicit empty flush resolves.
     posthogClientMock.autoFailNextIdentifies = 1
 
     telemetry.registerPersonProperties({ gpu_tier: 'high' })
@@ -1495,8 +2250,6 @@ describe('telemetry Firebase consensus identity lifecycle', () => {
 
     telemetry.applyFirebaseUserConsensus('user-123')
     expect(pendingIdentityMergeMock.entries).toHaveLength(1)
-    // Let the failed flush settle so the in-flight dedup releases before the
-    // next trigger, as it does for any real later trigger.
     await new Promise((resolve) => setTimeout(resolve, 0))
     identifies.length = 0
 
@@ -1673,8 +2426,6 @@ describe('telemetry Firebase consensus identity lifecycle', () => {
     for (let i = 0; i < 60; i++) {
       expect(telemetry.capture('burst.event', { i })).toBe(true)
     }
-    // The 61st is refused up front instead of being buffered and then
-    // silently dropped at replay after having been acknowledged.
     expect(telemetry.capture('burst.event', { i: 60 })).toBe(false)
 
     telemetry.applyFirebaseUserConsensus('user-123')
@@ -1808,8 +2559,6 @@ describe('telemetry Firebase consensus identity lifecycle', () => {
   it('discards a staged login attribution when a different user is confirmed', () => {
     telemetry.stageLoginAttribution('user-a', { via: 'desktop_login_code' })
     telemetry.applyFirebaseUserConsensus('user-b')
-    // Even a later confirmation of the original UID stays silent: the switch
-    // already contradicted the staged sign-in.
     telemetry.applyFirebaseUserConsensus('user-a')
 
     expect(
@@ -1869,8 +2618,6 @@ describe('telemetry Firebase consensus identity lifecycle', () => {
 
     captured.length = 0
     expect(telemetry.capture('between.replays')).toBe(true)
-    // The switched-away user must not receive events recorded after their
-    // switch resolved; the gap runs anonymous until the new UID rebinds.
     expect(captured.at(-1)?.distinctId).toBe('anonymous-next-1')
 
     telemetry.applyFirebaseUserConsensus('user-456')
@@ -1979,7 +2726,7 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
     })
   })
 
-  it('forwards exceptions to Datadog without message, stack, or arbitrary context', () => {
+  it('forwards a bare notice to Datadog when no error is supplied', () => {
     const target = makeStubWebContents()
     telemetry.registerTelemetryRelayTarget(target.wc)
 
@@ -2008,17 +2755,62 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
     expect(forwardedContext).not.toHaveProperty('error_stack')
   })
 
+  it('forwards the scrubbed message, stack and error_type so a monitor can tell failures apart', () => {
+    const target = makeStubWebContents()
+    telemetry.registerTelemetryRelayTarget(target.wc)
+    const scrubbed = new Error('workspace auth gate failed to initialise')
+    scrubbed.stack = 'Error: workspace auth gate failed to initialise\n at gate.ts:1:1'
+
+    telemetry.forwardExceptionToRenderer(
+      {
+        origin: 'renderer',
+        source: 'hosted-frontend',
+        error_type: 'workspace_auth_gate_initialization_failure',
+        error_message: 'private failure text'
+      },
+      scrubbed
+    )
+
+    expect(target.sends[0]).toMatchObject({
+      channel: 'dd-error',
+      data: {
+        message: 'workspace auth gate failed to initialise',
+        stack: scrubbed.stack,
+        context: { error_type: 'workspace_auth_gate_initialization_failure' },
+        skipPostHog: true
+      }
+    })
+    const forwardedContext = (target.sends[0]!.data as Record<string, unknown>)[
+      'context'
+    ] as Record<string, unknown>
+    expect(forwardedContext).not.toHaveProperty('error_message')
+  })
+
+  it('suppresses the PostHog exception copy unless the product-scoped flag opts in', () => {
+    delete process.env['COMFY_DESKTOP_POSTHOG_EXCEPTIONS']
+    const target = makeStubWebContents()
+    telemetry.registerTelemetryRelayTarget(target.wc)
+
+    telemetry.captureExceptionAndForward(new Error('boom'), {
+      error_type: 'workspace_auth_gate_initialization_failure'
+    })
+
+    expect(exceptions).toHaveLength(0)
+    expect(target.sends).toHaveLength(1)
+    expect(target.sends[0]).toMatchObject({
+      channel: 'dd-error',
+      data: { message: 'boom' }
+    })
+  })
+
   it('emit() captures via PostHog Node AND forwards to relay targets', () => {
     const a = makeStubWebContents()
     telemetry.registerTelemetryRelayTarget(a.wc)
 
-    // Use a name that is in the Datadog allow-list so the forward path runs.
     telemetry.emit('comfy.desktop.execution.error', { variant: 'standalone' })
 
-    // PostHog Node side
     expect(captured.map((c) => c.event)).toEqual(['comfy.desktop.execution.error'])
     expect(captured[0]!.properties).toMatchObject({ variant: 'standalone' })
-    // Relay side — exactly one IPC send to the registered target
     expect(a.sends).toHaveLength(1)
     expect(a.sends[0]).toMatchObject({
       channel: 'telemetry-action-from-main',
@@ -2048,10 +2840,7 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
 
   it('forwards with no relay targets is a no-op (event still captured by PostHog Node)', () => {
     expect(telemetry._telemetryRelayTargetCount()).toBe(0)
-    // Use a name in the Datadog allow-list so the forward path actually fires.
     telemetry.emit('comfy.desktop.execution.error', {})
-    // Event still captured by PostHog Node even with no renderer alive yet —
-    // the architectural guarantee that "telemetry works no matter what".
     expect(captured.map((c) => c.event)).toEqual(['comfy.desktop.execution.error'])
   })
 
@@ -2059,12 +2848,9 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
     const a = makeStubWebContents()
     telemetry.registerTelemetryRelayTarget(a.wc)
 
-    // Product / funnel events stay PostHog-only and do not ride the relay.
     telemetry.emit('comfy.desktop.install.flow.opened', { variant: 'standalone' })
 
-    // PostHog Node still captured it.
     expect(captured.map((c) => c.event)).toEqual(['comfy.desktop.install.flow.opened'])
-    // But the renderer never sees it — no Datadog mirror needed for a product event.
     expect(a.sends).toHaveLength(0)
   })
 
@@ -2114,11 +2900,6 @@ describe('telemetry.forwardToRenderer + telemetry-relay registry', () => {
 describe('telemetry SDK-level volume guards', () => {
   beforeEach(() => {
     setupTelemetry()
-    // Clear AFTER the boot sequence — granting consent flushes the deferred
-    // `comfy.desktop.session.started` event into `captured`, which would
-    // otherwise count toward each test's product-event totals and
-    // throw the per-process cap assertions off by one (and make the
-    // 5000-cap test loop runaway-guard out, eating the 5s timeout).
     captured.length = 0
   })
 
@@ -2191,13 +2972,6 @@ describe('telemetry SDK-level volume guards', () => {
   })
 
   it('per-process cap at 5000 stops everything (including *.error) and warns once', () => {
-    // Fire enough rate-limited-bypassing errors to overshoot the 5000
-    // session cap by a healthy margin — the cap is the FINAL backstop
-    // and must apply even to events that bypass the per-event window.
-    // Use a fixed iteration count instead of polling `captured.filter()`
-    // each loop turn: that filter is O(N) over a growing array, so a
-    // while-condition variant is O(N²) and blows the 5s test timeout
-    // on slower CI hosts.
     for (let i = 0; i < 6000; i++) {
       telemetry.capture('comfy.desktop.execution.error', { i })
     }

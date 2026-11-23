@@ -1,5 +1,6 @@
-// @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import type * as ComfyBuilderModule from '../../comfybuilder'
 
 const acquireModelDownloadRootLock = vi.hoisted(() =>
   vi.fn<(modelsRoot: string) => (() => void) | null>(() => vi.fn())
@@ -10,6 +11,9 @@ const cancelModelDownload = vi.hoisted(() => vi.fn(async () => {}))
 const releaseInstallTerminalForFsOp = vi.hoisted(() => vi.fn<(installationId: string) => void>())
 const startModelStaging = vi.hoisted(() => vi.fn())
 const abortModelStaging = vi.hoisted(() => vi.fn())
+const updateInstallation = vi.hoisted(() =>
+  vi.fn<(id: string, data: Record<string, unknown>) => Promise<void>>(async () => {})
+)
 
 vi.mock('electron', () => ({
   app: { getPath: () => '', isPackaged: false },
@@ -20,8 +24,8 @@ vi.mock('electron', () => ({
   net: { request: vi.fn() }
 }))
 
-// Stub the library so install() wiring can be asserted without real downloads.
-vi.mock('../../comfybuilder', () => ({
+vi.mock('../../comfybuilder', async (importOriginal) => ({
+  ...(await importOriginal<typeof ComfyBuilderModule>()),
   installArtifact: vi.fn(async () => {}),
   buildLaunchSpec: vi.fn(() => null),
   venvPython: vi.fn((installPath: string) =>
@@ -39,6 +43,7 @@ vi.mock('../../comfybuilder', () => ({
   }))
 }))
 vi.mock('../../devplatform/session', () => ({ getBuilderClient: vi.fn(() => ({})) }))
+vi.mock('../../installations', () => ({ update: updateInstallation }))
 vi.mock('../../lib/comfyDownloadManager', () => ({
   acquireModelDownloadRootLock,
   releaseParkedModelJobsUnder,
@@ -54,14 +59,21 @@ vi.mock('./modelStagingTask', () => ({
 vi.mock('../../devplatform/builds', () => ({
   resolveHost: vi.fn(async () => ({ os: 'linux', gpu: 'nvidia' })),
   resolveHostArtifactForVersion: vi.fn(),
-  listCompleteVersions: vi.fn(async () => [])
+  listUpdateVersions: vi.fn(async () => [])
 }))
 
 import fs, { promises as fsp } from 'fs'
 import os from 'os'
 import path from 'path'
-import { installArtifact, stageModels, resolveModelManifest, venvPython } from '../../comfybuilder'
-import { listCompleteVersions, resolveHostArtifactForVersion } from '../../devplatform/builds'
+import {
+  buildLaunchSpec,
+  installArtifact,
+  stageModels,
+  resolveModelManifest,
+  venvPython
+} from '../../comfybuilder'
+import { getBuilderClient } from '../../devplatform/session'
+import { listUpdateVersions, resolveHostArtifactForVersion } from '../../devplatform/builds'
 import {
   clearVersionCache,
   getCachedVersions,
@@ -96,13 +108,19 @@ const record = (overrides: Record<string, unknown> = {}): InstallationRecord =>
     distributionId: 'd1',
     distributionName: 'desktop-4target-stg-v0190',
     version: '1',
-    // Every real record carries its build identity (written by the install handler).
     artifactId: 'art-default',
     artifactOs: 'linux',
     artifactGpu: 'nvidia',
     artifactAccelVariant: 'cu128',
     ...overrides
   }) as unknown as InstallationRecord
+
+function writePolicy(installPath: string, customNodeMode: string | null): void {
+  const file = path.join(installPath, 'ComfyUI', 'governance', 'policy.signed.json')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const payload = Buffer.from(JSON.stringify({ customNodeMode })).toString('base64url')
+  fs.writeFileSync(file, JSON.stringify({ schema: 1, payload, signature: 'sig' }))
+}
 
 function fakeTools(
   signal?: AbortSignal
@@ -227,9 +245,6 @@ describe('comfybuilder.install wiring', () => {
     }
   })
 
-  // A record without its build identity is corrupt: reject it with a clear
-  // message before touching the environment, instead of silently installing
-  // a target the record never chose.
   it('rejects a record missing its artifact identity before mutating anything', async () => {
     acquireModelDownloadRootLock.mockReturnValueOnce(vi.fn())
     const rename = vi.spyOn(fsp, 'rename').mockResolvedValue(undefined)
@@ -247,6 +262,92 @@ describe('comfybuilder.install wiring', () => {
     }
   })
 
+  it.each([
+    ['No (an allowlist)', { mode: 'allowlist' }, false, '--cpu'],
+    ['Yes (an empty blocklist)', { mode: 'blocklist', list: [] }, true, '--enable-manager --cpu'],
+    ['nothing (no policy)', null, true, '--enable-manager --cpu']
+  ])(
+    'records the manager answer and matching launch args when the author said %s',
+    async (_name, customNodePolicy, expected, expectedArgs) => {
+      vi.mocked(resolveModelManifest).mockResolvedValueOnce({
+        models: [],
+        modelPolicy: null,
+        partnerNodePolicy: null,
+        customNodePolicy
+      } as never)
+      updateInstallation.mockClear()
+
+      await comfybuilder.install!(record({ launchArgs: '--enable-manager --cpu' }), fakeTools())
+
+      expect(updateInstallation).toHaveBeenCalledWith('i1', {
+        comfybuilderManagerAllowed: expected,
+        launchArgs: expectedArgs
+      })
+    }
+  )
+
+  it.each([
+    ['off', false, false],
+    ['on', true, true],
+    ['unrecorded (an install older than the field)', undefined, true]
+  ])('launches with the manager %s', (_name, recorded, expected) => {
+    vi.mocked(buildLaunchSpec).mockClear()
+    comfybuilder.getLaunchCommand!(record({ comfybuilderManagerAllowed: recorded }))
+    expect(buildLaunchSpec).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ managerAllowed: expected })
+    )
+  })
+
+  it('keeps the manager flag of a governed allowlist build whose release said Yes', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'comfybuilder-governed-'))
+    try {
+      writePolicy(root, 'allowlist')
+      vi.mocked(resolveModelManifest).mockResolvedValueOnce({
+        models: [],
+        customNodePolicy: { mode: 'blocklist', list: [] }
+      } as never)
+      updateInstallation.mockClear()
+
+      await comfybuilder.install!(
+        record({ installPath: root, launchArgs: '--enable-manager --cpu' }),
+        fakeTools()
+      )
+
+      expect(updateInstallation).toHaveBeenCalledWith('i1', {
+        comfybuilderManagerAllowed: true,
+        launchArgs: '--enable-manager --cpu'
+      })
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the manager flag of a governed allowlist install whose record carries no manager answer', async () => {
+    const real = await vi.importActual<typeof ComfyBuilderModule>('../../comfybuilder')
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'comfybuilder-governed-launch-'))
+    try {
+      fs.mkdirSync(path.dirname(real.venvPython(root)), { recursive: true })
+      fs.writeFileSync(real.venvPython(root), '')
+      writePolicy(root, 'allowlist')
+      fs.writeFileSync(path.join(root, 'ComfyUI', 'main.py'), '')
+      vi.mocked(buildLaunchSpec).mockImplementationOnce(real.buildLaunchSpec)
+
+      const cmd = comfybuilder.getLaunchCommand!(
+        record({ installPath: root, launchArgs: '--enable-manager --cpu' })
+      )
+
+      expect(cmd?.args).toEqual([
+        '-s',
+        path.join('ComfyUI', 'main.py'),
+        '--enable-manager',
+        '--cpu'
+      ])
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('installs the archive, resolves the manifest, then stages models in the background', async () => {
     vi.mocked(resolveModelManifest).mockResolvedValueOnce({
       models: [{ type: 'checkpoints', filename: 'm.safetensors', downloadUrl: 'https://x/m' }],
@@ -258,7 +359,6 @@ describe('comfybuilder.install wiring', () => {
 
     expect(installArtifact).toHaveBeenCalledTimes(1)
     expect(resolveModelManifest).toHaveBeenCalledTimes(1)
-    // The archive must be in place before the manifest gates the ready marker.
     const archiveOrder = (installArtifact as unknown as { mock: { invocationCallOrder: number[] } })
       .mock.invocationCallOrder[0]!
     const manifestOrder = (
@@ -266,10 +366,7 @@ describe('comfybuilder.install wiring', () => {
     ).mock.invocationCallOrder[0]!
     expect(archiveOrder).toBeLessThan(manifestOrder)
 
-    // The manifest is keyed by the record's build id and version number.
     expect(resolveModelManifest).toHaveBeenCalledWith(expect.anything(), 'd1', '1')
-    // The declared models are handed to the background staging task; install
-    // itself never blocks on model bytes.
     expect(startModelStaging).toHaveBeenCalledWith(installation, [
       { type: 'checkpoints', filename: 'm.safetensors', downloadUrl: 'https://x/m' }
     ])
@@ -503,8 +600,6 @@ describe('comfybuilder interrupted-install recovery', () => {
   })
 
   it('keeps user data already moved into the failed new tree', async () => {
-    // Crash window: the user directory was restored into the new tree after
-    // extraction, but the transaction died before the ready marker was written.
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'comfybuilder-user-moved-'))
     try {
       await fsp.mkdir(path.join(root, 'venv.previous'), { recursive: true })
@@ -555,8 +650,6 @@ describe('comfybuilder interrupted-install recovery', () => {
         fsp.access(path.join(root, '.comfybuilder-environment-ready'))
       ).resolves.toBeUndefined()
 
-      // If shutdown happens before the caller persists `result.data`, the same
-      // record is recovered again rather than being mistaken for a failed install.
       await expect(
         recoverComfyBuilderInstallation(
           record({ installPath: root, version: '9', status: 'installing' })
@@ -584,9 +677,6 @@ describe('comfybuilder interrupted-install recovery', () => {
   })
 
   it('fails a stranded updating record that lost its rollback payload', async () => {
-    // 'updating' is always written together with the rollback payload, so a
-    // record with the status but no payload is corrupt; mark it failed rather
-    // than leave it perpetually busy.
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'comfybuilder-stranded-'))
     try {
       await expect(
@@ -599,8 +689,6 @@ describe('comfybuilder interrupted-install recovery', () => {
 })
 
 describe('comfybuilder.getListActions', () => {
-  // Without this the renderer gets an empty action array, reads the install as
-  // unlaunchable, and bounces a tile click into the new-install wizard.
   it.each([
     ['installed', 'installed', true],
     ['installing', 'installing', false],
@@ -637,12 +725,6 @@ describe('comfybuilder.getListPreview', () => {
 })
 
 describe('comfybuilder.withAccelArgs', () => {
-  // The flag tracks the INSTALLED ARTIFACT, not the host. `selectArtifactForHost`
-  // treats a cpu build as the universal fallback, so an nvidia machine lands on
-  // a cpu artifact whenever the build has no nvidia artifact: that torch is
-  // still CPU-only and ComfyUI would assert "Torch not compiled with CUDA
-  // enabled" without --cpu. nvidia/amd/mps builds bring their own accelerated
-  // torch and are auto-detected, so they take no flag.
   it.each([
     ['cpu build', 'cpu', 'cpu', '--enable-manager --cpu'],
     [
@@ -756,31 +838,28 @@ describe('comfybuilder update-comfyui', () => {
 
     expect(result.ok).toBe(true)
     expect(installArtifact).toHaveBeenCalledTimes(1)
-    // Updating first, installed last - never left mid-flight.
     expect(tools.updates[0]).toMatchObject({
       version: '9',
       artifactId: 'art-9',
       status: 'updating'
     })
-    // The new version's models are unstaged until the background task finishes.
-    expect(tools.updates.at(-1)).toMatchObject({ status: 'installed', modelsStaged: false })
-    // A staging still running for the old version is stopped before the swap,
-    // and the new version's models stage in the background afterwards.
+    expect(tools.updates.at(-1)).toMatchObject({
+      status: 'installed',
+      modelsStaged: false,
+      comfybuilderManagerAllowed: true
+    })
     expect(abortModelStaging).toHaveBeenCalledWith('i1')
     expect(startModelStaging).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'i1', version: '9' }),
       []
     )
-    // The environment is laid down for the NEW artifact, not the old one.
     const passed = vi.mocked(installArtifact).mock.calls[0]![0] as { artifact: { id: string } }
     expect(passed.artifact.id).toBe('art-9')
   })
 
   it('restores the previous version when the install fails', async () => {
-    // Otherwise the record advertises a version whose environment never landed.
     vi.mocked(resolveHostArtifactForVersion).mockResolvedValue({ artifact, version: 9 } as never)
     vi.mocked(installArtifact).mockRejectedValueOnce(new Error('disk full'))
-    // The venv survived — `installEnvironment` put it back.
     const stat = vi.spyOn(fsp, 'stat').mockResolvedValue({} as never)
     const tools = actionTools()
 
@@ -804,9 +883,84 @@ describe('comfybuilder update-comfyui', () => {
     }
   })
 
+  it.each(['missing release', 'manifest 404', 'manifest timeout'])(
+    'preserves the working install when a stopped-version lookup fails: %s',
+    async (failure) => {
+      access.mockImplementation(realFsp.access)
+      mkdir.mockImplementation(realFsp.mkdir)
+      rename.mockImplementation(realFsp.rename)
+      rm.mockImplementation(realFsp.rm)
+      writeFile.mockImplementation(realFsp.writeFile)
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'comfybuilder-manifest-failure-'))
+      const real = await vi.importActual<typeof ComfyBuilderModule>('../../comfybuilder')
+      const fetchModelManifest = vi.fn(async () => {
+        throw new Error(failure)
+      })
+      const client = {
+        listVersions: async () => [
+          { id: 'older-complete', version: 1, status: 'complete' },
+          ...(failure === 'missing release'
+            ? []
+            : [{ id: 'selected-stopped', version: 9, status: 'stopped' }])
+        ],
+        fetchModelManifest
+      }
+      vi.mocked(getBuilderClient)
+        .mockReturnValueOnce(client as never)
+        .mockReturnValueOnce(client as never)
+      vi.mocked(resolveModelManifest).mockImplementationOnce(real.resolveModelManifest)
+      vi.mocked(resolveHostArtifactForVersion).mockResolvedValue({ artifact, version: 9 } as never)
+      vi.mocked(installArtifact).mockImplementationOnce(async ({ installPath }) => {
+        await fsp.mkdir(path.join(installPath, 'venv'), { recursive: true })
+        await fsp.mkdir(path.join(installPath, 'ComfyUI'), { recursive: true })
+        await fsp.writeFile(path.join(installPath, 'ComfyUI', 'main.py'), 'new code')
+      })
+      const tools = actionTools()
+      try {
+        await fsp.mkdir(path.dirname(real.venvPython(root)), { recursive: true })
+        await fsp.writeFile(real.venvPython(root), 'old python')
+        await fsp.mkdir(path.join(root, 'ComfyUI', 'models'), { recursive: true })
+        await fsp.mkdir(path.join(root, 'ComfyUI', 'user'), { recursive: true })
+        await fsp.writeFile(path.join(root, 'ComfyUI', 'main.py'), 'old code')
+        await fsp.writeFile(path.join(root, 'ComfyUI', 'models', 'existing.bin'), 'existing model')
+        await fsp.writeFile(
+          path.join(root, 'ComfyUI', 'user', 'workflow.json'),
+          'existing workflow'
+        )
+        const result = await comfybuilder.handleAction(
+          'update-comfyui',
+          record({ installPath: root, artifactId: 'art-1', modelsStaged: true }),
+          { version: 9 },
+          tools as never
+        )
+        expect(result.ok).toBe(false)
+        expect(result.message).toContain(
+          failure === 'missing release' ? 'build version 9' : failure
+        )
+        expect(tools.updates.at(-1)).toMatchObject({
+          version: '1',
+          artifactId: 'art-1',
+          status: 'installed'
+        })
+        expect(await fsp.readFile(real.venvPython(root), 'utf8')).toBe('old python')
+        expect(await fsp.readFile(path.join(root, 'ComfyUI', 'main.py'), 'utf8')).toBe('old code')
+        expect(
+          await fsp.readFile(path.join(root, 'ComfyUI', 'models', 'existing.bin'), 'utf8')
+        ).toBe('existing model')
+        expect(
+          await fsp.readFile(path.join(root, 'ComfyUI', 'user', 'workflow.json'), 'utf8')
+        ).toBe('existing workflow')
+        expect(startModelStaging).not.toHaveBeenCalled()
+        expect(fs.existsSync(path.join(root, '.comfybuilder-environment-ready'))).toBe(false)
+        if (failure === 'missing release') expect(fetchModelManifest).not.toHaveBeenCalled()
+        else expect(fetchModelManifest.mock.calls).toEqual([['selected-stopped']])
+      } finally {
+        await realFsp.rm(root, { recursive: true, force: true })
+      }
+    }
+  )
+
   it('reports failed when the environment did not survive the attempt', async () => {
-    // Restoring the record but still claiming `installed` would advertise a
-    // working install that cannot launch.
     vi.mocked(resolveHostArtifactForVersion).mockResolvedValue({ artifact, version: 9 } as never)
     vi.mocked(installArtifact).mockRejectedValueOnce(new Error('disk full'))
     const stat = vi.spyOn(fsp, 'stat').mockRejectedValue(new Error('ENOENT'))
@@ -893,8 +1047,78 @@ describe('comfybuilder update-comfyui', () => {
     }
   })
 
+  async function updateAcrossPolicies(
+    oldMode: string | null,
+    newMode: string | null,
+    overrides: Record<string, unknown>
+  ): Promise<Record<string, unknown>[]> {
+    access.mockImplementation(realFsp.access)
+    mkdir.mockImplementation(realFsp.mkdir)
+    rename.mockImplementation(realFsp.rename)
+    rm.mockImplementation(realFsp.rm)
+    writeFile.mockImplementation(realFsp.writeFile)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'comfybuilder-update-policy-'))
+    try {
+      fs.mkdirSync(path.join(root, 'venv'), { recursive: true })
+      fs.mkdirSync(path.join(root, 'ComfyUI'), { recursive: true })
+      fs.writeFileSync(path.join(root, 'ComfyUI', 'main.py'), 'old code')
+      if (oldMode) writePolicy(root, oldMode)
+
+      vi.mocked(resolveHostArtifactForVersion).mockResolvedValue({ artifact, version: 9 } as never)
+      vi.mocked(installArtifact).mockImplementationOnce(async ({ installPath }) => {
+        fs.mkdirSync(path.join(installPath, 'venv'), { recursive: true })
+        fs.mkdirSync(path.join(installPath, 'ComfyUI'), { recursive: true })
+        fs.writeFileSync(path.join(installPath, 'ComfyUI', 'main.py'), 'new code')
+        if (newMode) writePolicy(installPath, newMode)
+      })
+      vi.mocked(resolveModelManifest).mockResolvedValueOnce({
+        models: [],
+        customNodePolicy: { mode: newMode ?? 'blocklist', list: [] }
+      } as never)
+      const tools = actionTools()
+
+      const result = await comfybuilder.handleAction(
+        'update-comfyui',
+        record({ installPath: root, ...overrides }),
+        { version: 9 },
+        tools as never
+      )
+
+      expect(result.ok).toBe(true)
+      expect(fs.readFileSync(path.join(root, 'ComfyUI', 'main.py'), 'utf8')).toBe('new code')
+      return tools.updates
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
+
+  it('drops the manager flag when the new release carries an allowlist policy', async () => {
+    const updates = await updateAcrossPolicies(null, 'allowlist', {
+      comfybuilderManagerAllowed: true,
+      launchArgs: '--enable-manager --cpu'
+    })
+
+    expect(updates.at(-1)).toMatchObject({
+      status: 'installed',
+      comfybuilderManagerAllowed: false,
+      launchArgs: '--cpu'
+    })
+  })
+
+  it('restores the manager flag when the new release drops its allowlist policy', async () => {
+    const updates = await updateAcrossPolicies('allowlist', null, {
+      comfybuilderManagerAllowed: false,
+      launchArgs: '--cpu'
+    })
+
+    expect(updates.at(-1)).toMatchObject({
+      status: 'installed',
+      comfybuilderManagerAllowed: true,
+      launchArgs: '--enable-manager --cpu'
+    })
+  })
+
   it('refuses to update an install that is not ready', async () => {
-    // The section disables the button, but an action id is reachable alone.
     const tools = actionTools()
     const result = await comfybuilder.handleAction(
       'update-comfyui',
@@ -958,7 +1182,7 @@ describe('comfybuilder check-update', () => {
   })
 
   it('warms the version cache from the catalog', async () => {
-    vi.mocked(listCompleteVersions).mockResolvedValue([7, 3])
+    vi.mocked(listUpdateVersions).mockResolvedValue([7, 3])
     const result = await comfybuilder.handleAction(
       'check-update',
       record(),
@@ -967,10 +1191,14 @@ describe('comfybuilder check-update', () => {
     )
     expect(result.ok).toBe(true)
     expect(getCachedVersions('d1')?.versions).toEqual([7, 3])
+    expect(listUpdateVersions).toHaveBeenCalledWith(expect.anything(), 'd1', {
+      os: 'linux',
+      gpu: 'nvidia'
+    })
   })
 
   it('reports failure and leaves the cache untouched when the catalog read throws', async () => {
-    vi.mocked(listCompleteVersions).mockRejectedValueOnce(new Error('offline'))
+    vi.mocked(listUpdateVersions).mockRejectedValueOnce(new Error('offline'))
     const result = await comfybuilder.handleAction(
       'check-update',
       record(),
@@ -984,7 +1212,7 @@ describe('comfybuilder check-update', () => {
 
   it('does not cache an update check completed after authentication changed', async () => {
     let resolveVersions!: (versions: number[]) => void
-    vi.mocked(listCompleteVersions).mockReturnValueOnce(
+    vi.mocked(listUpdateVersions).mockReturnValueOnce(
       new Promise<number[]>((resolve) => {
         resolveVersions = resolve
       })
@@ -998,6 +1226,7 @@ describe('comfybuilder check-update', () => {
     const startedGeneration = getVersionCacheGeneration()
     clearVersionCache()
     expect(getVersionCacheGeneration()).toBeGreaterThan(startedGeneration)
+    await vi.waitFor(() => expect(resolveVersions).toBeDefined())
     resolveVersions([9])
 
     await expect(result).resolves.toEqual({ ok: true })

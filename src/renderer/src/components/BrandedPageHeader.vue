@@ -1,0 +1,32 @@
+<script setup lang="ts">
+defineProps<{
+  title: string
+  description?: string
+  actionsInline?: boolean
+}>()
+</script>
+
+<template>
+  <header
+    class="branded-page-header box-border flex w-full items-end justify-between gap-6"
+    :class="{ '@max-[700px]:flex-col @max-[700px]:items-start @max-[700px]:gap-3': !actionsInline }"
+  >
+    <div class="min-w-0">
+      <h1 class="m-0 text-display font-semibold tracking-[-0.055em] text-foreground">
+        {{ title }}
+      </h1>
+      <p
+        v-if="description"
+        class="branded-page-header__description m-0 mt-1 text-[14px] text-text-muted"
+      >
+        {{ description }}
+      </p>
+    </div>
+    <div
+      v-if="$slots.actions"
+      class="branded-page-header__actions flex flex-none items-center gap-2"
+    >
+      <slot name="actions" />
+    </div>
+  </header>
+</template>

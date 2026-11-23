@@ -1,18 +1,9 @@
-// @vitest-environment node
-/**
- * Integration tests for the staged-envelope commit gating at the end of
- * `handleAction('snapshot-restore')`. The restore phases themselves are
- * mocked; what is under test is the decision layer: a clean staged restore
- * commits the envelope to history, and an abort landing during the final
- * installation-record reload (after the last mid-phase abort check) must
- * neither commit nor release the staged envelope - the retry target stays
- * staged.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import type { InstallationRecord } from '../../installations'
+import type { RestoreResult } from '../../lib/snapshots'
 
 vi.mock('electron', () => ({
   app: { isPackaged: false, getPath: () => '' },
@@ -24,7 +15,6 @@ vi.mock('../../lib/i18n', () => ({
     params ? `${key}:${JSON.stringify(params)}` : key
 }))
 
-// Deterministic no-git environment: no op-marker window, no source rollback.
 vi.mock('../../lib/git', () => ({
   readGitHead: vi.fn(() => null),
   rollbackComfySource: vi.fn(async () => true)
@@ -79,7 +69,7 @@ const snapshotsMock = vi.hoisted(() => ({
     failed: [],
     unreportable: []
   })),
-  restorePipPackages: vi.fn(async () => ({
+  restorePipPackages: vi.fn(async (): Promise<RestoreResult> => ({
     installed: [],
     removed: [],
     changed: [],
@@ -89,20 +79,23 @@ const snapshotsMock = vi.hoisted(() => ({
   })),
   repairNodeRequirements: vi.fn(async () => ({ changed: [], errors: [] })),
   protectedPackageDrift: vi.fn(async () => []),
+  describePackageRevert: vi.fn((revert?: unknown) => (revert ? 'REVERT_NOTE' : 'NO_OUTCOME_NOTE')),
   buildPostRestoreState: vi.fn(() => ({})),
-  ensureCurrentSnapshotOnTop: vi.fn(async () => ({ filename: null })),
+  ensureCurrentSnapshotOnTop: vi.fn(
+    async (_installPath: string, _installation: unknown, _label?: string) => ({
+      filename: null
+    })
+  ),
   getSnapshotCount: vi.fn(async () => 1),
   importSnapshots: vi.fn(async () => {}),
   releaseStagedSnapshotEnvelope: vi.fn(async () => {}),
   saveSnapshot: vi.fn(async () => 'post-restore.json'),
-  // Unused by the restore path; present so other action branches don't crash.
   listSnapshots: vi.fn(async () => []),
   deleteSnapshot: vi.fn(async () => {}),
   diffAgainstCurrent: vi.fn(async () => ({}))
 }))
 vi.mock('../../lib/snapshots', () => snapshotsMock)
 
-// Import the SUT after all mocks are declared.
 import { handleAction } from './actions'
 import { resolveSnapshotManagedTarget } from './torchStackCatalog'
 import type { ActionTools } from '../../types/sources'
@@ -164,10 +157,6 @@ describe('handleAction(snapshot-restore) staged-envelope commit gating', () => {
 
   it('neither commits nor releases the staged envelope when an abort lands during the final record reload', async () => {
     const controller = new AbortController()
-    // The abort arrives while the post-restore `installations.get()` reload is
-    // pending - after every mid-phase abort check has already passed. Without
-    // the post-reload guard this used to commit (or, on the adapted path,
-    // release) the staged envelope of a cancelled restore.
     installationsGet.mockImplementationOnce(async () => {
       controller.abort()
       return installation
@@ -184,8 +173,57 @@ describe('handleAction(snapshot-restore) staged-envelope commit gating', () => {
     expect(result.cancelled).toBe(true)
     expect(snapshotsMock.importSnapshots).not.toHaveBeenCalled()
     expect(snapshotsMock.releaseStagedSnapshotEnvelope).not.toHaveBeenCalled()
-    // The live state is still recorded on top so "Latest" reflects reality.
     expect(snapshotsMock.ensureCurrentSnapshotOnTop).toHaveBeenCalled()
+  })
+
+  it('a failed package phase reports what the revert did, and labels the recorded state', async () => {
+    snapshotsMock.loadStagedSnapshotEnvelope.mockImplementation(async () => ({
+      snapshots: [{ ...stagedSnapshot, skipPipSync: false }]
+    }))
+    snapshotsMock.restorePipPackages.mockImplementationOnce(async () => ({
+      installed: [],
+      removed: [],
+      changed: [],
+      protectedSkipped: [],
+      failed: ['ghost-pkg'],
+      errors: ['Failed to remove ghost-pkg'],
+      revert: {
+        reason: 'failures',
+        uninstalled: [],
+        keptPreexisting: ['aiohttp'],
+        restoredFromBackup: false,
+        complete: true
+      }
+    }))
+
+    const result = await handleAction(
+      'snapshot-restore',
+      installation,
+      { restoreToken: 'tok-fail' },
+      makeTools()
+    )
+
+    expect(result.ok).toBe(false)
+    expect(snapshotsMock.describePackageRevert).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'failures', keptPreexisting: ['aiohttp'] })
+    )
+    expect(result.message).toContain('REVERT_NOTE')
+    expect(result.message).not.toContain('reverted where possible')
+    expect(snapshotsMock.ensureCurrentSnapshotOnTop).toHaveBeenCalledWith(
+      installation.installPath,
+      expect.anything(),
+      'snapshots.labelRestoreIncomplete'
+    )
+    expect(snapshotsMock.importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('does not label the post-restore snapshot of a restore that succeeded', async () => {
+    await handleAction('snapshot-restore', installation, { restoreToken: 'tok-ok' }, makeTools())
+
+    expect(snapshotsMock.ensureCurrentSnapshotOnTop).toHaveBeenCalled()
+    for (const call of snapshotsMock.ensureCurrentSnapshotOnTop.mock.calls) {
+      expect(call[2]).toBeUndefined()
+    }
   })
 
   it('exact mode: unknown protected drift fails the restore, keeps the staged envelope, and discloses why', async () => {
@@ -207,8 +245,6 @@ describe('handleAction(snapshot-restore) staged-envelope commit gating', () => {
     expect(result.ok).toBe(false)
     expect(result.message).toContain('standalone.snapshotProtectedDriftUnknown')
     expect(outputs.join('')).toContain('standalone.snapshotProtectedDriftUnknown')
-    // The install never provably reached the imported state: nothing commits,
-    // and the staged envelope stays for a retry.
     expect(snapshotsMock.importSnapshots).not.toHaveBeenCalled()
     expect(snapshotsMock.releaseStagedSnapshotEnvelope).not.toHaveBeenCalled()
   })
@@ -243,7 +279,6 @@ describe('handleAction(snapshot-restore) staged-envelope commit gating', () => {
     expect(result.ok).toBe(false)
     expect(result.message).toContain('standalone.pytorchCatalogError')
     expect(result.message).toContain('offline')
-    // "Could not check" must abort before anything is mutated or committed.
     expect(snapshotsMock.restorePipPackages).not.toHaveBeenCalled()
     expect(snapshotsMock.importSnapshots).not.toHaveBeenCalled()
     expect(snapshotsMock.releaseStagedSnapshotEnvelope).not.toHaveBeenCalled()
@@ -267,8 +302,6 @@ describe('handleAction(snapshot-restore) staged-envelope commit gating', () => {
 
     expect(result.ok).toBe(true)
     expect(outputs.join('')).toContain('standalone.snapshotProtectedDriftUnknown')
-    // Adapted success: the actual state is recorded and the staged file is
-    // dropped, but the unverified target is never committed to history.
     expect(snapshotsMock.importSnapshots).not.toHaveBeenCalled()
     expect(snapshotsMock.ensureCurrentSnapshotOnTop).toHaveBeenCalled()
     expect(snapshotsMock.releaseStagedSnapshotEnvelope).toHaveBeenCalledWith('tok-4')

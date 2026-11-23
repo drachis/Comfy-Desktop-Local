@@ -1,58 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 
 import TrackModal from './TrackModal.vue'
-import { BaseSelect } from '../components/ui'
+import { useModal } from '../composables/useModal'
 import type { ProbeResult } from '../types/ipc'
-
-/**
- * The Install Directory field is browse-only: it has no editable input, so
- * typing/pasting is impossible. The only way to populate it is the Browse
- * button, which runs the probe and enables the "Track Install" button when an
- * existing install is detected. Once populated, the path text is clickable to
- * open the folder in the OS file manager.
- */
-
-// Minimal catalog covering the keys the template reads. Missing keys fall
-// back to the dotted path, which would surface in a failed assertion.
-const messages = {
-  en: {
-    common: {
-      name: 'Name',
-      browse: 'Browse',
-      namePlaceholder: 'e.g. ComfyUI Main',
-      backToDashboard: 'Back to Dashboard'
-    },
-    git: {
-      venv: 'Virtual Environment',
-      venvNotFound: 'Not found',
-      venvHint: 'No venv found. Browse to one or set it in Manage.'
-    },
-    track: {
-      grandTitle: 'Add Existing Instance',
-      grandSubtitle: 'Add an existing local ComfyUI checkout.',
-      installDir: 'Install location',
-      selectDir: 'Select a directory',
-      detectedType: 'Detected type',
-      browseDirFirst: 'Browse to a directory first',
-      detecting: 'Detecting',
-      noDetected: 'No known install detected',
-      notDetectedSuffix: 'not detected',
-      pickType: 'Nothing detected. Choose a type',
-      notDetectedWarning: 'Does not look like this type; may not launch.',
-      trackInstallation: 'Track Install',
-      cannotTrack: 'Cannot Track',
-      version: 'Version',
-      repository: 'Repository',
-      branch: 'Branch'
-    }
-  }
-}
-
-function createTestI18n() {
-  return createI18n({ legacy: false, locale: 'en', messages })
-}
 
 interface MockApi {
   getUniqueName: ReturnType<typeof vi.fn>
@@ -87,17 +38,19 @@ function installMockApi(overrides: Partial<MockApi> = {}): MockApi {
 function mountTrack() {
   return mount(TrackModal, {
     global: {
-      plugins: [createTestI18n()],
       stubs: {
-        // BrandTakeoverLayout renders the default slot so the card is in
-        // the DOM; the rest are inert presentational shells.
-        BrandTakeoverLayout: { template: '<div><slot /><slot name="footer-left" /></div>' },
-        TakeoverBack: true,
+        DesktopDialogSurface: { template: '<div><slot /></div>' },
         BaseSelect: true,
         HardDrive: true
       }
     }
   })
+}
+
+function browseButton(wrapper: ReturnType<typeof mountTrack>) {
+  const button = wrapper.findAll('button').find((button) => button.text() === 'Browse')
+  if (!button) throw new Error('Browse button not found')
+  return button
 }
 
 function trackButton(wrapper: ReturnType<typeof mountTrack>) {
@@ -118,12 +71,11 @@ describe('TrackModal — browse-only install directory', () => {
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
 
-    // Browse-only: the directory has no editable text input at all.
-    expect(wrapper.find('.track-path-input input').exists()).toBe(false)
-    // Empty → muted placeholder, not a clickable open button.
-    expect(wrapper.find('button.track-path-open').exists()).toBe(false)
-    expect(wrapper.find('.track-path-placeholder').exists()).toBe(true)
-    expect(wrapper.findAll('.track-label').map((label) => label.text())).toEqual([
+    const location = wrapper.get('.track-location')
+    expect(location.find('input').exists()).toBe(false)
+    expect(location.find('.config-path-open').exists()).toBe(false)
+    expect(location.get('.config-path-placeholder').text()).toBe('Select a directory…')
+    expect(wrapper.findAll('.config-label').map((label) => label.text())).toEqual([
       'Install location',
       'Name',
       'Detected type'
@@ -138,16 +90,17 @@ describe('TrackModal — browse-only install directory', () => {
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
 
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
-    const pathBtn = wrapper.get('button.track-path-open')
-    expect(pathBtn.text()).toBe('/Users/jo/ComfyUI')
-    await pathBtn.trigger('click')
+    const pathText = wrapper.get('.track-location .config-path-open')
+    expect(pathText.text()).toBe('/Users/jo/ComfyUI')
+    expect(pathText.element.tagName).not.toBe('BUTTON')
+    await wrapper.get('.track-location .config-path-reveal').trigger('click')
     expect(api.openPath).toHaveBeenCalledWith('/Users/jo/ComfyUI')
   })
 
-  it('probes and enables Track Install when a folder is picked via Browse', async () => {
+  it('probes and enables Add build when a folder is picked via Browse', async () => {
     const api = installMockApi({
       browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI')
     })
@@ -157,14 +110,14 @@ describe('TrackModal — browse-only install directory', () => {
 
     expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
 
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
     expect(api.probeInstallation).toHaveBeenCalledWith('/Users/jo/ComfyUI')
     expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
   })
 
-  it('keeps Track Install disabled when no install is detected at the picked folder', async () => {
+  it('keeps Add build disabled when no install is detected at the picked folder', async () => {
     const api = installMockApi({
       browseFolder: vi.fn().mockResolvedValue('/tmp/not-comfy'),
       probeInstallation: vi.fn().mockResolvedValue([])
@@ -173,7 +126,7 @@ describe('TrackModal — browse-only install directory', () => {
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
 
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
     expect(api.probeInstallation).toHaveBeenCalledWith('/tmp/not-comfy')
@@ -181,112 +134,108 @@ describe('TrackModal — browse-only install directory', () => {
   })
 })
 
-describe('TrackModal — missing venv explanation', () => {
+describe('TrackModal — modal layout', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })
 
-  async function browseWithProbe(probe: ProbeResult) {
-    installMockApi({
+  it('shows the detected details as rows and closes from the round close button', async () => {
+    installMockApi({ browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI') })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+
+    expect(wrapper.get('.setup-modal-title').text()).toBe('Add existing build')
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(
+      wrapper
+        .findAll('.track-summary-row')
+        .map((row) => [row.get('.config-label').text(), row.get('.track-summary-value').text()])
+    ).toEqual([
+      ['Version', 'abcdef12'],
+      ['Repository', 'https://github.com/comfyanonymous/ComfyUI.git'],
+      ['Branch', 'master']
+    ])
+    expect(trackButton(wrapper).text()).toBe('Add build')
+
+    await wrapper.get('.setup-modal-close').trigger('click')
+    expect(wrapper.emitted('close')).toHaveLength(1)
+  })
+})
+
+describe('TrackModal — virtual environment', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function browseGitInstall(probe: ProbeResult) {
+    const api = installMockApi({
       browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI'),
       probeInstallation: vi.fn().mockResolvedValue([probe])
     })
     const wrapper = mountTrack()
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
-    await wrapper.get('button.brand-tertiary').trigger('click')
-    await flushPromises()
-    return wrapper
-  }
-
-  it('explains how to fix a Git-type folder that has no venv', async () => {
-    const wrapper = await browseWithProbe(gitProbe)
-
-    expect(wrapper.get('[data-testid="track-venv-hint"]').text()).toContain('No venv found')
-  })
-
-  it('omits the explanation once a venv was detected', async () => {
-    const wrapper = await browseWithProbe({ ...gitProbe, venvPath: '/Users/jo/ComfyUI/.venv' })
-
-    expect(wrapper.find('[data-testid="track-venv-hint"]').exists()).toBe(false)
-  })
-
-  it('does not show the venv field or hint for types that manage their own environment', async () => {
-    const wrapper = await browseWithProbe({
-      sourceId: 'standalone',
-      sourceLabel: 'Standalone',
-      version: 'v0.1.0'
-    })
-
-    expect(wrapper.find('[data-testid="track-venv-hint"]').exists()).toBe(false)
-  })
-})
-
-describe('TrackModal — manual type choice', () => {
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  const manualGit: ProbeResult = {
-    sourceId: 'git',
-    sourceLabel: 'Git Clone',
-    detected: false,
-    version: 'unknown'
-  }
-
-  async function browseWithResults(results: ProbeResult[]) {
-    const api = installMockApi({
-      browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI'),
-      probeInstallation: vi.fn().mockResolvedValue(results)
-    })
-    const wrapper = mountTrack()
-    ;(wrapper.vm as unknown as { open: () => void }).open()
-    await flushPromises()
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
     return { api, wrapper }
   }
 
-  it('does not pre-select a manual-only type, so Track Install stays disabled', async () => {
-    const { wrapper } = await browseWithResults([manualGit])
+  it('shows the detected virtual environment as a path that opens the folder', async () => {
+    const { api, wrapper } = await browseGitInstall({
+      ...gitProbe,
+      venvPath: '/Users/jo/ComfyUI/.venv'
+    })
 
-    expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
-    const select = wrapper.findComponent(BaseSelect)
-    expect(select.props('placeholder')).toBe('Nothing detected. Choose a type')
-    expect(select.props('disabled')).toBe(false)
+    const venv = wrapper.get('[data-testid="track-venv-field"]')
+    expect(wrapper.findAll('[data-testid="install-location-field"]')).toHaveLength(1)
+    expect(venv.get('.config-path-open').text()).toBe('/Users/jo/ComfyUI/.venv')
+    await venv.get('.config-path-reveal').trigger('click')
+    expect(api.openPath).toHaveBeenCalledWith('/Users/jo/ComfyUI/.venv')
   })
 
-  it('labels manual types as not detected in the dropdown', async () => {
-    const { wrapper } = await browseWithResults([gitProbe, { ...manualGit, sourceId: 'portable' }])
+  it('says no virtual environment was found when the git install has none', async () => {
+    const { wrapper } = await browseGitInstall(gitProbe)
 
-    const labels = (wrapper.findComponent(BaseSelect).props('options') as { label: string }[]).map(
-      (o) => o.label
-    )
-    expect(labels).toEqual(['Git', 'Git Clone (not detected)'])
+    const venv = wrapper.get('[data-testid="track-venv-field"]')
+    expect(venv.find('.config-path-open').exists()).toBe(false)
+    expect(venv.get('.config-path-placeholder').text()).toBe('No virtual environment found.')
   })
 
-  it('still pre-selects a detected type ahead of manual ones', async () => {
-    const { wrapper } = await browseWithResults([gitProbe, manualGit])
+  it('uses the environment found in the next folder, not one browsed for the folder before', async () => {
+    const api = installMockApi({
+      browseFolder: vi
+        .fn()
+        .mockResolvedValueOnce('/Users/jo/A')
+        .mockResolvedValueOnce('/Users/jo/envs/a')
+        .mockResolvedValueOnce('/Users/jo/B'),
+      probeInstallation: vi
+        .fn()
+        .mockResolvedValueOnce([{ ...gitProbe, venvPath: '/Users/jo/A/.venv' }])
+        .mockResolvedValueOnce([{ ...gitProbe, venvPath: '/Users/jo/B/.venv' }])
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    const venvPath = () => wrapper.get('[data-testid="track-venv-field"] .config-path-open').text()
 
-    expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
-    expect(wrapper.find('[data-testid="track-forced-type-hint"]').exists()).toBe(false)
-  })
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="track-venv-field"] .config-path-browse').trigger('click')
+    await flushPromises()
+    expect(venvPath()).toBe('/Users/jo/envs/a')
 
-  it('warns and enables tracking once the user picks a manual type, without saving the flag', async () => {
-    const { api, wrapper } = await browseWithResults([manualGit])
-
-    wrapper.findComponent(BaseSelect).vm.$emit('update:modelValue', '0')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
-    expect(wrapper.get('[data-testid="track-forced-type-hint"]').text()).toContain('may not launch')
-    expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
-
+    expect(venvPath()).toBe('/Users/jo/B/.venv')
     await trackButton(wrapper).trigger('click')
     await flushPromises()
-
     const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
-    expect(data).toMatchObject({ sourceId: 'git', installPath: '/Users/jo/ComfyUI' })
-    expect(data).not.toHaveProperty('detected')
+    expect(data.installPath).toBe('/Users/jo/B')
+    expect(data.venvPath).toBe('/Users/jo/B/.venv')
   })
 })
 
@@ -303,7 +252,6 @@ describe('TrackModal — install path resolution on save', () => {
       installPath: '/Users/jo/standalone'
     }
     const api = installMockApi({
-      // User browses to the nested ComfyUI folder; the probe corrects the root.
       browseFolder: vi.fn().mockResolvedValue('/Users/jo/standalone/ComfyUI'),
       probeInstallation: vi.fn().mockResolvedValue([standaloneProbe])
     })
@@ -311,7 +259,7 @@ describe('TrackModal — install path resolution on save', () => {
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
 
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
     await trackButton(wrapper).trigger('click')
@@ -325,13 +273,12 @@ describe('TrackModal — install path resolution on save', () => {
   it('falls back to the picked folder when the probe has no resolved root', async () => {
     const api = installMockApi({
       browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI')
-      // gitProbe has no installPath.
     })
     const wrapper = mountTrack()
     ;(wrapper.vm as unknown as { open: () => void }).open()
     await flushPromises()
 
-    await wrapper.get('button.brand-tertiary').trigger('click')
+    await browseButton(wrapper).trigger('click')
     await flushPromises()
 
     await trackButton(wrapper).trigger('click')
@@ -340,5 +287,247 @@ describe('TrackModal — install path resolution on save', () => {
     expect(api.trackInstallation).toHaveBeenCalledTimes(1)
     const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
     expect(data.installPath).toBe('/Users/jo/ComfyUI')
+  })
+
+  it('adds the folder once when Add build is pressed again before the first press has finished', async () => {
+    let finishTracking: (result: { ok: boolean }) => void = () => {}
+    const api = installMockApi({
+      browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI'),
+      trackInstallation: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishTracking = resolve
+          })
+      )
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+
+    const addBuild = trackButton(wrapper)
+    ;(addBuild.element as HTMLButtonElement).click()
+    ;(addBuild.element as HTMLButtonElement).click()
+    await flushPromises()
+    expect(addBuild.attributes('disabled')).toBeDefined()
+
+    finishTracking({ ok: true })
+    await flushPromises()
+
+    expect(api.trackInstallation).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('navigate-list')).toHaveLength(1)
+  })
+
+  it('saves the folder that was picked when Add build was pressed, even if another is browsed during the name check', async () => {
+    let holdNames = false
+    let releaseName: () => void = () => {}
+    const api = installMockApi({
+      getUniqueName: vi.fn((base: string) => {
+        if (!holdNames) return Promise.resolve(base)
+        return new Promise<string>((resolve) => {
+          releaseName = () => resolve(base)
+        })
+      }),
+      browseFolder: vi
+        .fn()
+        .mockResolvedValueOnce('/Users/jo/A')
+        .mockResolvedValueOnce('/Users/jo/B'),
+      probeInstallation: vi
+        .fn()
+        .mockResolvedValueOnce([{ ...gitProbe, commit: 'aaaa1111', venvPath: '/Users/jo/A/.venv' }])
+        .mockResolvedValueOnce([{ ...gitProbe, commit: 'bbbb2222', venvPath: '/Users/jo/B/.venv' }])
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+
+    holdNames = true
+    await trackButton(wrapper).trigger('click')
+    await flushPromises()
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+    releaseName()
+    await flushPromises()
+
+    expect(api.trackInstallation).toHaveBeenCalledTimes(1)
+    const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
+    expect(data.installPath).toBe('/Users/jo/A')
+    expect(data.commit).toBe('aaaa1111')
+    expect(data.venvPath).toBe('/Users/jo/A/.venv')
+  })
+})
+
+describe('TrackModal — build name', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const takenNames = new Set(['ComfyUI'])
+  const uniqueName = vi.fn(async (base: string) => (takenNames.has(base) ? `${base} (1)` : base))
+
+  async function openWithFolder() {
+    const api = installMockApi({
+      getUniqueName: uniqueName,
+      browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI')
+    })
+    const wrapper = mountTrack()
+    ;(wrapper.vm as unknown as { open: () => void }).open()
+    await flushPromises()
+    await browseButton(wrapper).trigger('click')
+    await flushPromises()
+    return { api, wrapper }
+  }
+
+  it('saves the suggested name shown in the empty field', async () => {
+    const { api, wrapper } = await openWithFolder()
+
+    expect(wrapper.get('#track-name').attributes('placeholder')).toBe('ComfyUI (1)')
+    await trackButton(wrapper).trigger('click')
+    await flushPromises()
+
+    const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
+    expect(data.name).toBe('ComfyUI (1)')
+  })
+
+  it('warns and keeps Add build disabled when the typed name already exists', async () => {
+    const { api, wrapper } = await openWithFolder()
+
+    await wrapper.get('#track-name').setValue('ComfyUI')
+    await flushPromises()
+
+    expect(wrapper.get('#track-name-error').text()).toBe(
+      'A build named "ComfyUI" already exists. Please choose a different name.'
+    )
+    expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+
+    await wrapper.get('#track-name').setValue('Old portable')
+    await flushPromises()
+    expect(wrapper.find('#track-name-error').exists()).toBe(false)
+    await trackButton(wrapper).trigger('click')
+    await flushPromises()
+    const data = api.trackInstallation.mock.calls[0]![0] as Record<string, unknown>
+    expect(data.name).toBe('Old portable')
+  })
+
+  it('shows the error and does not add the build when the name check fails on Add build', async () => {
+    const modal = useModal()
+    const { api, wrapper } = await openWithFolder()
+    api.getUniqueName.mockRejectedValueOnce(new Error('Could not read the builds list.'))
+
+    await trackButton(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(modal.state.visible).toBe(true)
+    expect(modal.state.title).toBe("Couldn't add this build")
+    expect(modal.state.message).toBe('Could not read the builds list.')
+    expect(api.trackInstallation).not.toHaveBeenCalled()
+
+    modal.dismiss()
+    await flushPromises()
+    expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
+  })
+
+  it('asks for a name when only spaces are typed', async () => {
+    const { wrapper } = await openWithFolder()
+
+    await wrapper.get('#track-name').setValue('   ')
+    await flushPromises()
+
+    expect(wrapper.get('#track-name-error').text()).toBe(
+      'Enter a name, or leave blank to use the suggested one.'
+    )
+    expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+  })
+
+  describe('when the name is checked again on Add build', () => {
+    async function openWithHeldName() {
+      const held: Array<() => void> = []
+      const api = installMockApi({
+        getUniqueName: vi.fn((base: string) => {
+          const unique = takenNames.has(base) ? `${base} (1)` : base
+          if (base !== 'ComfyUI') return Promise.resolve(unique)
+          return new Promise<string>((resolve) => {
+            held.push(() => resolve(unique))
+          })
+        }),
+        browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI')
+      })
+      const wrapper = mountTrack()
+      ;(wrapper.vm as unknown as { open: () => void }).open()
+      await flushPromises()
+      await browseButton(wrapper).trigger('click')
+      await flushPromises()
+      await wrapper.get('#track-name').setValue('ComfyUI')
+      await trackButton(wrapper).trigger('click')
+      await flushPromises()
+      const releaseAll = async () => {
+        held.splice(0).forEach((release) => release())
+        await flushPromises()
+      }
+      return { api, wrapper, releaseAll }
+    }
+
+    it('still rejects a taken name when the field has not changed', async () => {
+      const { api, wrapper, releaseAll } = await openWithHeldName()
+
+      await releaseAll()
+
+      expect(api.trackInstallation).not.toHaveBeenCalled()
+      expect(wrapper.get('#track-name-error').text()).toBe(
+        'A build named "ComfyUI" already exists. Please choose a different name.'
+      )
+      expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+    })
+
+    it('does not flag a new name when the check for the old one returns late', async () => {
+      const { api, wrapper, releaseAll } = await openWithHeldName()
+
+      await wrapper.get('#track-name').setValue('Old portable')
+      await flushPromises()
+      await releaseAll()
+
+      expect(api.trackInstallation).not.toHaveBeenCalled()
+      expect(wrapper.find('#track-name-error').exists()).toBe(false)
+      expect(trackButton(wrapper).attributes('disabled')).toBeUndefined()
+    })
+
+    it('keeps the warning when an older check for the same name returns free after Add build found it taken', async () => {
+      let releaseEditCheck: () => void = () => {}
+      let holdNextCheck = false
+      const api = installMockApi({
+        getUniqueName: vi.fn((base: string) => {
+          if (base !== 'ComfyUI') return Promise.resolve(base)
+          if (holdNextCheck) {
+            holdNextCheck = false
+            return new Promise<string>((resolve) => {
+              releaseEditCheck = () => resolve(base)
+            })
+          }
+          return Promise.resolve(`${base} (1)`)
+        }),
+        browseFolder: vi.fn().mockResolvedValue('/Users/jo/ComfyUI')
+      })
+      const wrapper = mountTrack()
+      ;(wrapper.vm as unknown as { open: () => void }).open()
+      await flushPromises()
+      await browseButton(wrapper).trigger('click')
+      await flushPromises()
+      holdNextCheck = true
+      await wrapper.get('#track-name').setValue('ComfyUI')
+      await trackButton(wrapper).trigger('click')
+      await flushPromises()
+
+      releaseEditCheck()
+      await flushPromises()
+
+      expect(api.trackInstallation).not.toHaveBeenCalled()
+      expect(wrapper.get('#track-name-error').text()).toBe(
+        'A build named "ComfyUI" already exists. Please choose a different name.'
+      )
+      expect(trackButton(wrapper).attributes('disabled')).toBeDefined()
+    })
   })
 })

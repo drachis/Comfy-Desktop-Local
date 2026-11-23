@@ -1,4 +1,3 @@
-// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ComfyBuilderApiError, ComfyBuilderClient } from './client'
 import type { TokenProvider } from './types'
@@ -131,7 +130,6 @@ describe('ComfyBuilderClient', () => {
     })
 
     await expect(client.listBuilds()).rejects.toThrow(/repeated build cursor/)
-    // First page without a cursor, one page for the cursor, then the repeat is refused.
     expect(f).toHaveBeenCalledTimes(2)
   })
 
@@ -207,7 +205,8 @@ describe('ComfyBuilderClient', () => {
     await expect(client.fetchModelManifest('release/one')).resolves.toEqual({
       models: [],
       modelPolicy: null,
-      partnerNodePolicy: null
+      partnerNodePolicy: null,
+      customNodePolicy: null
     })
     await expect(client.resolveDownloadUrl('archive-one')).resolves.toBe(
       'https://storage.test/archive-one'
@@ -363,8 +362,16 @@ describe('ComfyBuilderClient', () => {
     expect(m.models).toHaveLength(1)
     expect(m.modelPolicy).toBeNull()
     expect(m.partnerNodePolicy).toBeNull()
+    expect(m.customNodePolicy).toBeNull()
     const call = (f as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!
     expect(call[0]).toBe('https://api.test/builder/v1/releases/ver-9/manifest')
+  })
+
+  it('fetchModelManifest carries the custom-node policy the manager answer rides on', async () => {
+    vi.stubGlobal('fetch', mockFetch(200, { models: [], customNodePolicy: { mode: 'allowlist' } }))
+    const client = new ComfyBuilderClient({ baseUrl: 'https://api.test/builder', auth: auth('t') })
+    const m = await client.fetchModelManifest('ver-9')
+    expect(m.customNodePolicy).toEqual({ mode: 'allowlist' })
   })
 
   it('rejects a manifest response without an explicit model list', async () => {

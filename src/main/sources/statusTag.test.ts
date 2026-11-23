@@ -32,7 +32,6 @@ function makeInstall(sourceId: string): InstallationRecord {
   } as InstallationRecord
 }
 
-// Migrating is an opt-in action in Manage, not a badge that competes with launching.
 describe('installed local installs carry no Migrate status tag', () => {
   beforeEach(() => {
     vi.clearAllMocks()

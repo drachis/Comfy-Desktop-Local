@@ -1,27 +1,66 @@
 import fs from 'fs'
 import path from 'path'
 import { execFile, spawn } from 'child_process'
+import type { ChildProcess } from 'child_process'
 import { killProcTree } from './process'
+import { stripAnsi } from './stderrTail'
+import { scrubAll } from '../../shared/piiScrub'
 
-/** Regex matching PyTorch-family packages that must never be overwritten by pip. */
 export const PYTORCH_RE = /^(torch|torchvision|torchaudio|torchsde)(\s*[<>=!~;[#]|$)/i
 
-/** Cap on captured pip output (characters) so a verbose install can't grow an unbounded string in memory. */
+export const VALID_PIP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
+const COLOUR_FORCING_VARS = new Set(['FORCE_COLOR', 'CLICOLOR_FORCE'])
+
+export function uvEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string | undefined> = {}
+  for (const [key, value] of Object.entries(base)) {
+    if (COLOUR_FORCING_VARS.has(key.toUpperCase())) continue
+    env[key] = value
+  }
+  env.NO_COLOR = '1'
+  return env
+}
+
 const MAX_CAPTURED_OUTPUT_CHARS = 256 * 1024
 
 export interface UvPipResult {
   code: number
-  /** Combined stdout+stderr in arrival order, capped to the last ~256K characters. */
   output: string
 }
 
-/** Run a uv pip command, streaming output and capturing a bounded tail. Returns the exit code and captured output. */
-export function runUvPipDetailed(
+export type OnUvSpawn = (proc: ChildProcess) => void
+
+export async function runUvPipDetailed(
   uvPath: string,
   args: string[],
   cwd: string,
   sendOutput: (text: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSpawn?: OnUvSpawn,
+  extraEnv?: Record<string, string>,
+  mirrors?: PipMirrorConfig
+): Promise<UvPipResult> {
+  if (!mirrors) return spawnUvPip(uvPath, args, cwd, sendOutput, signal, onSpawn, extraEnv)
+  const { pypiMirror, useChineseMirrors } = mirrors
+  const run = (indexArgs: string[]): Promise<UvPipResult> =>
+    spawnUvPip(uvPath, [...args, ...indexArgs], cwd, sendOutput, signal, onSpawn, extraEnv)
+  const result = await run(getPipIndexArgs(pypiMirror, useChineseMirrors))
+  const fallback = getPipFallbackIndexArgs(pypiMirror, useChineseMirrors)
+  if (result.code === 0 || !fallback || signal?.aborted) return result
+  sendOutput('\nRetrying with the mirrors ahead of pypi.org…\n')
+  const retried = await run(fallback)
+  return retried.code === 0 ? retried : result
+}
+
+function spawnUvPip(
+  uvPath: string,
+  args: string[],
+  cwd: string,
+  sendOutput: (text: string) => void,
+  signal?: AbortSignal,
+  onSpawn?: OnUvSpawn,
+  extraEnv?: Record<string, string>
 ): Promise<UvPipResult> {
   if (signal?.aborted) return Promise.resolve({ code: 1, output: '' })
   return new Promise<UvPipResult>((resolve) => {
@@ -29,8 +68,14 @@ export function runUvPipDetailed(
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
-      detached: process.platform !== 'win32'
+      detached: process.platform !== 'win32',
+      env: { ...uvEnv(), ...extraEnv }
     })
+    if (onSpawn) {
+      try {
+        onSpawn(proc)
+      } catch {}
+    }
 
     let captured = ''
     const record = (text: string): void => {
@@ -60,15 +105,24 @@ export function runUvPipDetailed(
   })
 }
 
-/** Run a uv pip command and stream output. Returns the exit code. */
 export function runUvPip(
   uvPath: string,
   args: string[],
   cwd: string,
   sendOutput: (text: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  mirrors?: PipMirrorConfig
 ): Promise<number> {
-  return runUvPipDetailed(uvPath, args, cwd, sendOutput, signal).then((r) => r.code)
+  return runUvPipDetailed(
+    uvPath,
+    args,
+    cwd,
+    sendOutput,
+    signal,
+    undefined,
+    undefined,
+    mirrors
+  ).then((r) => r.code)
 }
 
 export interface PipMirrorConfig {
@@ -76,7 +130,6 @@ export interface PipMirrorConfig {
   useChineseMirrors?: boolean
 }
 
-/** Install a requirements file via `uv pip install -r`, filtering out PyTorch packages first. Returns the exit code and captured output. */
 export async function installFilteredRequirementsDetailed(
   reqPath: string,
   uvPath: string,
@@ -86,7 +139,10 @@ export async function installFilteredRequirementsDetailed(
   sendOutput: (text: string) => void,
   signal?: AbortSignal,
   mirrors?: PipMirrorConfig,
-  extraArgs?: string[]
+  extraArgs?: string[],
+  onSpawn?: OnUvSpawn,
+  extraEnv?: Record<string, string>,
+  subcommand: 'install' | 'compile' = 'install'
 ): Promise<UvPipResult> {
   const content = await fs.promises.readFile(reqPath, 'utf-8')
   const filtered = content
@@ -97,22 +153,22 @@ export async function installFilteredRequirementsDetailed(
   await fs.promises.writeFile(filteredPath, filtered, 'utf-8')
 
   try {
-    const indexArgs = getPipIndexArgs(mirrors?.pypiMirror, mirrors?.useChineseMirrors)
     return await runUvPipDetailed(
       uvPath,
       [
         'pip',
-        'install',
-        '-r',
+        ...(subcommand === 'install' ? ['install', '-r'] : ['compile']),
         filteredPath,
         '--python',
         pythonPath,
-        ...indexArgs,
         ...(extraArgs ?? [])
       ],
       installPath,
       sendOutput,
-      signal
+      signal,
+      onSpawn,
+      extraEnv,
+      mirrors ?? {}
     )
   } finally {
     try {
@@ -121,7 +177,6 @@ export async function installFilteredRequirementsDetailed(
   }
 }
 
-/** Install a requirements file via `uv pip install -r`, filtering out PyTorch packages first. Returns the exit code. */
 export async function installFilteredRequirements(
   reqPath: string,
   uvPath: string,
@@ -147,27 +202,32 @@ export async function installFilteredRequirements(
   return result.code
 }
 
-/** The canonical PyPI index — always used as the primary `--index-url`. */
 export const PYPI_INDEX_URL = 'https://pypi.org/simple/'
 
-/** Additional PyPI mirror URLs for regions with restricted access (e.g. China). */
 export const PYPI_MIRROR_URLS: string[] = [
   'https://mirrors.aliyun.com/pypi/simple/',
   'https://mirrors.cloud.tencent.com/pypi/simple/'
 ]
 
-/** Trim whitespace and ensure a trailing slash for consistent URL comparison. */
 function normalizeIndexUrl(url: string): string {
   const trimmed = url.trim()
   return trimmed.endsWith('/') ? trimmed : trimmed + '/'
 }
 
+function mirrorUrls(pypiMirror?: string, useChineseMirrors?: boolean): string[] {
+  const urls: string[] = []
+  const seen = new Set([normalizeIndexUrl(PYPI_INDEX_URL)])
+  for (const url of [pypiMirror?.trim(), ...(useChineseMirrors ? PYPI_MIRROR_URLS : [])]) {
+    if (!url || seen.has(normalizeIndexUrl(url))) continue
+    seen.add(normalizeIndexUrl(url))
+    urls.push(url)
+  }
+  return urls
+}
+
 export function getPipIndexArgs(pypiMirror?: string, useChineseMirrors?: boolean): string[] {
   const mirror = pypiMirror?.trim() || undefined
 
-  // Primary --index-url priority: user mirror, then first Chinese mirror, then pypi.org.
-  // The Chinese mirror goes first (not pypi.org as a fallback extra) to avoid uv's first-match
-  // strategy stalling on the unreachable pypi.org before falling back.
   let primary: string
   if (mirror) {
     primary = mirror
@@ -203,6 +263,43 @@ export function getPipIndexArgs(pypiMirror?: string, useChineseMirrors?: boolean
   return args
 }
 
+export function getPipFallbackIndexArgs(
+  pypiMirror?: string,
+  useChineseMirrors?: boolean
+): string[] | null {
+  const urls = mirrorUrls(pypiMirror, useChineseMirrors)
+  if (urls.length === 0) return null
+  return ['--index-url', PYPI_INDEX_URL, ...urls.flatMap((url) => ['--extra-index-url', url])]
+}
+
+export function parsePipFreeze(output: string): Record<string, string> {
+  const packages: Record<string, string> = Object.create(null)
+  for (const line of stripAnsi(output).split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    if (trimmed.startsWith('-e ')) {
+      const eggMatch = trimmed.match(/#egg=(.+)/)
+      if (eggMatch) {
+        const name = eggMatch[1]!.trim()
+        if (VALID_PIP_NAME.test(name)) packages[name] = trimmed
+      }
+      continue
+    }
+    const atMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*@\s*(.+)$/)
+    if (atMatch) {
+      const name = atMatch[1]!.trim()
+      if (VALID_PIP_NAME.test(name)) packages[name] = atMatch[2]!.trim()
+      continue
+    }
+    const eqIdx = trimmed.indexOf('==')
+    if (eqIdx > 0) {
+      const name = trimmed.slice(0, eqIdx).trim()
+      if (VALID_PIP_NAME.test(name)) packages[name] = trimmed.slice(eqIdx + 2)
+    }
+  }
+  return packages
+}
+
 export async function pipFreeze(
   uvPath: string,
   pythonPath: string
@@ -211,40 +308,16 @@ export async function pipFreeze(
     execFile(
       uvPath,
       ['pip', 'freeze', '--python', pythonPath],
-      { windowsHide: true, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+      { windowsHide: true, timeout: 60_000, maxBuffer: 10 * 1024 * 1024, env: uvEnv() },
       (err, stdout, stderr) => {
         if (err) {
-          const detail = stderr ? stderr.slice(0, 500) : err.message
-          return reject(new Error(`uv pip freeze failed: ${detail}`))
+          const raw = stderr ? stripAnsi(stderr).slice(0, 500) : err.message
+          return reject(new Error(`uv pip freeze failed: ${scrubAll(raw)}`))
         }
         resolve(stdout)
       }
     )
   })
 
-  const packages: Record<string, string> = {}
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    // Editable installs: "-e git+https://...@commit#egg=name"
-    if (trimmed.startsWith('-e ')) {
-      const eggMatch = trimmed.match(/#egg=(.+)/)
-      if (eggMatch) {
-        packages[eggMatch[1]!] = trimmed
-      }
-      continue
-    }
-    // PEP 508 direct references: "package @ git+https://..." or "package @ file:///..."
-    const atMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*@\s*(.+)$/)
-    if (atMatch) {
-      packages[atMatch[1]!] = atMatch[2]!.trim()
-      continue
-    }
-    // Standard: "package==version"
-    const eqIdx = trimmed.indexOf('==')
-    if (eqIdx > 0) {
-      packages[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 2)
-    }
-  }
-  return packages
+  return parsePipFreeze(output)
 }

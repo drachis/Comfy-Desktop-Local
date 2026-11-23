@@ -52,7 +52,6 @@ const probeVersion: VersionProbe = (candidate) =>
     )
   })
 
-/** First system Python that is new enough to run ComfyUI, or null. */
 export async function findBasePython(
   platform: NodeJS.Platform = process.platform,
   probe: VersionProbe = probeVersion
@@ -67,7 +66,6 @@ export async function findBasePython(
 
 export type TorchIndexChoice = { ok: true; indexUrl: string | null } | { ok: false }
 
-/** Map the user's PyTorch backend choice to a pip index URL. `null` means the default PyPI wheels. */
 export function resolveTorchIndex(choice: string, nvidiaPresent: boolean): TorchIndexChoice {
   const value = choice.trim().toLowerCase()
   if (value === '' || value === TORCH_BACKEND_AUTO) {
@@ -83,14 +81,8 @@ export function resolveTorchIndex(choice: string, nvidiaPresent: boolean): Torch
   return { ok: false }
 }
 
-/** The full CPython that uv downloads for the venv (3.12 has the widest custom node support). */
 export const MANAGED_PYTHON_VERSION = '3.12'
 
-/**
- * The uv shipped inside Comfy Desktop (resources/bootstrap-python), or null when absent.
- * Only uv is used from that folder: its bundled Python is a trimmed build with no unittest or
- * sqlite3, so PyTorch cannot import in a venv made from it.
- */
 export function findBundledUv(dir: string | null = defaultBootstrapDir()): string | null {
   if (!dir) return null
   const uv = process.platform === 'win32' ? path.join(dir, 'uv.exe') : path.join(dir, 'bin', 'uv')
@@ -110,13 +102,11 @@ interface Command {
   args: string[]
 }
 
-/** How to create a venv and install into it, for whichever Python is available. */
 interface Toolchain {
   createVenv(venvDir: string): Command
   pipInstall(venvPython: string, args: string[]): Command
 }
 
-/** uv fetches a managed Python if needed; `--clear` replaces a venv that is already there. */
 function uvToolchain(uv: string): Toolchain {
   return {
     createVenv: (venvDir) => ({
@@ -145,15 +135,12 @@ function venvPythonPath(venvDir: string): string {
 
 export interface CreateVenvOptions {
   installPath: string
-  /** Folder holding ComfyUI's main.py and requirements.txt. */
   comfyDir: string
   torchChoice: string
   tools: Pick<ActionTools, 'sendProgress' | 'sendOutput'>
-  /** Override where Desktop's bundled uv lives; `null` means none. Defaults to the app's own. */
   bootstrapDir?: string | null
 }
 
-/** Build `<installPath>/.venv` with PyTorch and ComfyUI's requirements. On success the record's `venvPath`. */
 export async function createVenv(
   opts: CreateVenvOptions
 ): Promise<ActionResult & { venvPath?: string }> {

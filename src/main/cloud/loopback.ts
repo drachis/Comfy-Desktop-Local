@@ -1,21 +1,17 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
+import { idpCallbackFailure, SignInFailure } from './signInFailure'
+
 export interface LoopbackListenerOptions {
-  /** The exact `state` value generated for this authorization request. */
   expectedState: string
-  /** How long to wait for the browser callback before giving up, in ms. */
   timeoutMs: number
+  signal?: AbortSignal
 }
 
 export interface LoopbackListener {
-  /** The `http://127.0.0.1:<port>/callback` URI to register as the redirect target. */
   redirectUri: string
-  /** Resolves with the authorization `code` on a matching callback; rejects on
-   *  an IdP error (matching state) or timeout. A callback with a wrong/missing
-   *  state is ignored (kept listening), never settling. Same promise every call. */
   waitForCode: () => Promise<{ code: string }>
-  /** Tear the listener down (idempotent); safe to call after settle. */
   close: () => void
 }
 
@@ -129,14 +125,13 @@ function html(kind: 'success' | 'error' | 'invalid'): string {
 </html>`
 }
 
-/**
- * Single-shot loopback HTTP listener for a PKCE redirect (RFC 8252 section 7.3): binds
- * `127.0.0.1` on an ephemeral port, waits for exactly one `GET /callback`,
- * validates `state`, and shuts down.
- */
 export function startLoopbackListener(options: LoopbackListenerOptions): Promise<LoopbackListener> {
-  const { expectedState, timeoutMs } = options
+  const { expectedState, timeoutMs, signal } = options
   return new Promise((resolveListener, rejectListener) => {
+    if (signal?.aborted) {
+      rejectListener(signal.reason)
+      return
+    }
     let settled = false
     let resolveCode!: (r: { code: string }) => void
     let rejectCode!: (e: Error) => void
@@ -149,12 +144,11 @@ export function startLoopbackListener(options: LoopbackListenerOptions): Promise
     let server: Server | null = null
     const close = (): void => {
       clearTimeout(timeoutHandle)
+      signal?.removeEventListener('abort', cancel)
       if (server) {
         try {
           server.close()
-        } catch {
-          /* best-effort */
-        }
+        } catch {}
         server = null
       }
     }
@@ -163,9 +157,6 @@ export function startLoopbackListener(options: LoopbackListenerOptions): Promise
       settled = true
       close()
       rejectCode(err)
-      // If listen() never completed, the caller is still awaiting the outer
-      // promise; reject it too so the timeout bounds listener startup as well.
-      // A no-op once the listener has already resolved.
       rejectListener(err)
     }
     const succeed = (code: string): void => {
@@ -182,9 +173,13 @@ export function startLoopbackListener(options: LoopbackListenerOptions): Promise
       fail(err)
     }
     const timeoutHandle = setTimeout(
-      () => fail(new Error('Loopback OAuth callback timed out')),
+      () => fail(new SignInFailure('Loopback OAuth callback timed out', 'timeout')),
       timeoutMs
     )
+    function cancel(): void {
+      fail(signal?.reason)
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
 
     function handle(req: IncomingMessage, res: ServerResponse): void {
       const remote = req.socket.remoteAddress ?? ''
@@ -207,8 +202,6 @@ export function startLoopbackListener(options: LoopbackListenerOptions): Promise
         res.end()
         return
       }
-      // Wrong/missing state = not our callback (a port scan, prefetch, or another
-      // flow). Refuse it but KEEP LISTENING so an outsider can't abort our sign-in.
       if (params.get('state') !== expectedState) {
         res.statusCode = 400
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
@@ -218,12 +211,12 @@ export function startLoopbackListener(options: LoopbackListenerOptions): Promise
       }
       const idpError = params.get('error')
       if (idpError) {
-        failRequest(res, 200, new Error(idpError))
+        failRequest(res, 200, idpCallbackFailure(idpError))
         return
       }
       const code = params.get('code')
       if (!code) {
-        failRequest(res, 400, new Error('missing authorization code'))
+        failRequest(res, 400, new SignInFailure('missing authorization code', 'idp_error'))
         return
       }
       res.statusCode = 200

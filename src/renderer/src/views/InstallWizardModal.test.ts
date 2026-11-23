@@ -1,32 +1,231 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 import { createPinia, setActivePinia } from 'pinia'
 
-import { en } from '../lib/i18nMessages.ts'
 import InstallWizardModal from './InstallWizardModal.vue'
-import BaseSelect from '../components/ui/BaseSelect.vue'
-import BrandVariantList from '../components/BrandVariantList.vue'
+import BaseSelect, { type BaseSelectOption } from '../components/ui/BaseSelect.vue'
 import PathDiskInfo from '../components/PathDiskInfo.vue'
 import { useModal } from '../composables/useModal'
+import { useAuthStore } from '../stores/authStore'
+import { useDashboardScopeStore } from '../stores/dashboardScopeStore'
+import type { SavedSetup } from '../lib/setupPlan'
 
-function makeI18n() {
-  return createI18n({ legacy: false, locale: 'en', messages: { en } })
-}
-
-function mountModal() {
+function mountModal(
+  props: { hideBackToDashboard?: boolean } = {},
+  options: { attachTo?: HTMLElement } = {}
+) {
   const pinia = createPinia()
   setActivePinia(pinia)
   return mount(InstallWizardModal, {
+    props,
+    ...options,
     global: {
-      plugins: [makeI18n(), pinia],
+      plugins: [pinia],
       stubs: {
         BrandTakeoverLayout: {
-          template: '<div><slot /><slot name="footer-left" /><slot name="footer" /></div>'
+          template: '<div class="brand-takeover-stub"><slot /></div>'
+        },
+        DesktopDialogSurface: {
+          template: '<div class="dialog-surface-stub"><slot /></div>'
         }
       }
     }
   })
+}
+
+function savedSetups(wrapper: ReturnType<typeof mountModal>): SavedSetup[] {
+  return (wrapper.emitted('save-setup') ?? []).map(([saved]) => saved as SavedSetup)
+}
+
+async function showChangeSetup(wrapper: ReturnType<typeof mountModal>): Promise<void> {
+  await wrapper.get('[data-testid="config-change-setup"]').trigger('click')
+  await flushPromises()
+}
+
+const NEW_INSTALL = 'Install a new build'
+const ALREADY_HAVE = 'Use an existing build'
+const CONNECT_TO_SERVER = 'Connect to a server'
+
+async function startFrom(wrapper: ReturnType<typeof mountModal>, label: string): Promise<void> {
+  const option = wrapper
+    .get('[data-testid="config-start-from"]')
+    .findAll('button')
+    .find((button) => button.text() === label)
+  if (!option) throw new Error(`Start from has no option named ${label}`)
+  await option.trigger('click')
+  await flushPromises()
+}
+
+type ModalWrapper = ReturnType<typeof mountModal>
+
+function sourceSelect(wrapper: ModalWrapper) {
+  const select = wrapper
+    .findAllComponents(BaseSelect)
+    .find((candidate) =>
+      (candidate.props('options') as BaseSelectOption[]).some((option) =>
+        option.testId?.includes('install-source')
+      )
+    )
+  if (!select) throw new Error('the Source dropdown is missing')
+  return select
+}
+
+function sourceOption(wrapper: ModalWrapper, testId: string): BaseSelectOption {
+  const option = (sourceSelect(wrapper).props('options') as BaseSelectOption[]).find(
+    (candidate) => candidate.testId === testId
+  )
+  if (!option) throw new Error(`the Source dropdown has no ${testId}`)
+  return option
+}
+
+function hasSourceOption(wrapper: ModalWrapper, testId: string): boolean {
+  return (sourceSelect(wrapper).props('options') as BaseSelectOption[]).some(
+    (option) => option.testId === testId
+  )
+}
+
+function sourceLabels(wrapper: ModalWrapper): string[] {
+  return (sourceSelect(wrapper).props('options') as BaseSelectOption[]).map(
+    (option) => option.label
+  )
+}
+
+function sourceChecked(wrapper: ModalWrapper, testId: string): string {
+  return String(sourceSelect(wrapper).props('modelValue') === sourceOption(wrapper, testId).value)
+}
+
+async function pickSource(wrapper: ModalWrapper, testId: string): Promise<void> {
+  sourceSelect(wrapper).vm.$emit('update:modelValue', sourceOption(wrapper, testId).value)
+  await flushPromises()
+}
+
+function hardwareSelect(wrapper: ModalWrapper) {
+  const select = wrapper
+    .findAllComponents(BaseSelect)
+    .find((candidate) =>
+      (candidate.props('options') as BaseSelectOption[]).some(
+        (option) => option.icon && !option.testId
+      )
+    )
+  if (!select) throw new Error('the Hardware dropdown is missing')
+  return select
+}
+
+function hardwareLabels(wrapper: ModalWrapper): string[] {
+  return (hardwareSelect(wrapper).props('options') as BaseSelectOption[]).map(
+    (option) => option.label
+  )
+}
+
+function pickedHardware(wrapper: ModalWrapper): string | undefined {
+  const select = hardwareSelect(wrapper)
+  return (select.props('options') as BaseSelectOption[]).find(
+    (option) => option.value === select.props('modelValue')
+  )?.label
+}
+
+async function pickHardware(wrapper: ModalWrapper, label: string): Promise<void> {
+  const select = hardwareSelect(wrapper)
+  const option = (select.props('options') as BaseSelectOption[]).find((candidate) =>
+    candidate.label.includes(label)
+  )
+  if (!option) throw new Error(`no hardware named ${label}`)
+  select.vm.$emit('update:modelValue', option.value)
+  await flushPromises()
+}
+
+function workspaceBuildSelect(wrapper: ModalWrapper) {
+  return wrapper.get('[data-testid="workspace-build-field"]').getComponent(BaseSelect)
+}
+
+function startFromLabels(wrapper: ReturnType<typeof mountModal>): string[] {
+  return wrapper
+    .get('[data-testid="config-start-from"]')
+    .findAll('button')
+    .map((button) => button.text())
+}
+
+function chosenStartFrom(wrapper: ReturnType<typeof mountModal>): string | undefined {
+  return wrapper
+    .get('[data-testid="config-start-from"]')
+    .findAll('button')
+    .find((button) => button.attributes('data-state') === 'on')
+    ?.text()
+}
+
+function existingSelect(wrapper: ReturnType<typeof mountModal>) {
+  const select = wrapper
+    .findAllComponents(BaseSelect)
+    .find((candidate) => candidate.vm.$attrs['data-testid'] === 'existing-comfy-tabs')
+  if (!select) throw new Error('the Where it is dropdown is missing')
+  return select
+}
+
+function existingComfyCards(wrapper: ReturnType<typeof mountModal>): string[] {
+  return (existingSelect(wrapper).props('options') as BaseSelectOption[]).map(
+    (option) => option.label
+  )
+}
+
+function existingOption(wrapper: ReturnType<typeof mountModal>, testId: string): BaseSelectOption {
+  const option = (existingSelect(wrapper).props('options') as BaseSelectOption[]).find(
+    (candidate) => candidate.testId === testId
+  )
+  if (!option) throw new Error(`the Where it is dropdown has no ${testId}`)
+  return option
+}
+
+async function pickExisting(wrapper: ReturnType<typeof mountModal>, testId: string): Promise<void> {
+  existingSelect(wrapper).vm.$emit('update:modelValue', existingOption(wrapper, testId).value)
+  await flushPromises()
+}
+
+function startFromIsHeld(wrapper: ReturnType<typeof mountModal>): boolean {
+  return wrapper
+    .get('[data-testid="config-start-from"]')
+    .findAll('button')
+    .every((button) => button.attributes('disabled') !== undefined)
+}
+
+function mockSnapshotFile(): Record<string, ReturnType<typeof vi.fn>> {
+  const api = window.api as unknown as Record<string, ReturnType<typeof vi.fn>>
+  api.previewSnapshotFile = vi.fn().mockResolvedValue({
+    ok: true,
+    preview: {
+      filePath: '/tmp/snap.json',
+      installationName: 'Studio',
+      snapshotCount: 1,
+      snapshots: [],
+      newestSnapshot: {
+        comfyuiVersion: 'v0.4.2',
+        pythonVersion: '3.12',
+        createdAt: '2026-01-01T00:00:00Z',
+        updateChannel: 'stable',
+        comfyui: { variant: 'mps', releaseTag: '' },
+        customNodes: [],
+        pipPackages: {},
+        pipPackageCount: 0
+      }
+    }
+  })
+  api.getFieldOptions = vi.fn(async (_source: string, fieldId: string) =>
+    fieldId === 'release'
+      ? [{ value: 'stable', label: 'Stable' }]
+      : [{ value: 'mps', label: 'Apple Silicon (MPS)', data: { variantId: 'mps' } }]
+  )
+  return api
+}
+
+function mockPickedFolder(): Record<string, ReturnType<typeof vi.fn>> {
+  const api = window.api as unknown as Record<string, ReturnType<typeof vi.fn>>
+  api.probeInstallation = vi
+    .fn()
+    .mockResolvedValue([
+      { sourceId: 'portable', sourceLabel: 'Portable', installPath: '/home/user/Picked' }
+    ])
+  api.trackInstallation = vi.fn().mockResolvedValue({ ok: true })
+  api.getUniqueName = vi.fn(async (base: string) => base)
+  return api
 }
 
 beforeEach(() => {
@@ -40,6 +239,7 @@ beforeEach(() => {
     getFieldOptions: vi.fn().mockResolvedValue([]),
     validateHardware: vi.fn().mockResolvedValue({ supported: true }),
     getSetting: vi.fn().mockResolvedValue(false),
+    onSettingsChanged: vi.fn(() => () => {}),
     getInstallationsSummary: vi.fn().mockResolvedValue({ localCount: 0 }),
     getUniqueName: vi.fn().mockResolvedValue('ComfyUI'),
     getDiskSpace: vi.fn().mockResolvedValue(null),
@@ -65,13 +265,555 @@ beforeEach(() => {
 })
 
 describe('InstallWizardModal heading', () => {
-  it('uses the new-instance title and local-install subtitle', async () => {
+  it('opens Change from Set up as one sheet with the name on top, every option, and Save or Discard', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    expect(wrapper.get('.setup-modal-title').text()).toBe('Change setup')
+    expect(wrapper.find('.config-name-card').exists()).toBe(false)
+    const rows = wrapper
+      .get('[data-testid="config-change-form"]')
+      .findAll('.config-label')
+      .map((label) => label.text())
+    expect(rows).toEqual(['Name', 'Source', 'Location', 'Hardware'])
+    expect(wrapper.find('.config-name-row #inst-name-standalone').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="install-source-tabs"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="config-summary"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="config-change-setup"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="config-discard-changes"]').text()).toBe('Discard')
+    expect(wrapper.get('[data-testid="config-save-changes"]').text()).toBe('Save changes')
+    expect(wrapper.find('.config-continue').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('saves the picked setup back to Set up without asking for the EULA or installing', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        value: 'nvidia',
+        label: 'NVIDIA',
+        recommended: true,
+        data: { variantId: 'win-nvidia', downloadFiles: [{ size: 1000 }] }
+      },
+      { value: 'cpu', label: 'CPU', data: { variantId: 'win-cpu', downloadFiles: [{ size: 400 }] } }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, needsConsent: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="config-consent-tos"]').exists()).toBe(false)
+    await pickHardware(wrapper, 'CPU')
+    await wrapper.get('#inst-name-standalone').setValue('Studio')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(window.api.addInstallation).not.toHaveBeenCalled()
+    expect(window.api.installInstance).not.toHaveBeenCalled()
+    expect(wrapper.emitted('show-progress')).toBeUndefined()
+    const [saved] = savedSetups(wrapper)
+    expect(saved?.plan).toMatchObject({
+      sourceId: 'standalone',
+      installRoot: '/home/user/ComfyUI',
+      name: 'Studio',
+      downloadBytes: 400,
+      requiredBytes: 900,
+      hardwareDetected: false,
+      selections: { variant: expect.objectContaining({ value: 'cpu' }) }
+    })
+    expect(saved?.draft.instName).toBe('Studio')
+    wrapper.unmount()
+  })
+
+  it('does not call the default hardware Detected after it was changed by hand and picked again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'win-amd', label: 'AMD', data: { variantId: 'win-amd', downloadFiles: [] } },
+      {
+        value: 'win-nvidia',
+        label: 'NVIDIA',
+        data: { variantId: 'win-nvidia', downloadFiles: [] }
+      }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, needsConsent: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    await pickHardware(wrapper, 'NVIDIA')
+    await pickHardware(wrapper, 'AMD')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    const [saved] = savedSetups(wrapper)
+    expect(saved?.plan).toMatchObject({
+      hardwareDetected: false,
+      selections: { variant: expect.objectContaining({ value: 'win-amd' }) }
+    })
+    wrapper.unmount()
+  })
+
+  it('drops Detected from the summary once the hardware was changed by hand, even back to the default', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'win-amd', label: 'AMD', data: { variantId: 'win-amd', downloadFiles: [] } },
+      {
+        value: 'win-nvidia',
+        label: 'NVIDIA',
+        data: { variantId: 'win-nvidia', downloadFiles: [] }
+      }
+    ])
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    const hardwareRow = () => wrapper.get('[data-testid="config-summary-standalone-hardware"]')
+    expect(hardwareRow().text()).toBe('HardwareAMDDetected')
+
+    await showChangeSetup(wrapper)
+    await pickHardware(wrapper, 'NVIDIA')
+    await pickHardware(wrapper, 'AMD')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(hardwareRow().text()).toBe('HardwareAMD')
+    wrapper.unmount()
+  })
+
+  it('reopens Change on the setup saved before, ready to save again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'nvidia', label: 'NVIDIA', recommended: true, data: { variantId: 'win-nvidia' } },
+      { value: 'cpu', label: 'CPU', data: { variantId: 'win-cpu' } }
+    ])
+    const first = mountModal({ hideBackToDashboard: true })
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    await pickHardware(first, 'CPU')
+    await first.get('#inst-name-standalone').setValue('Studio')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+
+    const again = mountModal({ hideBackToDashboard: true })
+    await again.vm.open({ cameFromSetup: true, entrypoint: 'first_use', restore: saved.draft })
+    await flushPromises()
+
+    expect(pickedHardware(again)).toBe('CPU')
+    expect((again.get('#inst-name-standalone').element as HTMLInputElement).value).toBe('Studio')
+    await again.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(savedSetups(again)[0]?.plan.selections.variant?.value).toBe('cpu')
+    again.unmount()
+  })
+
+  it('opens Change from Set up on the folder picked there with Change location', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({
+      cameFromSetup: true,
+      entrypoint: 'first_use',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    await flushPromises()
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(savedSetups(wrapper)[0]?.plan.installRoot).toBe('/Volumes/Big/ComfyUI')
+    wrapper.unmount()
+  })
+
+  it('keeps the saved choices when hardware picked after reopening Change is discarded', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'nvidia', label: 'NVIDIA', recommended: true, data: { variantId: 'win-nvidia' } },
+      { value: 'cpu', label: 'CPU', data: { variantId: 'win-cpu' } }
+    ])
+    const pick = pickHardware
+    const checkedHardware = (wrapper: ModalWrapper) => [pickedHardware(wrapper)]
+
+    const first = mountModal({ hideBackToDashboard: true })
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    await pick(first, 'CPU')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+
+    const edited = mountModal({ hideBackToDashboard: true })
+    await edited.vm.open({ cameFromSetup: true, entrypoint: 'first_use', restore: saved.draft })
+    await flushPromises()
+    await pick(edited, 'NVIDIA')
+    await edited.get('[data-testid="config-discard-changes"]').trigger('click')
+    expect(edited.emitted('back-to-setup')).toEqual([[]])
+    edited.unmount()
+
+    const again = mountModal({ hideBackToDashboard: true })
+    await again.vm.open({ cameFromSetup: true, entrypoint: 'first_use', restore: saved.draft })
+    await flushPromises()
+    expect(checkedHardware(again)).toEqual([expect.stringContaining('CPU')])
+    again.unmount()
+  })
+
+  it('holds Discard and a second Save while Save is still checking the folder', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    let finishFolderCheck: (issues: string[]) => void = () => {}
+    ;(window.api.validateInstallPath as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishFolderCheck = resolve
+      })
+    )
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(
+      wrapper.get('[data-testid="config-discard-changes"]').attributes('disabled')
+    ).toBeDefined()
+    expect(wrapper.get('[data-testid="config-save-changes"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+
+    finishFolderCheck([])
+    await flushPromises()
+    expect(wrapper.emitted('back-to-setup')).toBeUndefined()
+    expect(savedSetups(wrapper)).toHaveLength(1)
+    expect(window.api.validateInstallPath).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('does not ask for the EULA again when it was accepted on Set up', async () => {
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, needsConsent: false, entrypoint: 'first_use' })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="config-consent-tos"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('returns to Set up as it was from Discard changes in the first-use Change sheet', async () => {
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+
+    expect(wrapper.emitted('back-to-setup')).toEqual([[]])
+    expect(wrapper.emitted('save-setup')).toBeUndefined()
+    expect(wrapper.emitted('close')).toBeUndefined()
+    expect(window.api.addInstallation).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('uses the install-build title and local-install subtitle', async () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
 
-    expect(wrapper.get('.brand-title').text()).toBe('Create a New Instance')
-    expect(wrapper.get('.brand-lead').text()).toBe('Set up a fresh ComfyUI environment.')
+    expect(wrapper.get('.setup-modal-title').text()).toBe('New build')
+    expect(wrapper.find('[aria-label="New build"]').exists()).toBe(true)
+    expect(wrapper.get('.setup-modal-lead').text()).toBe('Set up a fresh ComfyUI install.')
+    expect(wrapper.find('[data-testid="config-summary"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="config-change-form"]').exists()).toBe(false)
+  })
+
+  it('titles the close button Close, since closing New build only dismisses it', async () => {
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const close = wrapper.get('.setup-modal-close')
+    expect(close.attributes('title')).toBe('Close')
+    expect(close.attributes('aria-label')).toBe('Close')
+    await close.trigger('click')
+    expect(wrapper.emitted('close')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('sums up the detected setup and opens every field from Change', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'mps', label: 'Apple Silicon (MPS)', description: '773 MB', recommended: true }
+    ])
+    ;(window.api.detectGPU as ReturnType<typeof vi.fn>).mockResolvedValue({
+      label: 'Apple Silicon'
+    })
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="detected-gpu-field"]').text()).toBe('Apple Silicon')
+    expect(wrapper.get('.config-machine-kicker').text()).toBe('Detected')
+    const rows = wrapper.findAll('.config-summary-row').map((row) => row.text())
+    expect(wrapper.get('.config-name-card #inst-name-standalone').exists()).toBe(true)
+    expect(rows[0]).toBe('HardwareApple Silicon (MPS)Detected')
+    expect(rows[2]).toContain('/home/user/ComfyUI')
+    expect(wrapper.get('[data-testid="config-summary"]').text()).not.toContain('773 MB')
+    expect(wrapper.find('#source-fields').exists()).toBe(false)
+    expect(wrapper.get('.config-continue').text()).toBe('Install')
+
+    await showChangeSetup(wrapper)
+
+    expect(wrapper.get('.setup-modal-title').text()).toBe('Change setup')
+    expect(wrapper.get('#source-fields').text()).toContain('Apple Silicon (MPS)')
+    expect(wrapper.find('[data-testid="install-location-field"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    expect(wrapper.find('[data-testid="config-summary"]').exists()).toBe(true)
+  })
+
+  it('sums up a standalone build like first run: Hardware, Version with the release as its note, then Location', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [
+          { id: 'release', label: 'Release', type: 'select' },
+          { id: 'comfyVersion', label: 'Version', type: 'select' },
+          { id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }
+        ]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_source: string, fieldId: string) => {
+        if (fieldId === 'release') {
+          return [
+            {
+              value: 'stable',
+              label: 'Stable',
+              description: 'Tested releases, recommended for most users',
+              recommended: true
+            }
+          ]
+        }
+        if (fieldId === 'comfyVersion') {
+          return [
+            { value: 'v0.46.1', label: 'v0.46.1', description: 'Latest stable', recommended: true }
+          ]
+        }
+        return [
+          {
+            value: 'amd',
+            label: 'AMD',
+            description: 'ComfyUI 0.46.1 · Python 3.13.12 · 8655 MB',
+            recommended: true
+          }
+        ]
+      }
+    )
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const rows = wrapper.findAll('.config-summary-row')
+    expect(rows.map((row) => row.get('span').text())).toEqual(['Hardware', 'Version', 'Location'])
+    expect(rows[0].text()).toBe('HardwareAMDDetected')
+    expect(rows[1].text()).toBe('VersionComfyUI v0.46.1Stable')
+    const summary = wrapper.get('[data-testid="config-summary"]').text()
+    for (const description of [
+      'Tested releases, recommended for most users',
+      'Latest stable',
+      'ComfyUI 0.46.1 · Python 3.13.12 · 8655 MB'
+    ]) {
+      expect(summary).not.toContain(description)
+    }
+  })
+
+  it('notes the default hardware as Detected, like first run, even when no option is marked recommended', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        value: 'win-amd',
+        label: 'AMD',
+        description: 'ComfyUI 0.46.1  ·  Python 3.13.12  ·  8655 MB',
+        data: { variantId: 'win-amd', downloadFiles: [{ size: 8655 * 1048576 }] }
+      },
+      {
+        value: 'win-cpu',
+        label: 'CPU',
+        description: 'ComfyUI 0.46.1  ·  Python 3.13.12  ·  612 MB',
+        data: { variantId: 'win-cpu', downloadFiles: [{ size: 612 * 1048576 }] }
+      }
+    ])
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const hardwareRow = () => wrapper.get('[data-testid="config-summary-standalone-hardware"]')
+    expect(hardwareRow().text()).toBe('HardwareAMDDetected')
+
+    await showChangeSetup(wrapper)
+    await pickHardware(wrapper, 'CPU')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(hardwareRow().text()).toBe('HardwareCPUNo GPU acceleration')
+  })
+
+  it('says no hardware options are available, instead of checking forever, when the catalog has none', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([])
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const hardware = wrapper.get('[data-testid="config-summary-standalone-hardware"]').text()
+    expect(hardware).toBe('HardwareNo options available')
+    expect(hardware).not.toContain('Checking')
+  })
+
+  it('browses for a new location straight from the summary', async () => {
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    await wrapper.get('.config-summary-location .config-path-browse').trigger('click')
+    await flushPromises()
+
+    expect(window.api.browseFolder).toHaveBeenCalledWith('/home/user/ComfyUI')
+    expect(wrapper.get('.config-summary-location').text()).toContain('/home/user/Picked')
+  })
+
+  it('keeps a folder browsed while the setup is still loading', async () => {
+    let finishSources: (sources: unknown[]) => void = () => {}
+    const sources = (window.api.getSources as ReturnType<typeof vi.fn>).getMockImplementation()
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSources = (value) => resolve(value)
+        })
+    )
+    const wrapper = mountModal()
+    const opening = wrapper.vm.open({ installRoot: '/Volumes/Big/ComfyUI' })
+    await flushPromises()
+
+    await wrapper.get('.config-path-browse').trigger('click')
+    await flushPromises()
+    finishSources(((await sources?.()) as unknown[]) ?? [])
+    await opening
+    await flushPromises()
+
+    expect(wrapper.get('.config-summary-location').text()).toContain('/home/user/Picked')
+  })
+
+  it('keeps a folder browsed while a saved setup is still being restored', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const first = mountModal({ hideBackToDashboard: true })
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    await pickHardware(first, 'CPU')
+    await first.get('#inst-name-standalone').setValue('Studio')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+
+    let finishSources: (sources: unknown[]) => void = () => {}
+    const sources = (window.api.getSources as ReturnType<typeof vi.fn>).getMockImplementation()
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSources = (value) => resolve(value)
+        })
+    )
+    const again = mountModal()
+    const opening = again.vm.open({ restore: saved.draft, installRoot: '/Volumes/Big/ComfyUI' })
+    await flushPromises()
+
+    await again.get('.config-path-browse').trigger('click')
+    await flushPromises()
+    finishSources(((await sources?.()) as unknown[]) ?? [])
+    await opening
+    await flushPromises()
+
+    expect(again.get('.config-summary-location').text()).toContain('/home/user/Picked')
   })
 
   it('shows signed-out local fields directly like the Public workspace tab', async () => {
@@ -79,7 +821,7 @@ describe('InstallWizardModal heading', () => {
       {
         id: 'standalone',
         label: 'Standalone',
-        fields: [{ id: 'comfyVersion', label: 'ComfyUI version', type: 'select' }]
+        fields: [{ id: 'comfyVersion', label: 'Version', type: 'select' }]
       }
     ])
     ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
@@ -88,6 +830,7 @@ describe('InstallWizardModal heading', () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
+    await showChangeSetup(wrapper)
 
     expect(wrapper.get('.config-advanced').classes()).toEqual(
       expect.arrayContaining(['config-advanced--direct', 'is-open'])
@@ -95,19 +838,10 @@ describe('InstallWizardModal heading', () => {
     expect(wrapper.find('.config-advanced__summary').exists()).toBe(false)
     const fieldLabel = wrapper.get('#source-fields label')
     expect(fieldLabel.classes()).toContain('config-label')
-    expect(fieldLabel.text()).toBe('ComfyUI version')
-    expect(
-      wrapper
-        .get('[data-testid="install-source-tabs"]')
-        .findAll('button')
-        .map((button) => button.text())
-    ).toEqual(['Public Builds', 'Managed Builds'])
-    expect(
-      wrapper.get('[data-testid="install-source-standalone"]').attributes('aria-checked')
-    ).toBe('true')
-    expect(
-      wrapper.get('[data-testid="workspace-install-source-managed"]').attributes('aria-checked')
-    ).toBe('false')
+    expect(fieldLabel.text()).toBe('Version')
+    expect(sourceLabels(wrapper)).toEqual(['Official release', "Your team's builds"])
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('false')
   })
 
   it('starts sign-in when a signed-out user selects Managed Builds', async () => {
@@ -126,15 +860,14 @@ describe('InstallWizardModal heading', () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
+    await showChangeSetup(wrapper)
 
-    await wrapper.get('[data-testid="workspace-install-source-managed"]').trigger('click')
+    await pickSource(wrapper, 'workspace-install-source-managed')
     await flushPromises()
 
     expect(window.api.comfybuilder.signIn).toHaveBeenCalledOnce()
     expect(window.api.comfybuilder.listBuilds).toHaveBeenCalledOnce()
-    expect(
-      wrapper.get('[data-testid="workspace-install-source-managed"]').attributes('aria-checked')
-    ).toBe('true')
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
     expect(wrapper.get('[data-testid="workspace-build-field"]').text()).toContain('Ready Build')
   })
 
@@ -153,8 +886,9 @@ describe('InstallWizardModal heading', () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
+    await showChangeSetup(wrapper)
 
-    await wrapper.get('[data-testid="workspace-install-source-managed"]').trigger('click')
+    await pickSource(wrapper, 'workspace-install-source-managed')
     await flushPromises()
 
     const modal = useModal()
@@ -170,19 +904,23 @@ describe('InstallWizardModal heading', () => {
 })
 
 describe('InstallWizardModal install-location field', () => {
-  it('renders the default install location as a clickable path that opens the folder', async () => {
+  it('renders the default install location as plain path text with a reveal button that opens the folder', async () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
+    await showChangeSetup(wrapper)
 
     expect(wrapper.get('[data-testid="install-location-field"] .config-label').text()).toBe(
-      'Install location'
+      'Location'
     )
-    const pathBtn = wrapper.find('button.config-path-open')
-    expect(pathBtn.exists()).toBe(true)
-    expect(pathBtn.text()).toBe('/home/user/ComfyUI')
+    const pathText = wrapper.find('[data-testid="install-location-field"] .config-path-open')
+    expect(pathText.exists()).toBe(true)
+    expect(pathText.text()).toBe('/home/user/ComfyUI')
+    expect(pathText.element.tagName).not.toBe('BUTTON')
 
-    await pathBtn.trigger('click')
+    await pathText.trigger('click')
+    expect(window.api.openPath).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="install-location-field"] .config-path-reveal').trigger('click')
     expect(window.api.openPath).toHaveBeenCalledWith('/home/user/ComfyUI')
   })
 
@@ -191,10 +929,61 @@ describe('InstallWizardModal install-location field', () => {
     const wrapper = mountModal()
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
+    await showChangeSetup(wrapper)
 
-    expect(wrapper.find('button.config-path-open').exists()).toBe(false)
-    expect(wrapper.find('.config-path-open--static').exists()).toBe(true)
+    expect(wrapper.find('.config-path-open').exists()).toBe(false)
     expect(window.api.openPath).not.toHaveBeenCalled()
+  })
+
+  describe('required space on the summary', () => {
+    const hardwareSource = {
+      id: 'standalone',
+      label: 'Standalone',
+      fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+    }
+
+    async function openSummaryWithFreeSpace(free: number) {
+      ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([hardwareSource])
+      ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          value: 'mac-mps',
+          label: 'Apple Silicon',
+          recommended: true,
+          data: { variantId: 'mac-mps', downloadFiles: [{ size: 8_000_000_000 }] }
+        }
+      ])
+      ;(window.api.getDiskSpace as ReturnType<typeof vi.fn>).mockResolvedValue({
+        free,
+        total: 1_000_000_000_000
+      })
+      const wrapper = mountModal()
+      ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+      await flushPromises()
+      await vi.waitFor(() =>
+        expect(wrapper.get('.config-summary-location').text()).toContain('free')
+      )
+      return wrapper
+    }
+
+    it('shows only the free space when the build fits', async () => {
+      const wrapper = await openSummaryWithFreeSpace(500_000_000_000)
+
+      const location = wrapper.get('.config-summary-location').text()
+      expect(location).toContain('466 GB free')
+      expect(location).not.toContain('16.76 GB')
+      expect(wrapper.find('.config-path-required').exists()).toBe(false)
+    })
+
+    it('is named once, as a warning, when the disk is short', async () => {
+      const wrapper = await openSummaryWithFreeSpace(5_000_000_000)
+
+      const location = wrapper.get('.config-summary-location').text()
+      expect(wrapper.get('.config-path-required').text()).toBe(
+        'Only 5 GB free, about 16.76 GB needed to install'
+      )
+      expect(location).toContain('5 GB free')
+      expect(location.split('16.76 GB')).toHaveLength(2)
+    })
   })
 })
 
@@ -217,6 +1006,7 @@ describe('InstallWizardModal workspace Builds', () => {
       wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
     ).open({ workspaceId: 'w1' })
     await flushPromises()
+    await showChangeSetup(wrapper)
     return wrapper
   }
 
@@ -224,7 +1014,7 @@ describe('InstallWizardModal workspace Builds', () => {
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: 'standalone', label: 'Standalone', fields: [] },
       { id: 'portable', label: 'Portable', fields: [] },
-      { id: 'remote', label: 'Remote Connection', fields: [] }
+      { id: 'remote', label: 'Remote connection', skipInstall: true, fields: [] }
     ])
     signInToWorkspace([
       { id: 'ready', name: 'Ready Build', state: 'installable' },
@@ -240,24 +1030,21 @@ describe('InstallWizardModal workspace Builds', () => {
       wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
     ).open({ workspaceId: 'w1' })
     await flushPromises()
+    await showChangeSetup(wrapper)
 
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('false')
+    expect(sourceLabels(wrapper)).toEqual(['Official release', "Your team's builds", 'Portable'])
+    expect(chosenStartFrom(wrapper)).toBe(NEW_INSTALL)
     expect(
-      wrapper.get('[data-testid="workspace-install-source-managed"]').attributes()
-    ).toMatchObject({ 'aria-checked': 'true' })
-    expect(
-      wrapper.get('[data-testid="install-source-standalone"]').attributes('aria-checked')
-    ).toBe('false')
-    expect(
-      wrapper
-        .get('[data-testid="install-source-tabs"]')
-        .findAll('button')
-        .map((button) => button.text())
-    ).toEqual(['Public Builds', 'Managed Builds', 'Remote Connection', 'Portable'])
-    expect(wrapper.get('[data-testid="install-source-tabs"]').text()).not.toContain('RECOMMENDED')
-    expect(wrapper.find('[data-testid="workspace-install-source-public"]').exists()).toBe(false)
+      (sourceSelect(wrapper).props('options') as BaseSelectOption[]).every(
+        (option) => !option.badge
+      )
+    ).toBe(true)
+    expect(hasSourceOption(wrapper, 'workspace-install-source-public')).toBe(false)
     expect(wrapper.find('.config-advanced').exists()).toBe(false)
     expect(wrapper.get('[data-testid="workspace-build-field"] label').text()).toBe('Release')
-    const buildSelect = wrapper.getComponent(BaseSelect)
+    const buildSelect = workspaceBuildSelect(wrapper)
     expect(buildSelect.props('options')).toEqual([
       { value: 'ready', label: 'Ready Build' },
       { value: 'installed', label: 'Installed Build' },
@@ -267,7 +1054,7 @@ describe('InstallWizardModal workspace Builds', () => {
     expect(buildSelect.props('modelValue')).toBe('ready')
   })
 
-  it('switches directly from Managed to a peer source tab', async () => {
+  it('goes from a team build to a server and back, then on to a peer source tab', async () => {
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
         id: 'standalone',
@@ -276,7 +1063,7 @@ describe('InstallWizardModal workspace Builds', () => {
       },
       {
         id: 'remote',
-        label: 'Remote Connection',
+        label: 'Remote connection',
         skipInstall: true,
         fields: [{ id: 'url', label: 'Server URL', type: 'text' }]
       }
@@ -284,25 +1071,98 @@ describe('InstallWizardModal workspace Builds', () => {
     signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
     const wrapper = await openWorkspaceModal()
 
-    await wrapper.get('[data-testid="install-source-remote"]').trigger('click')
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
     await flushPromises()
 
-    expect(
-      wrapper.get('[data-testid="workspace-install-source-managed"]').attributes('aria-checked')
-    ).toBe('false')
-    expect(wrapper.get('[data-testid="install-source-remote"]').attributes('aria-checked')).toBe(
-      'true'
+    expect(existingSelect(wrapper).props('modelValue')).toBe(
+      existingOption(wrapper, 'install-source-remote').value
     )
+    expect(wrapper.find('[data-testid="install-source-tabs"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="workspace-build-field"]').exists()).toBe(false)
     expect(wrapper.get('#source-fields').text()).toContain('Server URL')
     expect(window.api.getFieldOptions).not.toHaveBeenCalled()
     expect(window.api.validateHardware).not.toHaveBeenCalled()
 
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
+    expect(wrapper.find('[data-testid="workspace-build-field"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="existing-comfy-tabs"]').exists()).toBe(false)
+
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
 
     expect(window.api.validateHardware).toHaveBeenCalledOnce()
     expect(window.api.getFieldOptions).toHaveBeenCalledOnce()
+  })
+
+  it('comes back from a server to the team build and the location that were picked', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] },
+      {
+        id: 'remote',
+        label: 'Remote connection',
+        skipInstall: true,
+        fields: [{ id: 'url', label: 'Server URL', type: 'text' }]
+      }
+    ])
+    signInToWorkspace([
+      { id: 'first', name: 'First', state: 'installable' },
+      { id: 'second', name: 'Second', state: 'installable' }
+    ])
+    const wrapper = await openWorkspaceModal()
+    workspaceBuildSelect(wrapper).vm.$emit('update:modelValue', 'second')
+    await wrapper.get('[data-testid="config-path-input"] .config-path-browse').trigger('click')
+    await flushPromises()
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(workspaceBuildSelect(wrapper).props('modelValue')).toBe('second')
+    expect(wrapper.get('.config-path-open').text()).toBe('/home/user/Picked')
+  })
+
+  it('holds Start from in first use while a workspace switch waits on authorization', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] },
+      {
+        id: 'remote',
+        label: 'Remote connection',
+        skipInstall: true,
+        fields: [{ id: 'url', label: 'Server URL', type: 'text' }]
+      }
+    ])
+    signInToWorkspace([])
+    let finishAuthorization!: (status: {
+      signedIn: boolean
+      workspaceId: string
+      workspaceType: string
+    }) => void
+    ;(window.api.comfybuilder.switchWorkspace as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishAuthorization = resolve
+      })
+    )
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+
+    const opening = wrapper.vm.open({ workspaceId: 'w2', cameFromSetup: true })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="workspace-authorization-status"]').exists()).toBe(true)
+    expect(startFromIsHeld(wrapper)).toBe(true)
+    await startFrom(wrapper, CONNECT_TO_SERVER)
+
+    finishAuthorization({ signedIn: true, workspaceId: 'w2', workspaceType: 'team' })
+    await opening
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="workspace-authorization-status"]').exists()).toBe(false)
+    expect(startFromIsHeld(wrapper)).toBe(false)
+    expect(chosenStartFrom(wrapper)).toBe(NEW_INSTALL)
   })
 
   it('shows Build metadata in the dropdown without a separate details panel', async () => {
@@ -318,7 +1178,7 @@ describe('InstallWizardModal workspace Builds', () => {
     ])
     const wrapper = await openWorkspaceModal()
 
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       {
         value: 'ready',
         label: 'Production Build',
@@ -339,7 +1199,8 @@ describe('InstallWizardModal workspace Builds', () => {
 
     await open({ workspaceId: 'w1' })
     await flushPromises()
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    await showChangeSetup(wrapper)
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       { value: 'ready', label: 'Ready Build', description: 'Release v2' }
     ])
     ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockResolvedValue([
@@ -347,56 +1208,57 @@ describe('InstallWizardModal workspace Builds', () => {
     ])
     await open({ workspaceId: 'w1' })
     await flushPromises()
+    await showChangeSetup(wrapper)
 
     expect(window.api.comfybuilder.switchWorkspace).not.toHaveBeenCalled()
     expect(window.api.comfybuilder.listBuilds).toHaveBeenCalledTimes(2)
-    expect(wrapper.getComponent(BaseSelect).props('modelValue')).toBe('ready')
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    expect(workspaceBuildSelect(wrapper).props('modelValue')).toBe('ready')
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       { value: 'ready', label: 'Ready Build', description: 'Release v3' }
     ])
   })
 
-  it('uses the existing local installer and template picker for Standalone', async () => {
+  it('installs Standalone directly with the recommended choice for each field', async () => {
     signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
         id: 'standalone',
         label: 'Standalone',
-        fields: [{ id: 'bundledTemplate', label: 'Starter Template', type: 'select' }]
+        fields: [{ id: 'variant', label: 'Variant', type: 'select' }]
       }
     ])
     ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { value: 'none', label: 'None' },
-      { value: 'starter', label: 'Starter Workflow' }
+      { value: 'cpu', label: 'CPU' },
+      { value: 'nvidia', label: 'NVIDIA', recommended: true }
     ])
     const wrapper = await openWorkspaceModal()
 
-    expect(wrapper.get('[data-testid="workspace-install-source-managed"]').text()).toBe(
-      'Managed Builds'
+    expect(sourceOption(wrapper, 'workspace-install-source-managed').label).toBe(
+      "Your team's builds"
     )
-    expect(wrapper.find('[data-testid="workspace-install-source-public"]').exists()).toBe(false)
+    expect(hasSourceOption(wrapper, 'workspace-install-source-public')).toBe(false)
 
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
 
-    expect(wrapper.get('.brand-lead').text()).toBe('Set up a fresh ComfyUI environment.')
+    expect(wrapper.get('.setup-modal-lead').text()).toBe(
+      'Everything here is already set to what fits this computer.'
+    )
     expect(wrapper.find('[data-testid="workspace-build-field"]').exists()).toBe(false)
     expect(wrapper.get('.config-advanced').classes()).toContain('config-advanced--direct')
     expect(wrapper.get('.config-advanced').classes()).toContain('is-open')
     expect(wrapper.find('.config-advanced__summary').exists()).toBe(false)
     expect(wrapper.get('#source-fields').exists()).toBe(true)
     expect(wrapper.get('#source-fields label').classes()).toContain('config-label')
-    expect(window.api.getFieldOptions).toHaveBeenCalledWith(
-      'standalone',
-      'bundledTemplate',
-      {},
-      undefined
-    )
+    expect(window.api.getFieldOptions).toHaveBeenCalledWith('standalone', 'variant', {}, undefined)
 
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
 
-    expect(wrapper.get('.template-shell').exists()).toBe(true)
+    expect(window.api.buildInstallation).toHaveBeenCalledWith('standalone', {
+      variant: expect.objectContaining({ value: 'nvidia' })
+    })
     expect(window.api.comfybuilder.installBuild).not.toHaveBeenCalled()
   })
 
@@ -418,8 +1280,9 @@ describe('InstallWizardModal workspace Builds', () => {
     })
     const wrapper = await openWorkspaceModal()
 
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
 
@@ -464,14 +1327,16 @@ describe('InstallWizardModal workspace Builds', () => {
       wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
     ).open({ workspaceId: 'personal' })
     await flushPromises()
+    await showChangeSetup(wrapper)
 
     expect(window.api.comfybuilder.switchWorkspace).not.toHaveBeenCalled()
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       { value: 'ready', label: 'Personal Build' }
     ])
 
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
 
@@ -500,32 +1365,33 @@ describe('InstallWizardModal workspace Builds', () => {
     ])
     const wrapper = await openWorkspaceModal()
 
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
     expect(wrapper.getComponent(PathDiskInfo).props('estimatedSize')).toBe(2_250)
 
-    await wrapper.get('[data-testid="workspace-install-source-managed"]').trigger('click')
+    await pickSource(wrapper, 'workspace-install-source-managed')
     await flushPromises()
 
-    expect(wrapper.get('.brand-lead').text()).toBe('Set up a fresh ComfyUI environment.')
+    expect(wrapper.get('.setup-modal-lead').text()).toBe(
+      'Everything here is already set to what fits this computer.'
+    )
     expect(wrapper.get('[data-testid="workspace-build-field"]').exists()).toBe(true)
     expect(wrapper.find('.config-advanced').exists()).toBe(false)
     expect(wrapper.getComponent(PathDiskInfo).props('estimatedSize')).toBe(4_500)
     expect(window.api.comfybuilder.listBuilds).toHaveBeenCalledOnce()
   })
 
-  it('never shows the template picker for a Managed install after visiting the Public tab', async () => {
+  it('installs the team build after a visit to the Standalone tab', async () => {
     signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
         id: 'standalone',
         label: 'Standalone',
-        fields: [{ id: 'bundledTemplate', label: 'Starter Template', type: 'select' }]
+        fields: [{ id: 'variant', label: 'Variant', type: 'select' }]
       }
     ])
     ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { value: 'none', label: 'None' },
-      { value: 'starter', label: 'Starter Workflow' }
+      { value: 'nvidia', label: 'NVIDIA', recommended: true }
     ])
     ;(window.api.comfybuilder.installBuild as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
@@ -533,17 +1399,304 @@ describe('InstallWizardModal workspace Builds', () => {
     })
     const wrapper = await openWorkspaceModal()
 
-    // Visit Standalone (loads template options), then return to Managed.
-    await wrapper.get('[data-testid="install-source-standalone"]').trigger('click')
+    await pickSource(wrapper, 'install-source-standalone')
     await flushPromises()
-    await wrapper.get('[data-testid="workspace-install-source-managed"]').trigger('click')
+    await pickSource(wrapper, 'workspace-install-source-managed')
     await flushPromises()
 
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
 
-    expect(wrapper.find('.template-shell').exists()).toBe(false)
     expect(window.api.comfybuilder.installBuild).toHaveBeenCalledOnce()
+    expect(window.api.buildInstallation).not.toHaveBeenCalled()
+  })
+
+  it('saves a team build picked in first-use Change back to Set up without installing it', async () => {
+    signInToWorkspace([
+      {
+        id: 'ready',
+        name: 'Ready Build',
+        state: 'installable',
+        sizeBytes: 2_000,
+        releaseTargets: [
+          {
+            artifactId: 'cuda',
+            releaseVersion: 3,
+            os: 'windows',
+            gpu: 'nvidia',
+            accelVariant: 'cu128',
+            recommended: true
+          }
+        ]
+      }
+    ])
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use', workspaceId: 'w1' })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(window.api.comfybuilder.installBuild).not.toHaveBeenCalled()
+    expect(savedSetups(wrapper)[0]?.plan).toMatchObject({
+      installRoot: '/home/user/ComfyUI',
+      requiredBytes: 4_500,
+      workspaceBuild: {
+        buildId: 'ready',
+        buildName: 'Ready Build',
+        artifactId: 'cuda',
+        releaseVersion: 3,
+        targetLabel: 'Windows - NVIDIA (CUDA 12.8)'
+      }
+    })
+  })
+
+  it('keeps the folder picked in Set up when Change restores another install mode', async () => {
+    signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const first = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use', workspaceId: 'w1' })
+    await flushPromises()
+    await pickSource(first, 'install-source-standalone')
+    await flushPromises()
+    await first.get('#inst-name-standalone').setValue('Studio')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+    expect(saved.plan.sourceId).toBe('standalone')
+
+    const again = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await again.vm.open({
+      cameFromSetup: true,
+      entrypoint: 'first_use',
+      workspaceId: 'w1',
+      restore: saved.draft,
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    await flushPromises()
+    expect(sourceChecked(again, 'install-source-standalone')).toBe('true')
+    await again.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(savedSetups(again)[0]?.plan).toMatchObject({
+      sourceId: 'standalone',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    again.unmount()
+  })
+
+  it('keeps a folder browsed while Change restores another install mode', async () => {
+    signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    const standalone = [
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ]
+    const getSources = window.api.getSources as ReturnType<typeof vi.fn>
+    getSources.mockResolvedValue(standalone)
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const first = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use', workspaceId: 'w1' })
+    await flushPromises()
+    await pickSource(first, 'install-source-standalone')
+    await flushPromises()
+    await first.get('#inst-name-standalone').setValue('Studio')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+
+    const cpu = [{ value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }]
+    const getFieldOptions = window.api.getFieldOptions as ReturnType<typeof vi.fn>
+    const pendingOptions: (() => void)[] = []
+    getFieldOptions.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          pendingOptions.push(() => resolve(cpu))
+        })
+    )
+    const again = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    const opening = again.vm.open({
+      cameFromSetup: true,
+      entrypoint: 'first_use',
+      workspaceId: 'w1',
+      restore: saved.draft,
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    await flushPromises()
+    expect(pendingOptions.length, 'the restore waits for the hardware options').toBeGreaterThan(0)
+    const browse = again.find('.config-path-browse')
+    if (browse.exists()) {
+      await browse.trigger('click')
+      await flushPromises()
+    }
+    getFieldOptions.mockResolvedValue(cpu)
+    while (pendingOptions.length > 0) pendingOptions.shift()!()
+    await opening
+    await flushPromises()
+    expect(browse.exists(), 'Browse is offered while the setup restores').toBe(true)
+    await again.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(savedSetups(again)[0]?.plan).toMatchObject({
+      sourceId: 'standalone',
+      installRoot: '/home/user/Picked'
+    })
+    again.unmount()
+  })
+
+  it('keeps the folder of the newest open when an earlier open restores late', async () => {
+    signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const first = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await first.vm.open({ cameFromSetup: true, entrypoint: 'first_use', workspaceId: 'w1' })
+    await flushPromises()
+    await pickSource(first, 'install-source-standalone')
+    await flushPromises()
+    await first.get('#inst-name-standalone').setValue('Studio')
+    await first.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(first)
+    first.unmount()
+    if (!saved) throw new Error('Save changes emitted nothing')
+
+    let finishHardware: (value: { supported: boolean }) => void = () => {}
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishHardware = resolve
+        })
+    )
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    const base = { cameFromSetup: true, entrypoint: 'first_use' as const, workspaceId: 'w1' }
+    const earlier = wrapper.vm.open({ ...base, restore: saved.draft, installRoot: '/Volumes/Old' })
+    await flushPromises()
+    await wrapper.vm.open({ ...base, restore: saved.draft, installRoot: '/Volumes/New' })
+    await flushPromises()
+    finishHardware({ supported: true })
+    await earlier
+    await flushPromises()
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(savedSetups(wrapper)[0]?.plan.installRoot).toBe('/Volumes/New')
+    wrapper.unmount()
+  })
+
+  it('keeps the folder picked in Set up when Public builds is picked before the catalog loads', async () => {
+    signInToWorkspace([])
+    let finishBuilds: (builds: unknown[]) => void = () => {}
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishBuilds = resolve
+      })
+    )
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    const opening = wrapper.vm.open({
+      cameFromSetup: true,
+      entrypoint: 'first_use',
+      workspaceId: 'w1',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    await flushPromises()
+
+    await pickSource(wrapper, 'install-source-standalone')
+    await flushPromises()
+    finishBuilds([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    await opening
+    await flushPromises()
+    await wrapper.get('#inst-name-standalone').setValue('Studio')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(savedSetups(wrapper)[0]?.plan).toMatchObject({
+      sourceId: 'standalone',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    wrapper.unmount()
+  })
+
+  it('keeps the folder picked in Set up when Change switches to Public builds', async () => {
+    signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'cpu', label: 'CPU', recommended: true, data: { variantId: 'win-cpu' } }
+    ])
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await flushPromises()
+    await wrapper.vm.open({
+      cameFromSetup: true,
+      entrypoint: 'first_use',
+      workspaceId: 'w1',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    await flushPromises()
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
+
+    await pickSource(wrapper, 'install-source-standalone')
+    await flushPromises()
+    await wrapper.get('#inst-name-standalone').setValue('Studio')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(savedSetups(wrapper)[0]?.plan).toMatchObject({
+      sourceId: 'standalone',
+      installRoot: '/Volumes/Big/ComfyUI'
+    })
+    wrapper.unmount()
   })
 
   it('opens the selected workspace Builds page online', async () => {
@@ -556,15 +1709,74 @@ describe('InstallWizardModal workspace Builds', () => {
     expect(wrapper.get('.workspace-build-online').text()).toBe('View builds online')
   })
 
-  it('shows an empty state when no compatible Builds can be installed', async () => {
-    signInToWorkspace([{ id: 'none', name: 'No Build Yet', state: 'no-build' }])
+  it('defaults to Public Builds when no managed Build is compatible with this machine', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] }
+    ])
+    signInToWorkspace([{ id: 'linux', name: 'Linux Build', state: 'platform-mismatch' }])
     const wrapper = await openWorkspaceModal()
 
-    expect(wrapper.get('.brand-lead').text()).toBe('Set up a fresh ComfyUI environment.')
-    expect(wrapper.get('[data-testid="workspace-build-field"]').text()).toContain(
-      'No compatible Builds are available to install.'
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('false')
+    expect(wrapper.find('[data-testid="workspace-build-field"]').exists()).toBe(false)
+  })
+
+  it('defaults to Public Builds when the workspace has no managed Builds', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] }
+    ])
+    signInToWorkspace([])
+    const wrapper = await openWorkspaceModal()
+
+    expect(wrapper.get('.setup-modal-lead').text()).toBe(
+      'Everything here is already set to what fits this computer.'
     )
-    expect(wrapper.get('.config-continue').attributes('disabled')).toBeDefined()
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('false')
+    expect(wrapper.find('[data-testid="workspace-build-field"]').exists()).toBe(false)
+  })
+
+  it('uses a prefetched empty managed catalog without loading it again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'standalone', label: 'Standalone', fields: [] }
+    ])
+    signInToWorkspace([])
+    const wrapper = mountModal()
+    await flushPromises()
+    const authStore = useAuthStore()
+    authStore.builds = []
+    authStore.buildsLoaded = true
+
+    await (
+      wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
+    ).open({ workspaceId: 'w1' })
+    await flushPromises()
+    await showChangeSetup(wrapper)
+
+    expect(window.api.comfybuilder.listBuilds).not.toHaveBeenCalled()
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+  })
+
+  it('retires a pending workspace pick once it attempts the switch itself', async () => {
+    signInToWorkspace([])
+    ;(window.api.comfybuilder.switchWorkspace as ReturnType<typeof vi.fn>).mockResolvedValue({
+      signedIn: true,
+      workspaceId: 'w1',
+      workspaceType: 'team',
+      workspaceSwitchFailure: 'retryable'
+    })
+    const wrapper = mountModal()
+    await flushPromises()
+    const scope = useDashboardScopeStore()
+    scope.selectWorkspace('w2')
+
+    await (
+      wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
+    ).open({ workspaceId: 'w2' })
+    await flushPromises()
+
+    expect(window.api.comfybuilder.switchWorkspace).toHaveBeenCalledWith('w2', 'chosen')
+    expect(scope.takeChosenSelection()).toBe(false)
   })
 
   it('activates the selected workspace before loading its Builds', async () => {
@@ -584,17 +1796,134 @@ describe('InstallWizardModal workspace Builds', () => {
       wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
     ).open({ workspaceId: 'w2' })
     await flushPromises()
+    await showChangeSetup(wrapper)
 
-    expect(window.api.comfybuilder.switchWorkspace).toHaveBeenCalledExactlyOnceWith('w2')
+    expect(window.api.comfybuilder.switchWorkspace).toHaveBeenCalledExactlyOnceWith('w2', 'chosen')
     expect(
       (window.api.comfybuilder.switchWorkspace as ReturnType<typeof vi.fn>).mock
         .invocationCallOrder[0]
     ).toBeLessThan(
       (window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!
     )
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       { value: 'ready', label: 'Workspace Two Build' }
     ])
+  })
+
+  describe('after Desktop returned to the anchor workspace', () => {
+    const readyBuild = { id: 'ready', name: 'Workspace Two Build', state: 'installable' }
+
+    async function openOnW2ThenReturnToAnchor() {
+      signInToWorkspace([])
+      let authChanged: (status: unknown) => void = () => {}
+      ;(window.api.comfybuilder.onAuthChanged as ReturnType<typeof vi.fn>).mockImplementation(
+        (callback: (status: unknown) => void) => {
+          authChanged = callback
+          return () => {}
+        }
+      )
+      const switchWorkspace = window.api.comfybuilder.switchWorkspace as ReturnType<typeof vi.fn>
+      const listBuilds = window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>
+      switchWorkspace.mockResolvedValue({
+        signedIn: true,
+        workspaceId: 'w2',
+        workspaceType: 'team'
+      })
+      listBuilds.mockResolvedValue([readyBuild])
+      const wrapper = mountModal()
+      await flushPromises()
+      await (
+        wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
+      ).open({ workspaceId: 'w2' })
+      await flushPromises()
+      await showChangeSetup(wrapper)
+      expect(workspaceBuildSelect(wrapper).props('options')).toHaveLength(1)
+      authChanged({ signedIn: true, workspaceId: 'w1', workspaceType: 'team' })
+      await flushPromises()
+      expect(workspaceBuildSelect(wrapper).props('options')).toEqual([])
+      switchWorkspace.mockClear()
+      listBuilds.mockClear()
+      return { wrapper, switchWorkspace, listBuilds }
+    }
+
+    it('Refresh re-establishes the target workspace before fetching its Builds', async () => {
+      const { wrapper, switchWorkspace, listBuilds } = await openOnW2ThenReturnToAnchor()
+
+      await wrapper.get('.workspace-build-refresh').trigger('click')
+      await flushPromises()
+
+      expect(switchWorkspace).toHaveBeenCalledExactlyOnceWith('w2', 'chosen')
+      expect(listBuilds).toHaveBeenCalledOnce()
+      expect(switchWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        listBuilds.mock.invocationCallOrder[0]!
+      )
+      expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
+        { value: 'ready', label: 'Workspace Two Build' }
+      ])
+    })
+
+    it.each(['.workspace-build-refresh', '.wizard-build-retry'])(
+      '%s is disabled while the target workspace is being re-established',
+      async (button) => {
+        const { wrapper, switchWorkspace } = await openOnW2ThenReturnToAnchor()
+        useAuthStore().buildsError = true
+        await flushPromises()
+        let finish: (status: unknown) => void = () => {}
+        switchWorkspace.mockReturnValue(new Promise((resolve) => (finish = resolve)))
+
+        await wrapper.get(button).trigger('click')
+        await flushPromises()
+        expect(wrapper.get(button).attributes('disabled')).toBeDefined()
+        await wrapper.get(button).trigger('click')
+
+        finish({ signedIn: true, workspaceId: 'w2', workspaceType: 'team' })
+        await flushPromises()
+        expect(switchWorkspace).toHaveBeenCalledOnce()
+      }
+    )
+
+    it('Refresh fetches nothing for the anchor when the target cannot be re-established', async () => {
+      const { wrapper, switchWorkspace, listBuilds } = await openOnW2ThenReturnToAnchor()
+      switchWorkspace.mockResolvedValue({
+        signedIn: true,
+        workspaceId: 'w1',
+        workspaceType: 'team',
+        workspaceSwitchFailure: 'retryable'
+      })
+
+      await wrapper.get('.workspace-build-refresh').trigger('click')
+      await flushPromises()
+
+      expect(listBuilds).not.toHaveBeenCalled()
+      expect(wrapper.emitted('close')).toHaveLength(1)
+    })
+  })
+
+  it('Refresh on the target workspace only fetches and keeps the selected Build', async () => {
+    signInToWorkspace([])
+    const switchWorkspace = window.api.comfybuilder.switchWorkspace as ReturnType<typeof vi.fn>
+    switchWorkspace.mockResolvedValue({ signedIn: true, workspaceId: 'w2', workspaceType: 'team' })
+    const listBuilds = window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>
+    listBuilds.mockResolvedValue([
+      { id: 'first', name: 'First', state: 'installable' },
+      { id: 'second', name: 'Second', state: 'installable' }
+    ])
+    const wrapper = mountModal()
+    await flushPromises()
+    await (
+      wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
+    ).open({ workspaceId: 'w2' })
+    await flushPromises()
+    await showChangeSetup(wrapper)
+    workspaceBuildSelect(wrapper).vm.$emit('update:modelValue', 'second')
+    await flushPromises()
+    switchWorkspace.mockClear()
+
+    await wrapper.get('.workspace-build-refresh').trigger('click')
+    await flushPromises()
+
+    expect(switchWorkspace).not.toHaveBeenCalled()
+    expect(workspaceBuildSelect(wrapper).props('modelValue')).toBe('second')
   })
 
   it('explains that a workspace switch may be waiting on browser authorization', async () => {
@@ -618,7 +1947,7 @@ describe('InstallWizardModal workspace Builds', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="workspace-authorization-status"]').text()).toBe(
-      'Waiting for workspace authorization... Complete authorization in your browser if prompted.'
+      'Waiting for workspace authorization… Complete authorization in your browser if prompted.'
     )
 
     finishAuthorization({ signedIn: true, workspaceId: 'w2', workspaceType: 'team' })
@@ -651,13 +1980,60 @@ describe('InstallWizardModal workspace Builds', () => {
       .mockResolvedValueOnce([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
     const wrapper = await openWorkspaceModal()
 
+    expect(
+      wrapper.get('.wizard-build-retry').attributes('data-variant'),
+      'Retry deletes nothing, so it is not red'
+    ).toBe('textonly')
     await wrapper.get('.wizard-build-retry').trigger('click')
     await flushPromises()
 
     expect(window.api.comfybuilder.listBuilds).toHaveBeenCalledTimes(2)
-    expect(wrapper.getComponent(BaseSelect).props('options')).toEqual([
+    expect(workspaceBuildSelect(wrapper).props('options')).toEqual([
       { value: 'ready', label: 'Ready Build' }
     ])
+  })
+
+  it('shows a failed Build catalog on the summary and retries it from there', async () => {
+    signInToWorkspace([])
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    const wrapper = mountModal()
+    await flushPromises()
+    await (
+      wrapper.vm as unknown as { open: (opts: { workspaceId: string }) => Promise<void> }
+    ).open({ workspaceId: 'w1' })
+    await flushPromises()
+
+    const retry = wrapper.get('[data-testid="config-summary-build-retry"]')
+    expect(retry.text()).toBe("Couldn't load builds. Retry")
+    expect(retry.attributes('data-variant'), 'Retry deletes nothing, so it is not red').toBe(
+      'textonly'
+    )
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeDefined()
+
+    await retry.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="config-summary-build-retry"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('Ready Build')
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
+  })
+
+  it('keeps the Build Desktop picked when Discard follows a refresh that dropped the old one', async () => {
+    signInToWorkspace([{ id: 'alpha', name: 'Alpha Build', state: 'installable' }])
+    const wrapper = await openWorkspaceModal()
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'beta', name: 'Beta Build', state: 'installable' }
+    ])
+
+    await wrapper.get('.workspace-build-refresh').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('Beta Build')
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
   })
 
   it('installs the selected Build with the requested name and install root', async () => {
@@ -667,6 +2043,7 @@ describe('InstallWizardModal workspace Builds', () => {
       entry: { id: 'managed-1', name: 'My Managed Instance' }
     })
     const wrapper = await openWorkspaceModal()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
     await wrapper.get('#inst-name-standalone').setValue('My Managed Instance')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
@@ -681,6 +2058,56 @@ describe('InstallWizardModal workspace Builds', () => {
       autoLaunchOnFinish: true,
       opKind: 'install'
     })
+  })
+
+  async function failBuildInstall(failure: Record<string, unknown>) {
+    signInToWorkspace([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    ;(window.api.comfybuilder.installBuild as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: false,
+      ...failure
+    })
+    const wrapper = await openWorkspaceModal()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await wrapper.get('.config-continue').trigger('click')
+    await flushPromises()
+    return wrapper
+  }
+
+  it('offers Change location when the folder is the problem, and opens the location picker', async () => {
+    const wrapper = await failBuildInstall({
+      message: 'Invalid install location.',
+      reason: 'location'
+    })
+    const modal = useModal()
+    expect(modal.state.visible).toBe(true)
+    expect(modal.state.title).toBe("Couldn't add this build")
+    expect(modal.state.message).toBe('Invalid install location.')
+    expect(modal.state.buttonLabel).toBe('Change location')
+    expect(window.api.browseFolder).not.toHaveBeenCalled()
+
+    modal.close(true)
+    await flushPromises()
+
+    expect(window.api.browseFolder).toHaveBeenCalledExactlyOnceWith('/home/user/ComfyUI')
+    expect(window.api.comfybuilder.installBuild).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('show-progress')).toBeUndefined()
+    await showChangeSetup(wrapper)
+    expect(wrapper.text()).toContain('/home/user/Picked')
+  })
+
+  it('shows any other failure with a single OK that only closes', async () => {
+    const wrapper = await failBuildInstall({ message: 'Install already starting.' })
+    const modal = useModal()
+    expect(modal.state.visible).toBe(true)
+    expect(modal.state.title).toBe("Couldn't add this build")
+    expect(modal.state.message).toBe('Install already starting.')
+    expect(modal.state.buttonLabel).toBe('OK')
+
+    modal.close(true)
+    await flushPromises()
+
+    expect(window.api.browseFolder).not.toHaveBeenCalled()
+    expect(wrapper.emitted('show-progress')).toBeUndefined()
   })
 
   it('lets users choose among compatible managed Build release targets', async () => {
@@ -720,26 +2147,26 @@ describe('InstallWizardModal workspace Builds', () => {
     const targetSection = wrapper.get('[data-testid="workspace-build-targets"]')
     expect(targetSection.isVisible()).toBe(true)
     expect(targetSection.get('label').text()).toBe('Hardware')
-    const targetPicker = wrapper.getComponent(BrandVariantList)
+    const targetPicker = targetSection.getComponent(BaseSelect)
     expect(targetPicker.props('options')).toEqual([
-      {
+      expect.objectContaining({
         value: 'cuda',
         label: 'Windows - NVIDIA (CUDA 12.8)',
         description: 'Release v3',
-        recommended: true,
-        data: { variantId: 'win-nvidia-cu128' }
-      },
-      {
+        badge: 'Recommended'
+      }),
+      expect.objectContaining({
         value: 'cpu',
         label: 'Windows - CPU',
         description: 'Release v3',
-        recommended: false,
-        data: { variantId: 'win-cpu-cpu' }
-      }
+        badge: undefined
+      })
     ])
-    expect(targetPicker.props('selectedValue')).toBe('cuda')
+    expect(targetPicker.props('modelValue')).toBe('cuda')
 
-    await targetPicker.findAll('button')[1]!.trigger('click')
+    targetPicker.vm.$emit('update:modelValue', 'cpu')
+    await flushPromises()
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
     await wrapper.get('.config-continue').trigger('click')
     await flushPromises()
 
@@ -786,13 +2213,79 @@ describe('InstallWizardModal onboarding->install handoff telemetry (#1224)', () 
       express: false
     })
   })
+
+  it('adds a folder picked in Change setup under the name typed on New Build, without reporting a cancelled wizard', async () => {
+    const api = mockPickedFolder()
+    const { events, stop } = captureTelemetry()
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await wrapper.get('#inst-name-standalone').setValue('Studio')
+    await showChangeSetup(wrapper)
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    const addBuild = wrapper.get('[data-testid="config-use-existing"]')
+    expect(addBuild.text()).toBe('Add build')
+    expect(addBuild.attributes('disabled')).toBeDefined()
+
+    await wrapper.get('.track-location .config-path-browse').trigger('click')
+    await flushPromises()
+    expect(addBuild.attributes('disabled')).toBeUndefined()
+    await addBuild.trigger('click')
+    await flushPromises()
+
+    expect(api.trackInstallation).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'Studio', installPath: '/home/user/Picked' })
+    )
+    expect(wrapper.emitted('navigate-list')).toHaveLength(1)
+
+    wrapper.unmount()
+    stop()
+
+    expect(events.map((e) => e.actionName)).toContain('comfy.desktop.track_existing.saved')
+    expect(events.map((e) => e.actionName)).not.toContain('comfy.desktop.install.not_started')
+  })
+
+  it('starts the install of a snapshot loaded in Change setup, without reporting a cancelled wizard', async () => {
+    const api = mockSnapshotFile()
+    api.createFromSnapshot = vi
+      .fn()
+      .mockResolvedValue({ ok: true, entry: { id: 'inst-1', name: 'Studio' } })
+    const { events, stop } = captureTelemetry()
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await showChangeSetup(wrapper)
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    const createBuild = wrapper.get('[data-testid="config-use-existing"]')
+    expect(createBuild.text()).toBe('Create build')
+    expect(createBuild.attributes('disabled')).toBeDefined()
+
+    await wrapper.get('.load-snapshot-tertiary').trigger('click')
+    await flushPromises()
+    await createBuild.trigger('click')
+    await flushPromises()
+
+    expect(api.createFromSnapshot).toHaveBeenCalledWith('/tmp/snap.json', 'Studio', 'stable', 'mps')
+    expect(wrapper.emitted('show-progress')).toEqual([
+      [expect.objectContaining({ installationId: 'inst-1', opKind: 'install' })]
+    ])
+
+    wrapper.unmount()
+    stop()
+
+    expect(events.map((e) => e.actionName)).not.toContain('comfy.desktop.install.not_started')
+  })
 })
 
 describe('InstallWizardModal hardware warning', () => {
   const KFD_WARNING =
     'Your user cannot access the AMD GPU compute interface (/dev/kfd), so ComfyUI will not be able to use the GPU.'
   const standaloneSource = { id: 'standalone', label: 'Standalone', fields: [] }
-  const remoteSource = { id: 'remote', label: 'Remote Connection', skipInstall: true, fields: [] }
+  const remoteSource = { id: 'remote', label: 'Remote connection', skipInstall: true, fields: [] }
 
   it('renders the validateHardware warning under the detected GPU field', async () => {
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([standaloneSource])
@@ -810,19 +2303,30 @@ describe('InstallWizardModal hardware warning', () => {
     const warning = wrapper.find('[data-testid="wizard-hardware-warning"]')
     expect(warning.exists()).toBe(true)
     expect(warning.text()).toBe(KFD_WARNING)
-    const advanced = wrapper.get('.config-advanced').element
-    const installLocation = wrapper.get('[data-testid="install-location-field"]').element
-    const gpuField = wrapper.get('[data-testid="detected-gpu-field"]').element
+    const machine = wrapper.get('.config-machine').element
     expect(
-      advanced.compareDocumentPosition(installLocation) & Node.DOCUMENT_POSITION_FOLLOWING
+      machine.compareDocumentPosition(warning.element) & Node.DOCUMENT_POSITION_FOLLOWING
     ).not.toBe(0)
-    expect(
-      installLocation.compareDocumentPosition(gpuField) & Node.DOCUMENT_POSITION_FOLLOWING
-    ).not.toBe(0)
-    expect(gpuField.parentElement).toBe(wrapper.get('.config-install-meta').element)
-    expect(wrapper.get('.config-install-separator').text()).toBe('·')
-    expect(wrapper.get('.config-gpu-value').classes()).toContain('disk-space-info')
-    expect(wrapper.get('.config-gpu-value').text()).toBe('detected GPU: Radeon RX 7900')
+    expect(wrapper.get('[data-testid="detected-gpu-field"]').text()).toBe('Radeon RX 7900')
+  })
+
+  it('names the computer the way first use does, with its memory', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([standaloneSource])
+    ;(window.api.detectGPU as ReturnType<typeof vi.fn>).mockResolvedValue({ label: 'NVIDIA' })
+    window.api.getSystemInfo = vi.fn().mockResolvedValue({
+      gpu_label: 'NVIDIA',
+      gpu_model: 'NVIDIA GeForce RTX 5080 Laptop GPU',
+      cpu_model: 'Intel Core Ultra 9',
+      total_memory_gb: 31.4
+    })
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="detected-gpu-field"]').text()).toBe(
+      'NVIDIA GeForce RTX 5080 Laptop GPU'
+    )
+    expect(wrapper.get('[data-testid="detected-machine-memory"]').text()).toBe('31 GB memory')
   })
 
   it('renders no warning element when validateHardware reports none', async () => {
@@ -834,7 +2338,7 @@ describe('InstallWizardModal hardware warning', () => {
     expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(false)
   })
 
-  it('suppresses the warning for a skipInstall (remote) source', async () => {
+  it('drops the warning once the build is a ComfyUI the person already has', async () => {
     ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
       standaloneSource,
       remoteSource
@@ -847,17 +2351,950 @@ describe('InstallWizardModal hardware warning', () => {
     ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
 
-    // Standalone is auto-selected; the warning shows.
     expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(true)
 
-    const remotePill = wrapper
-      .findAll('button[role="radio"]')
-      .find((b) => b.text().includes('Remote Connection'))
-    expect(remotePill).toBeTruthy()
-    await remotePill!.trigger('click')
+    await showChangeSetup(wrapper)
+    expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(true)
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(false)
+
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(false)
+  })
+
+  it('keeps the hardware warning visible in Change setup', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([standaloneSource])
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockResolvedValue({
+      supported: true,
+      warning: KFD_WARNING
+    })
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await showChangeSetup(wrapper)
+
+    expect(wrapper.get('[data-testid="wizard-hardware-warning"]').text()).toBe(KFD_WARNING)
+  })
+
+  it('connects a machine that cannot run ComfyUI to a server', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      standaloneSource,
+      remoteSource
+    ])
+    ;(window.api.detectGPU as ReturnType<typeof vi.fn>).mockResolvedValue({ label: 'Old GPU' })
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockResolvedValue({
+      supported: false,
+      error: 'This CPU is missing AVX support.'
+    })
+    ;(window.api.buildInstallation as ReturnType<typeof vi.fn>).mockResolvedValue({
+      sourceId: 'remote'
+    })
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
     await flushPromises()
 
-    // Remote installs run on other hardware; local GPU access is irrelevant.
-    expect(wrapper.find('[data-testid="wizard-hardware-warning"]').exists()).toBe(false)
+    expect(wrapper.find('.config-machine--unsupported').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="detected-gpu-field"]').text()).toBe(
+      'This CPU is missing AVX support.'
+    )
+
+    await showChangeSetup(wrapper)
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    const connect = wrapper.get('[data-testid="config-use-existing"]')
+    expect(connect.text()).toBe('Connect')
+    await connect.trigger('click')
+    await flushPromises()
+
+    expect(window.api.addInstallation).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceId: 'remote', status: 'installed', installPath: '' })
+    )
+    expect(wrapper.emitted('navigate-list')).toHaveLength(1)
+  })
+
+  it('goes back to the unsupported machine when a server is given up for a new install', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      standaloneSource,
+      remoteSource
+    ])
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockResolvedValue({
+      supported: false,
+      error: 'This CPU is missing AVX support.'
+    })
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await showChangeSetup(wrapper)
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('false')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    expect(wrapper.find('.config-machine--unsupported').exists()).toBe(true)
+  })
+})
+
+describe('InstallWizardModal Change setup', () => {
+  const releaseSource = {
+    id: 'standalone',
+    label: 'Standalone',
+    fields: [
+      { id: 'release', label: 'Release', type: 'select' },
+      { id: 'comfyVersion', label: 'Version', type: 'select' }
+    ]
+  }
+  const remoteSource = { id: 'remote', label: 'Remote connection', skipInstall: true, fields: [] }
+
+  function mockReleaseOptions(): void {
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_source: string, fieldId: string, selections: Record<string, { value: string }>) => {
+        if (fieldId === 'release') {
+          return [
+            { value: 'stable', label: 'Stable', recommended: true },
+            { value: 'latest', label: 'Latest on GitHub' }
+          ]
+        }
+        if (selections.release?.value !== 'stable') return []
+        return [
+          { value: 'v0.4.2', label: 'v0.4.2', recommended: true },
+          { value: 'v0.4.1', label: 'v0.4.1' }
+        ]
+      }
+    )
+  }
+
+  async function openChangeSetup(props: { hideBackToDashboard?: boolean } = {}) {
+    const wrapper = mountModal(props)
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await showChangeSetup(wrapper)
+    return wrapper
+  }
+
+  async function pickRelease(wrapper: ReturnType<typeof mountModal>, label: string): Promise<void> {
+    const choice = wrapper
+      .get('[data-testid="config-release"]')
+      .findAll('button')
+      .find((button) => button.text() === label)
+    if (!choice) throw new Error(`Release has no choice named ${label}`)
+    await choice.trigger('click')
+    await flushPromises()
+  }
+
+  function pickedRelease(wrapper: ReturnType<typeof mountModal>): string | undefined {
+    return wrapper
+      .get('[data-testid="config-release"]')
+      .findAll('button')
+      .find((button) => button.attributes('data-state') === 'on')
+      ?.text()
+  }
+
+  it('marks the Latest on GitHub version as nightly, since it installs the newest commit', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_source: string, fieldId: string) =>
+        fieldId === 'release'
+          ? [
+              {
+                value: 'stable',
+                label: 'Stable',
+                recommended: true,
+                data: { latestStableTag: 'v0.22.3' }
+              },
+              { value: 'latest', label: 'Latest on GitHub', data: { latestStableTag: 'v0.22.3' } }
+            ]
+          : []
+    )
+    const wrapper = await openChangeSetup()
+    const versionRow = () => wrapper.get('[data-testid="config-summary-standalone-version"]').text()
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(versionRow()).toBe('VersionComfyUI v0.22.3Stable')
+
+    await showChangeSetup(wrapper)
+    await pickRelease(wrapper, 'Latest on GitHub')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(versionRow()).toBe('VersionComfyUI v0.22.3 (nightly)Latest on GitHub')
+  })
+
+  it('picks the release with a segmented control and shows the version only for Stable', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+
+    const release = wrapper.get('[data-testid="config-release"] [role="group"]')
+    expect(release.findAll('button').map((button) => button.text())).toEqual([
+      'Stable',
+      'Latest on GitHub'
+    ])
+    const version = wrapper.get('.config-release-version')
+    expect(version.get('.ui-select-leading').text()).toBe('ComfyUI')
+    expect(version.get('.ui-select-label').text()).toBe('v0.4.2')
+    expect(
+      wrapper
+        .findAll('.config-source-field')
+        .map((row) => (row.element as HTMLElement).style.display)
+    ).toEqual(['', 'none'])
+
+    await release.findAll('button')[1]!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.config-release-version').exists()).toBe(false)
+  })
+
+  it('puts the free space and Browse inside the location field', async () => {
+    ;(window.api.getDiskSpace as ReturnType<typeof vi.fn>).mockResolvedValue({
+      free: 50_000_000_000,
+      total: 1_000_000_000_000
+    })
+    const wrapper = await openChangeSetup()
+    await vi.waitFor(() => expect(wrapper.find('.config-path-free').exists()).toBe(true))
+
+    const input = wrapper.get('[data-testid="config-path-input"]')
+    expect(input.find('.config-path-free').text()).toContain('free')
+    expect(input.find('.config-path-browse').text()).toBe('Browse')
+    expect(wrapper.find('.config-path-required').exists()).toBe(false)
+
+    await input.get('.config-path-browse').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.config-path-open').text()).toBe('/home/user/Picked')
+  })
+
+  it('keeps the setup as it was when Discard is pressed', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('.config-continue').text()).toBe('Install')
+    await showChangeSetup(wrapper)
+    expect(chosenStartFrom(wrapper)).toBe(NEW_INSTALL)
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+    expect(wrapper.get('.config-release-version').exists()).toBe(true)
+  })
+
+  it('keeps the release and version picked for a new install while the folder form is looked at', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+    wrapper
+      .findAllComponents(BaseSelect)
+      .find((select) => select.props('leading') === 'ComfyUI')!
+      .vm.$emit('update:modelValue', 'v0.4.1')
+    await flushPromises()
+    const loadsBefore = (window.api.getFieldOptions as ReturnType<typeof vi.fn>).mock.calls.length
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    expect(wrapper.find('[data-testid="install-source-tabs"]').exists()).toBe(false)
+    expect(wrapper.find('.config-release-version').exists()).toBe(false)
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(pickedRelease(wrapper)).toBe('Stable')
+    expect(wrapper.get('.config-release-version .ui-select-label').text()).toBe('v0.4.1')
+    expect((window.api.getFieldOptions as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+      loadsBefore
+    )
+  })
+
+  it('keeps the release picked for a new install after a server was looked at, without loading it again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+    await pickRelease(wrapper, 'Latest on GitHub')
+    const loadsBefore = (window.api.getFieldOptions as ReturnType<typeof vi.fn>).mock.calls.length
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(pickedRelease(wrapper)).toBe('Latest on GitHub')
+    expect((window.api.getFieldOptions as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+      loadsBefore
+    )
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('Latest on GitHub')
+  })
+
+  it('saves what was picked in first use after Connect to a server was only looked at', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    await pickRelease(wrapper, 'Latest on GitHub')
+
+    await startFrom(wrapper, CONNECT_TO_SERVER)
+    expect(chosenStartFrom(wrapper)).toBe(CONNECT_TO_SERVER)
+    expect(wrapper.find('[data-testid="config-use-existing"]').text()).toBe('Connect')
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(pickedRelease(wrapper)).toBe('Latest on GitHub')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    expect(savedSetups(wrapper)[0]?.plan).toMatchObject({
+      sourceId: 'standalone',
+      selections: { release: expect.objectContaining({ value: 'latest' }) }
+    })
+  })
+
+  it('drops a first-use Save when the release changes while the folder is being checked', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+    let finishFolderCheck: (issues: string[]) => void = () => {}
+    ;(window.api.validateInstallPath as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishFolderCheck = resolve
+      })
+    )
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    await pickRelease(wrapper, 'Latest on GitHub')
+    finishFolderCheck([])
+    await flushPromises()
+    expect(savedSetups(wrapper)).toEqual([])
+
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+    const [saved] = savedSetups(wrapper)
+    expect(saved?.plan.selections.release?.value).toBe('latest')
+    expect(saved?.plan.selections.comfyVersion).toBeUndefined()
+  })
+
+  it('holds Start from in first use until Desktop has picked a setup', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    let finishHardwareCheck: (result: { supported: boolean }) => void = () => {}
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishHardwareCheck = resolve
+      })
+    )
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    const opening = wrapper.vm.open({ cameFromSetup: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    expect(startFromIsHeld(wrapper)).toBe(true)
+    await startFrom(wrapper, CONNECT_TO_SERVER)
+    await startFrom(wrapper, NEW_INSTALL)
+    finishHardwareCheck({ supported: true })
+    await opening
+    await flushPromises()
+
+    expect(startFromIsHeld(wrapper)).toBe(false)
+    expect(sourceChecked(wrapper, 'install-source-standalone')).toBe('true')
+    expect(
+      wrapper.get('[data-testid="config-save-changes"]').attributes('disabled')
+    ).toBeUndefined()
+  })
+
+  it('gives the name back as it was when Discard follows a name typed for a ComfyUI already there', async () => {
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await wrapper.get('#inst-name-standalone').setValue('Studio')
+    await showChangeSetup(wrapper)
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await wrapper.get('#track-name').setValue('Old portable')
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get<HTMLInputElement>('#inst-name-standalone').element.value).toBe('Studio')
+  })
+
+  it('shows a failed release load only beside the new install it belongs to', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('HTTP 503')
+    )
+    const wrapper = await openChangeSetup()
+    expect(wrapper.get('.config-error').text()).toBe('HTTP 503')
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    expect(wrapper.find('.config-error').exists()).toBe(false)
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    expect(wrapper.find('.config-error').exists()).toBe(false)
+
+    await startFrom(wrapper, NEW_INSTALL)
+    expect(wrapper.get('.config-error').text()).toBe('HTTP 503')
+  })
+
+  it('still has the folder that was picked after the other places and a new install were looked at', async () => {
+    const api = mockPickedFolder()
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    await wrapper.get('.track-location .config-path-browse').trigger('click')
+    await flushPromises()
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    await pickExisting(wrapper, 'install-source-remote')
+    await flushPromises()
+    await startFrom(wrapper, NEW_INSTALL)
+    await startFrom(wrapper, ALREADY_HAVE)
+
+    expect(wrapper.get('.track-location .config-path-open').text()).toBe('/home/user/Picked')
+    await wrapper.get('[data-testid="config-use-existing"]').trigger('click')
+    await flushPromises()
+    expect(api.browseFolder).toHaveBeenCalledOnce()
+    expect(api.trackInstallation).toHaveBeenCalledWith(
+      expect.objectContaining({ installPath: '/home/user/Picked' })
+    )
+  })
+
+  it('only holds back a dropped file while the snapshot drop area is the one showing', async () => {
+    const wrapper = await openChangeSetup()
+    const dropIsHeldBack = (): boolean => {
+      const drop = new Event('drop', { cancelable: true })
+      document.dispatchEvent(drop)
+      return drop.defaultPrevented
+    }
+
+    await startFrom(wrapper, ALREADY_HAVE)
+    expect(dropIsHeldBack()).toBe(false)
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    expect(dropIsHeldBack()).toBe(true)
+
+    await pickExisting(wrapper, 'existing-comfy-folder')
+    await flushPromises()
+    expect(dropIsHeldBack()).toBe(false)
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    expect(dropIsHeldBack()).toBe(true)
+  })
+
+  it('forgets the folder that was picked once the changes are discarded', async () => {
+    mockPickedFolder()
+    const wrapper = await openChangeSetup()
+    await startFrom(wrapper, ALREADY_HAVE)
+    await wrapper.get('.track-location .config-path-browse').trigger('click')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+    await showChangeSetup(wrapper)
+    await startFrom(wrapper, ALREADY_HAVE)
+
+    expect(wrapper.find('.track-location .config-path-open').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="config-use-existing"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('holds Discard, the other places and Start from while a snapshot build is being created, then starts its install', async () => {
+    const api = mockSnapshotFile()
+    let finishCreating: (result: unknown) => void = () => {}
+    api.createFromSnapshot = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          finishCreating = resolve
+        })
+    )
+    const wrapper = await openChangeSetup()
+    await startFrom(wrapper, ALREADY_HAVE)
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+    await wrapper.get('.load-snapshot-tertiary').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="config-use-existing"]').trigger('click')
+    await flushPromises()
+
+    const discard = wrapper.get('[data-testid="config-discard-changes"]')
+    expect(discard.attributes('disabled')).toBeDefined()
+    expect(existingSelect(wrapper).props('disabled')).toBe(true)
+    expect(startFromIsHeld(wrapper)).toBe(true)
+    await discard.trigger('click')
+    await startFrom(wrapper, NEW_INSTALL)
+
+    finishCreating({ ok: true, entry: { id: 'inst-1', name: 'Studio' } })
+    await flushPromises()
+
+    expect(wrapper.emitted('show-progress')).toEqual([
+      [expect.objectContaining({ installationId: 'inst-1', opKind: 'install' })]
+    ])
+  })
+
+  it('adds the folder once when Add build is pressed twice before the first press has finished', async () => {
+    const api = mockPickedFolder()
+    let finishTracking: (result: { ok: boolean }) => void = () => {}
+    api.trackInstallation = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          finishTracking = resolve
+        })
+    )
+    const wrapper = await openChangeSetup()
+    await startFrom(wrapper, ALREADY_HAVE)
+    await wrapper.get('.track-location .config-path-browse').trigger('click')
+    await flushPromises()
+
+    const addBuild = wrapper.get<HTMLButtonElement>('[data-testid="config-use-existing"]')
+    addBuild.element.click()
+    addBuild.element.click()
+    await flushPromises()
+    expect(addBuild.attributes('disabled')).toBeDefined()
+    expect(
+      wrapper.get('[data-testid="config-discard-changes"]').attributes('disabled')
+    ).toBeDefined()
+
+    finishTracking({ ok: true })
+    await flushPromises()
+
+    expect(api.trackInstallation).toHaveBeenCalledOnce()
+    expect(wrapper.emitted('navigate-list')).toHaveLength(1)
+  })
+
+  it('holds Change until Desktop has picked a setup, so Discard goes back to that setup', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    let finishHardwareCheck: (result: { supported: boolean }) => void = () => {}
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishHardwareCheck = resolve
+      })
+    )
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const change = wrapper.get('[data-testid="config-change-setup"]')
+    expect(change.attributes('disabled')).toBeDefined()
+
+    finishHardwareCheck({ supported: true })
+    await flushPromises()
+    expect(change.attributes('disabled')).toBeUndefined()
+
+    await showChangeSetup(wrapper)
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    const summary = wrapper.get('[data-testid="config-summary"]').text()
+    expect(summary).toContain('Stable')
+    expect(summary).toContain('v0.4.2')
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
+  })
+
+  it('holds Change while the managed Builds are still loading', async () => {
+    const status = { signedIn: true, workspaceId: 'personal-server-id', workspaceType: 'personal' }
+    ;(window.api.comfybuilder.getAuthStatus as ReturnType<typeof vi.fn>).mockResolvedValue(status)
+    let finishBuilds: (builds: unknown[]) => void = () => {}
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishBuilds = resolve
+      })
+    )
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+
+    const change = wrapper.get('[data-testid="config-change-setup"]')
+    expect(change.attributes('disabled')).toBeDefined()
+
+    finishBuilds([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    await flushPromises()
+    expect(change.attributes('disabled')).toBeUndefined()
+
+    await showChangeSetup(wrapper)
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('Ready Build')
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
+  })
+
+  it('restarts a field load that Discard interrupted so Install comes back', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    let versionCalls = 0
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_source: string, fieldId: string) => {
+        if (fieldId === 'release') return [{ value: 'stable', label: 'Stable', recommended: true }]
+        versionCalls++
+        if (versionCalls === 1) return new Promise(() => {})
+        return [{ value: 'v0.4.2', label: 'v0.4.2', recommended: true }]
+      }
+    )
+    const wrapper = await openChangeSetup()
+    expect(versionCalls).toBe(1)
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(versionCalls).toBe(2)
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
+  })
+
+  it('stops loading when Discard cancels a managed Builds load started with no source picked', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockResolvedValue({
+      supported: false,
+      error: 'This CPU is missing AVX support.'
+    })
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockResolvedValue({
+      signedIn: true,
+      workspaceId: 'personal-server-id',
+      workspaceType: 'personal'
+    })
+    let finishBuilds: (builds: unknown[]) => void = () => {}
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishBuilds = resolve
+      })
+    )
+    const wrapper = await openChangeSetup()
+
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    await flushPromises()
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+    finishBuilds([{ id: 'ready', name: 'Ready Build', state: 'installable' }])
+    await flushPromises()
+
+    expect(wrapper.find('.config-loading').exists()).toBe(false)
+  })
+
+  it('drops the sign-in wait on Discard and opens the browser again when Managed is picked again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    let finishSignIn: (status: unknown) => void = () => {}
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishSignIn = resolve
+      })
+    )
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'ready', name: 'Ready Build', state: 'installable' }
+    ])
+    const wrapper = await openChangeSetup()
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(false)
+    expect(wrapper.get('.config-continue').attributes('disabled')).toBeUndefined()
+
+    await showChangeSetup(wrapper)
+    expect(sourceOption(wrapper, 'workspace-install-source-managed').disabled).toBe(false)
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    finishSignIn({ signedIn: true, workspaceId: 'personal-server-id', workspaceType: 'personal' })
+    await flushPromises()
+
+    expect(window.api.comfybuilder.signIn).toHaveBeenCalledTimes(2)
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
+    expect(wrapper.get('[data-testid="workspace-build-field"]').text()).toContain('Ready Build')
+  })
+
+  it('hints at the browser sign-in and restarts it when Managed is picked again', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    let finishSignIn: (status: unknown) => void = () => {}
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishSignIn = resolve
+      })
+    )
+    ;(window.api.comfybuilder.listBuilds as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 'ready', name: 'Ready Build', state: 'installable' }
+    ])
+    const wrapper = await openChangeSetup()
+    await pickSource(wrapper, 'workspace-install-source-managed')
+
+    expect(wrapper.get('[data-testid="managed-signin-status"]').text()).toBe(
+      'Continue in your browser'
+    )
+    expect(sourceOption(wrapper, 'workspace-install-source-managed').disabled).toBe(false)
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    expect(window.api.comfybuilder.signIn).toHaveBeenCalledTimes(2)
+
+    finishSignIn({ signedIn: true, workspaceId: 'personal-server-id', workspaceType: 'personal' })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(false)
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('true')
+  })
+
+  it('keeps the source picked during the browser sign-in when that sign-in finishes', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      { id: 'git', label: 'Git', fields: [] }
+    ])
+    mockReleaseOptions()
+    let finishSignIn: (status: unknown) => void = () => {}
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishSignIn = resolve
+      })
+    )
+    const wrapper = await openChangeSetup()
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    await pickSource(wrapper, 'install-source-git')
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(false)
+
+    finishSignIn({ signedIn: true, workspaceId: 'personal-server-id', workspaceType: 'personal' })
+    await flushPromises()
+
+    expect(sourceChecked(wrapper, 'install-source-git')).toBe('true')
+    expect(sourceChecked(wrapper, 'workspace-install-source-managed')).toBe('false')
+    expect(window.api.comfybuilder.listBuilds).not.toHaveBeenCalled()
+  })
+
+  it('opens the browser again when Managed is picked while a sign-in from another page is open', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise(() => {})
+    )
+    const wrapper = await openChangeSetup()
+    void useAuthStore()
+      .signIn()
+      .catch(() => {})
+    await flushPromises()
+    expect(window.api.comfybuilder.signIn).toHaveBeenCalledOnce()
+
+    await pickSource(wrapper, 'workspace-install-source-managed')
+
+    expect(window.api.comfybuilder.signIn).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-testid="managed-signin-status"]').text()).toBe(
+      'Continue in your browser'
+    )
+  })
+
+  it('starts clean when reopened during a Cloud sign-in, and the old pick does not come back', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    let finishSignIn: (status: unknown) => void = () => {}
+    ;(window.api.comfybuilder.signIn as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise((resolve) => {
+        finishSignIn = resolve
+      })
+    )
+    const wrapper = await openChangeSetup()
+    await pickSource(wrapper, 'workspace-install-source-managed')
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(true)
+
+    ;(window.api.validateHardware as ReturnType<typeof vi.fn>).mockResolvedValue({
+      supported: false,
+      error: 'No supported GPU'
+    })
+    wrapper.vm.open()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="managed-signin-status"]').exists()).toBe(false)
+
+    finishSignIn({ signedIn: true, workspaceId: 'personal-server-id', workspaceType: 'personal' })
+    await flushPromises()
+
+    expect(window.api.comfybuilder.listBuilds).not.toHaveBeenCalled()
+  })
+
+  it('lists the sources and the hardware in dropdowns with their icons, without signing in', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'nvidia', label: 'NVIDIA', recommended: true, data: { variantId: 'win-nvidia' } },
+      { value: 'cpu', label: 'CPU', data: { variantId: 'win-cpu' } }
+    ])
+    const wrapper = mountModal({}, { attachTo: document.body })
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    await showChangeSetup(wrapper)
+
+    expect(sourceLabels(wrapper)).toEqual(['Official release', "Your team's builds"])
+    expect(
+      (sourceSelect(wrapper).props('options') as BaseSelectOption[]).every((option) => option.icon)
+    ).toBe(true)
+    expect(window.api.comfybuilder.signIn).not.toHaveBeenCalled()
+
+    expect(hardwareLabels(wrapper)).toEqual(['NVIDIA', 'CPU'])
+    expect(pickedHardware(wrapper)).toBe('NVIDIA')
+    await pickHardware(wrapper, 'CPU')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('CPU')
+    wrapper.unmount()
+  })
+
+  it('hides the close button in Change setup so Discard and Save changes are the only ways back', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    const wrapper = mountModal()
+    ;(wrapper.vm as unknown as { open: () => Promise<void> }).open()
+    await flushPromises()
+    expect(wrapper.find('.setup-modal-close').exists()).toBe(true)
+
+    await showChangeSetup(wrapper)
+    expect(wrapper.find('.setup-modal-close').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="config-discard-changes"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.setup-modal-close').exists()).toBe(true)
+  })
+
+  it('keeps the edits when Save changes is pressed', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([releaseSource])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+
+    await pickRelease(wrapper, 'Latest on GitHub')
+    await wrapper.get('[data-testid="config-save-changes"]').trigger('click')
+
+    expect(wrapper.get('[data-testid="config-summary"]').text()).toContain('Latest on GitHub')
+    expect(wrapper.get('.config-continue').text()).toBe('Install')
+  })
+
+  it('puts Location before Hardware and draws hardware with an icon', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        id: 'standalone',
+        label: 'Standalone',
+        fields: [{ id: 'variant', label: 'Hardware', type: 'select', renderAs: 'cards' }]
+      }
+    ])
+    ;(window.api.getFieldOptions as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { value: 'mps', label: 'Apple Silicon (MPS)', recommended: true, data: { variantId: 'mps' } }
+    ])
+    const wrapper = await openChangeSetup()
+
+    const rows = wrapper.findAll('#source-fields > *')
+    expect(
+      rows.map((row) => row.attributes('data-testid') ?? row.get('.config-label').text())
+    ).toEqual(['install-location-field', 'Hardware'])
+    expect(hardwareSelect(wrapper).find('img').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="config-select-variant"] .ui-select-icon').exists()).toBe(
+      true
+    )
+  })
+
+  it('asks for the folder or the snapshot inside Change setup, with no second window', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    const wrapper = await openChangeSetup()
+    expect(wrapper.get('.setup-modal-lead').text()).toBe(
+      'Everything here is already set to what fits this computer.'
+    )
+
+    await startFrom(wrapper, ALREADY_HAVE)
+
+    expect(wrapper.get('.setup-modal-lead').text()).toBe(
+      'Point Desktop at the ComfyUI you already have.'
+    )
+    expect(existingComfyCards(wrapper)).toEqual([
+      'On this computer',
+      'On a server',
+      'In a snapshot file'
+    ])
+    expect(existingSelect(wrapper).props('modelValue')).toBe('track')
+    const form = wrapper.get('[data-testid="config-change-form"]')
+    expect(startFromLabels(wrapper)).toEqual([NEW_INSTALL, ALREADY_HAVE])
+    expect(form.findAll('.config-label').map((label) => label.text())).toEqual([
+      'How to start',
+      'Where it is',
+      'Install location',
+      'Name',
+      'Detected type'
+    ])
+    expect(wrapper.get('[data-testid="config-use-existing"]').text()).toBe('Add build')
+    expect(wrapper.find('[data-testid="config-save-changes"]').exists()).toBe(false)
+
+    await pickExisting(wrapper, 'existing-comfy-snapshot')
+    await flushPromises()
+
+    expect(form.find('.load-snapshot-dropzone').exists()).toBe(true)
+    expect(form.find('.track-form').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="config-use-existing"]').text()).toBe('Create build')
+    expect(wrapper.find('[data-testid="track-modal"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="load-snapshot-modal"]').exists()).toBe(false)
+
+    await startFrom(wrapper, NEW_INSTALL)
+
+    expect(form.find('.load-snapshot-dropzone').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="config-save-changes"]').text()).toBe('Save changes')
+  })
+
+  it('offers Connect to a server in first use with no place to pick, and connects once the EULA is agreed', async () => {
+    ;(window.api.getSources as ReturnType<typeof vi.fn>).mockResolvedValue([
+      releaseSource,
+      remoteSource
+    ])
+    mockReleaseOptions()
+    ;(window.api.buildInstallation as ReturnType<typeof vi.fn>).mockResolvedValue({
+      sourceId: 'remote'
+    })
+    const wrapper = mountModal({ hideBackToDashboard: true })
+    await wrapper.vm.open({ cameFromSetup: true, needsConsent: true, entrypoint: 'first_use' })
+    await flushPromises()
+
+    expect(startFromLabels(wrapper)).toEqual([NEW_INSTALL, CONNECT_TO_SERVER])
+    await startFrom(wrapper, CONNECT_TO_SERVER)
+
+    expect(wrapper.find('[data-testid="existing-comfy-tabs"]').exists()).toBe(false)
+    expect(wrapper.find('.track-form').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="config-save-changes"]').exists()).toBe(false)
+    const connect = wrapper.get('[data-testid="config-use-existing"]')
+    expect(connect.text()).toBe('Connect')
+
+    await connect.trigger('click')
+    await flushPromises()
+    expect(window.api.addInstallation).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="config-consent-tos"]').attributes('data-nudge')).toBe('true')
+
+    await wrapper.get('[data-testid="config-consent-tos"] [role="checkbox"]').trigger('click')
+    await flushPromises()
+    await connect.trigger('click')
+    await flushPromises()
+
+    expect(window.api.addInstallation).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceId: 'remote', status: 'installed', installPath: '' })
+    )
+    expect(wrapper.emitted('navigate-list')).toHaveLength(1)
   })
 })

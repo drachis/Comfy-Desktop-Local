@@ -1,11 +1,8 @@
-// Shared snapshot helpers used across snapshot-related components and views.
-
 import type { SnapshotDiffResult, SnapshotListData, SnapshotSummary } from '../types/ipc'
+import { formatRelativeFromMs } from './datetime'
 
 type Translator = (key: string, params?: Record<string, unknown>) => string
 
-// Session-scoped per-install cache so a remounted Snapshots tab paints instantly
-// while a background refresh runs. No eviction — one small object per install.
 const _snapshotListCache = new Map<string, SnapshotListData>()
 export function getCachedSnapshotList(installationId: string): SnapshotListData | null {
   return _snapshotListCache.get(installationId) ?? null
@@ -14,11 +11,6 @@ export function setCachedSnapshotList(installationId: string, data: SnapshotList
   _snapshotListCache.set(installationId, data)
 }
 
-/**
- * Export the install's latest snapshot via the OS save dialog. Snapshots come back
- * newest-first, so `[0]` is the current state. A cancelled save dialog returns
- * `{ ok: false }` with no message, which is treated as a successful no-op.
- */
 export async function shareLatestSnapshot(
   installationId: string
 ): Promise<{ ok: true } | { ok: false; reason: 'none' | 'error'; message?: string }> {
@@ -31,7 +23,12 @@ export async function shareLatestSnapshot(
   return { ok: true }
 }
 
-/** Localised trigger label (requires the `t` function from `useI18n`). */
+const LEGACY_SENTINEL_LABELS = new Set(['before-update', 'after-update', 'after-restore'])
+
+export function isDisplayableLabel(label: string | null | undefined): boolean {
+  return !!label && !LEGACY_SENTINEL_LABELS.has(label)
+}
+
 export function triggerLabel(trigger: string, t: (key: string) => string): string {
   switch (trigger) {
     case 'boot':
@@ -51,19 +48,16 @@ export function triggerLabel(trigger: string, t: (key: string) => string): strin
   }
 }
 
-/** Format an ISO date string for display. */
 export function formatDate(iso: string): string {
   return new Date(iso).toLocaleString()
 }
 
-/** Display a node version, falling back to short commit hash or em-dash. */
 export function formatNodeVersion(node: { version?: string; commit?: string }): string {
   if (node.version) return node.version
   if (node.commit) return node.commit.slice(0, 7)
   return '—'
 }
 
-/** CSS class suffix for a snapshot trigger badge / dot. */
 export function triggerClass(trigger: string): string {
   switch (trigger) {
     case 'boot':
@@ -83,20 +77,10 @@ export function triggerClass(trigger: string): string {
   }
 }
 
-/** Localised relative-time string (e.g. "5 minutes ago"). */
 export function formatRelative(iso: string, t: Translator): string {
-  const diff = Date.now() - new Date(iso).getTime()
-  const mins = Math.floor(diff / 60000)
-  if (mins < 1) return t('snapshots.timeJustNow')
-  if (mins < 60) return t('snapshots.timeMinutesAgo', { count: mins })
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return t('snapshots.timeHoursAgo', { count: hours })
-  const days = Math.floor(hours / 24)
-  if (days < 30) return t('snapshots.timeDaysAgo', { count: days })
-  return new Date(iso).toLocaleDateString()
+  return formatRelativeFromMs(new Date(iso).getTime(), t)
 }
 
-/** Localised label for a copy-event reason. */
 export function copyReasonLabel(reason: string, t: Translator): string {
   switch (reason) {
     case 'copy-update':
@@ -110,7 +94,6 @@ export function copyReasonLabel(reason: string, t: Translator): string {
   }
 }
 
-/** Short change badges (e.g. "+2 −1 ~3 nodes") summarising a snapshot vs its predecessor. */
 export function changeSummary(s: SnapshotSummary, t: Translator): string[] {
   if (!s.diffVsPrevious) return []
   const parts: string[] = []
@@ -132,7 +115,6 @@ export function changeSummary(s: SnapshotSummary, t: Translator): string[] {
   return parts
 }
 
-/** Convert a snapshot diff into grouped detail lines for the restore-confirm modal, each list capped at `cap`. */
 export function diffToDetailGroups(
   diff: SnapshotDiffResult,
   t: Translator,
@@ -175,7 +157,6 @@ export function diffToDetailGroups(
   return groups
 }
 
-/** True when the diff has any non-zero change. */
 export function diffHasChanges(diff: SnapshotDiffResult): boolean {
   return (
     diff.comfyuiChanged ||

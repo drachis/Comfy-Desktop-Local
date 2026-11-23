@@ -1,23 +1,14 @@
 <script setup lang="ts">
+import type { CoachmarkBeakPayload } from '../../../types/ipc'
 import { nextTick, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 
-/**
- * Title-tooltip popup renderer. Renders the hover bubble (and onboarding
- * coachmark) and reports its rendered size to main on each config update so
- * main resizes the popup view before showing it. Used because macOS doesn't
- * reliably surface native `title` tooltips for unfocused sibling chrome views.
- */
-
 interface TooltipConfig {
-  /** `'tooltip'` (default) for the hover bubble; `'coachmark'` for the
-   *  onboarding card. */
   variant?: 'tooltip' | 'coachmark'
-  /** Hover-bubble body (tooltip variant). */
   text?: string
-  /** Coachmark title + body + dismiss label (coachmark variant). */
   title?: string
   body?: string
   dismissLabel?: string
+  actionLabel?: string
   theme: { bg: string; text: string; border: string; accent?: string }
   configToken: string
 }
@@ -26,9 +17,9 @@ interface Bridge {
   ready(): void
   notifyRendered(payload: { width: number; height: number; configToken: string }): void
   onConfig(cb: (config: TooltipConfig) => void): () => void
-  /** Coachmark dismiss button — tells main to hide + persist the
-   *  once-ever flag. No-op for the tooltip variant. */
-  dismissCoachmark?(): void
+  dismissCoachmark?(configToken: string): void
+  onBeak?(cb: (payload: CoachmarkBeakPayload) => void): () => void
+  actionCoachmark?(configToken: string): void
 }
 
 const bridge = (window as unknown as { __comfyTitleTooltip?: Bridge }).__comfyTitleTooltip
@@ -38,32 +29,27 @@ const text = ref<string>('')
 const cmTitle = ref<string>('')
 const cmBody = ref<string>('')
 const cmDismissLabel = ref<string>('Got it')
-const themeBg = ref<string>('#211927')
-const themeText = ref<string>('#ffffff')
-const themeBorder = ref<string>('#38303d')
-const themeAccent = ref<string>('#e3ff3c')
+const cmActionLabel = ref<string>('')
+const cmBeakFraction = ref<number>(0.5)
+const cmCardCentre = ref<number | null>(null)
+const themeBg = ref<string>('rgba(42, 42, 42, 0.94)')
+const themeText = ref<string>('#f0f0f0')
+const themeBorder = ref<string>('rgba(241, 241, 241, 0.07)')
+const themeAccent = ref<string>('#f0f0f1')
 const coachmarkBorder = 'rgba(255, 255, 255, 0.22)'
-/** Token of the latest config, echoed in every render-ack so main can discard
- *  stale acks. */
 let currentConfigToken = ''
 
 const bubbleRef = useTemplateRef<HTMLElement>('bubble')
 
 let unsubConfig: (() => void) | undefined
+let unsubBeak: (() => void) | undefined
 
-/** Wait for the Inter web font before measuring, else the first show measures in
- *  the fallback font and reports a wrong size, making the bubble visibly
- *  re-size when the real font paints. */
 async function measureAndAck(): Promise<void> {
-  // Capture the token now; a config change mid-await produces a stale ack that
-  // main ignores because the token won't match.
   const token = currentConfigToken
   if (document.fonts && typeof document.fonts.ready?.then === 'function') {
     try {
       await document.fonts.ready
-    } catch {
-      // Best-effort — fall through to measuring with whatever's loaded.
-    }
+    } catch {}
   }
   await nextTick()
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
@@ -88,15 +74,21 @@ onMounted(() => {
     cmTitle.value = cfg.title ?? ''
     cmBody.value = cfg.body ?? ''
     cmDismissLabel.value = cfg.dismissLabel ?? cmDismissLabel.value
+    cmActionLabel.value = cfg.actionLabel ?? ''
     themeBg.value = cfg.theme.bg
     themeText.value = cfg.theme.text
     themeBorder.value = cfg.theme.border
     if (cfg.theme.accent) themeAccent.value = cfg.theme.accent
     void measureAndAck()
   })
+  unsubBeak = bridge?.onBeak?.(({ beakFraction, cardCentreInView }) => {
+    cmBeakFraction.value = Math.min(1, Math.max(0, beakFraction))
+    cmCardCentre.value =
+      typeof cardCentreInView === 'number' && Number.isFinite(cardCentreInView)
+        ? Math.max(0, cardCentreInView)
+        : null
+  })
   bridge?.ready()
-  // Re-measure if Inter loads mid-session (after the initial ack) so main can
-  // resize to the new metrics.
   if (document.fonts && typeof document.fonts.addEventListener === 'function') {
     document.fonts.addEventListener('loadingdone', () => {
       if (text.value) void measureAndAck()
@@ -104,18 +96,21 @@ onMounted(() => {
   }
 })
 
-// Defensive re-measure if rendered text changes outside the config push (HMR,
-// future mutations that bypass `onConfig`).
-watch([text, cmTitle, cmBody], () => {
+watch([text, cmTitle, cmBody, cmActionLabel], () => {
   void measureAndAck()
 })
 
 function onDismiss(): void {
-  bridge?.dismissCoachmark?.()
+  bridge?.dismissCoachmark?.(currentConfigToken)
+}
+
+function onAction(): void {
+  bridge?.actionCoachmark?.(currentConfigToken)
 }
 
 onUnmounted(() => {
   unsubConfig?.()
+  unsubBeak?.()
 })
 </script>
 
@@ -123,34 +118,70 @@ onUnmounted(() => {
   <div
     v-if="variant === 'coachmark'"
     ref="bubble"
-    class="coachmark"
+    class="coachmark relative mx-auto mt-[7px] box-border block w-max max-w-[280px] select-none rounded-[10px] border border-solid px-3.5 py-3 font-sans text-[13px] leading-[1.45] font-normal [box-shadow:inset_0_0_0_1px_rgba(255,255,255,0.04),0_8px_24px_rgba(0,0,0,0.5)]"
     role="dialog"
     aria-modal="false"
     :aria-label="cmTitle"
     :style="{
       background: themeBg,
       color: themeText,
-      borderColor: coachmarkBorder
+      borderColor: coachmarkBorder,
+      ...(cmCardCentre === null
+        ? {}
+        : {
+            marginLeft: '0',
+            marginRight: '0',
+            position: 'relative',
+            left: `${cmCardCentre}px`,
+            transform: 'translateX(-50%)'
+          })
     }"
   >
-    <span class="coachmark-beak" :style="{ background: themeBg, borderColor: coachmarkBorder }" />
+    <span
+      class="coachmark-beak absolute -top-1.5 left-1/2 size-3 rounded-tl-[3px] border-t border-l border-solid [transform:translateX(-50%)_rotate(45deg)]"
+      :style="{
+        background: themeBg,
+        borderColor: coachmarkBorder,
+        left: `${cmBeakFraction * 100}%`
+      }"
+    />
     <div class="coachmark-body">
-      <div class="coachmark-title" :style="{ color: themeAccent }">{{ cmTitle }}</div>
-      <p class="coachmark-text">{{ cmBody }}</p>
-      <button
-        type="button"
-        class="coachmark-dismiss"
+      <div
+        class="coachmark-title text-[13px] font-semibold tracking-[-0.01em] [overflow-wrap:anywhere]"
         :style="{ color: themeAccent }"
-        @click="onDismiss"
       >
-        {{ cmDismissLabel }}
-      </button>
+        {{ cmTitle }}
+      </div>
+      <p
+        class="coachmark-text mt-1 mr-0 mb-2.5 ml-0 text-[12px] leading-[1.5] opacity-88 [overflow-wrap:anywhere]"
+      >
+        {{ cmBody }}
+      </p>
+      <div class="coachmark-actions flex items-center gap-3.5">
+        <button
+          v-if="cmActionLabel"
+          type="button"
+          class="coachmark-action rounded-lg appearance-none border-0 border-none border-current bg-transparent px-0 py-0.5 font-[inherit] text-[12px] leading-[inherit] font-semibold cursor-pointer hover:underline"
+          :style="{ color: themeAccent }"
+          @click="onAction"
+        >
+          {{ cmActionLabel }}
+        </button>
+        <button
+          type="button"
+          class="coachmark-dismiss rounded-lg appearance-none border-0 border-none border-current bg-transparent px-0 py-0.5 font-[inherit] text-[12px] leading-[inherit] font-semibold cursor-pointer hover:underline"
+          :style="{ color: themeAccent }"
+          @click="onDismiss"
+        >
+          {{ cmDismissLabel }}
+        </button>
+      </div>
     </div>
   </div>
   <span
-    v-else
+    v-else-if="text"
     ref="bubble"
-    class="bubble"
+    class="bubble pointer-events-none box-border inline-block w-max max-w-[256px] select-none rounded-control border border-solid px-[9px] py-[5px] font-sans text-[12px] leading-[16.2px] font-medium tracking-normal whitespace-normal [box-shadow:0_8px_12px_rgba(0,0,0,0.5)]"
     :style="{
       background: themeBg,
       color: themeText,
@@ -159,100 +190,3 @@ onUnmounted(() => {
     >{{ text }}</span
   >
 </template>
-
-<style scoped>
-:global(html),
-:global(body),
-:global(#app) {
-  margin: 0;
-  width: 100%;
-  height: 100%;
-  background: transparent !important;
-  overflow: hidden;
-}
-
-/* Center the bubble horizontally; anchor it to the top (asymmetric gutter). */
-:global(body) {
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-}
-
-/* Shrink-wraps its text so main can measure and resize the view. Chrome matches
-   the panel-side `.info-tooltip-bubble` so the popup looks identical. */
-.bubble {
-  display: inline-block;
-  width: max-content;
-  max-width: 260px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid;
-  font: 12px/1.4 var(--font-sans, 'Inter', system-ui, sans-serif);
-  font-weight: 400;
-  letter-spacing: 0;
-  white-space: normal;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
-  user-select: none;
-  box-sizing: border-box;
-}
-
-/* Coachmark card — sticky onboarding hint, sized from its measured rect. */
-.coachmark {
-  position: relative;
-  display: block;
-  width: max-content;
-  max-width: 280px;
-  margin-top: 7px; /* room for the beak above the card */
-  padding: 12px 14px;
-  border-radius: 10px;
-  border: 1px solid;
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.04),
-    0 8px 24px rgba(0, 0, 0, 0.5);
-  font: 13px/1.45 var(--font-sans, 'Inter', system-ui, sans-serif);
-  user-select: none;
-  box-sizing: border-box;
-}
-
-/* Upward beak: a rotated square sharing the card's bg + border. */
-.coachmark-beak {
-  position: absolute;
-  top: -6px;
-  left: 50%;
-  width: 12px;
-  height: 12px;
-  transform: translateX(-50%) rotate(45deg);
-  border-top: 1px solid;
-  border-left: 1px solid;
-  border-top-left-radius: 3px;
-}
-
-.coachmark-title {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-.coachmark-text {
-  margin: 4px 0 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  opacity: 0.88;
-}
-
-.coachmark-dismiss {
-  appearance: none;
-  background: transparent;
-  border: none;
-  padding: 2px 0;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.coachmark-dismiss:hover {
-  text-decoration: underline;
-}
-</style>

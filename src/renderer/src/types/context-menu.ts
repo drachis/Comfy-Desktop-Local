@@ -1,9 +1,13 @@
+import type { Component } from 'vue'
+
 export interface ContextMenuItem {
   id: string
   label: string
-  icon?: string
+  hint?: string
+  hintUrl?: string
+  hintLinkLabel?: string
+  icon?: Component
   disabled?: boolean
-  /** Hover tooltip, typically the reason a disabled item can't be used. */
   title?: string
   separator?: boolean
   style?: 'default' | 'danger'

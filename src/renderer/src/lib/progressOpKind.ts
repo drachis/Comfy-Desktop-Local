@@ -7,9 +7,6 @@ export function progressOpKindForActionId(actionId: string): ProgressOpKind {
     case 'launch':
     case 'restart':
       return 'launch'
-    // A version check is a read, not an update - it must never paint
-    // update-op UI (the dashboard tile's "Updating" pill keys on this kind),
-    // and the includes('update') fallback below would misclassify it.
     case 'check-update':
       return 'generic'
     case 'delete':
@@ -29,7 +26,6 @@ export function progressOpKindForActionId(actionId: string): ProgressOpKind {
   }
 }
 
-/** Actions that finish almost instantly, so they never warrant a busy indicator or a launch block. */
 const QUICK_ACTION_IDS: ReadonlySet<string> = new Set([
   'launch',
   'rename',
@@ -38,12 +34,21 @@ const QUICK_ACTION_IDS: ReadonlySet<string> = new Set([
   'check-update'
 ])
 
-/** True for actions worth showing as in progress and blocking a launch while they run. */
 export function isLongRunningActionId(actionId: string): boolean {
   return !QUICK_ACTION_IDS.has(actionId)
 }
 
-/** Whether the action removes the install from the registry on success. */
+export function isUninstallOpKind(opKind: ProgressOpKind | undefined): boolean {
+  return opKind === 'destructive'
+}
+
 export function destroysInstanceForActionId(actionId: string): boolean {
   return actionId === 'delete'
+}
+
+export function updatesBuildInPlace(
+  opKind: ProgressOpKind | undefined,
+  actionId: string | undefined
+): boolean {
+  return opKind === 'update' && !actionId?.startsWith('copy-')
 }

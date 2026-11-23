@@ -13,6 +13,7 @@ import {
   quarantineOrphanStagedBytes,
   readStagedMeta,
   removeStagedArtifacts,
+  revalidateStagedPair,
   scanForStagedDownloads,
   sha256File,
   stagingMetaPathFor,
@@ -96,6 +97,48 @@ describe('readStagedMeta / writeStagedMeta', () => {
     expect(readStagedMeta(metaPath)).toBeNull()
   })
 
+  it('round-trips a v3 sidecar whose segments cover the file exactly', () => {
+    const metaPath = path.join(tmpDir, 'seg' + STAGING_META_SUFFIX)
+    const meta = validMeta({
+      version: 3,
+      expectedSize: 10,
+      segments: [
+        { start: 0, end: 4, done: 5 },
+        { start: 5, end: 9, done: 2 }
+      ]
+    })
+    writeStagedMeta(metaPath, meta)
+    expect(readStagedMeta(metaPath)).toEqual(meta)
+  })
+
+  const seg = (start: unknown, end: unknown, done: unknown) => ({ start, end, done })
+
+  it.each([
+    ['no segments', undefined],
+    ['a gap', [seg(0, 3, 0), seg(5, 9, 0)]],
+    ['a short last segment', [seg(0, 4, 0), seg(5, 8, 0)]],
+    ['more done than the segment holds', [seg(0, 4, 6), seg(5, 9, 0)]],
+    ['a negative count', [seg(0, 4, -1), seg(5, 9, 0)]],
+    ['a non-number field', [seg(0, '4', 0), seg(5, 9, 0)]]
+  ])('returns null for a v3 sidecar with %s', (_label, segments) => {
+    const metaPath = path.join(tmpDir, 'badseg' + STAGING_META_SUFFIX)
+    const raw = { ...validMeta({ expectedSize: 10 }), version: 3, segments }
+    fs.writeFileSync(metaPath, JSON.stringify(raw))
+    expect(readStagedMeta(metaPath)).toBeNull()
+  })
+
+  it('returns null for a v2 sidecar that carries segments', () => {
+    const metaPath = path.join(tmpDir, 'v2seg' + STAGING_META_SUFFIX)
+    fs.writeFileSync(
+      metaPath,
+      JSON.stringify({
+        ...validMeta({ expectedSize: 10 }),
+        segments: [{ start: 0, end: 9, done: 0 }]
+      })
+    )
+    expect(readStagedMeta(metaPath)).toBeNull()
+  })
+
   it('returns null for a wrong version', () => {
     const metaPath = path.join(tmpDir, 'v1' + STAGING_META_SUFFIX)
     fs.writeFileSync(metaPath, JSON.stringify({ ...validMeta(), version: 1 }))
@@ -113,9 +156,6 @@ describe('readStagedMeta / writeStagedMeta', () => {
   })
 
   it('prefers a valid .tmp sidecar over a stale main sidecar (newest durable write wins)', () => {
-    // A rewrite whose replacing rename failed leaves the NEWEST content in
-    // .tmp while the main sidecar still holds stale content. Resuming or
-    // finalizing against the stale expectedSize would be wrong.
     const metaPath = path.join(tmpDir, 'model.safetensors' + STAGING_META_SUFFIX)
     fs.writeFileSync(metaPath, JSON.stringify(validMeta({ expectedSize: 10, etag: '"stale"' })))
     fs.writeFileSync(
@@ -130,16 +170,11 @@ describe('readStagedMeta / writeStagedMeta', () => {
   it('falls back to the main sidecar when the .tmp copy is torn', () => {
     const metaPath = path.join(tmpDir, 'model.safetensors' + STAGING_META_SUFFIX)
     fs.writeFileSync(metaPath, JSON.stringify(validMeta({ expectedSize: 10 })))
-    // Crash mid-write leaves a torn scratch copy - it must not mask the
-    // valid main sidecar.
     fs.writeFileSync(metaPath + '.tmp', '{ torn')
     expect(readStagedMeta(metaPath)?.expectedSize).toBe(10)
   })
 
   it('rewrites an existing sidecar in place without leaving the temp file', () => {
-    // Sidecars are updated repeatedly across a job's life (per response,
-    // validator refresh) - replacement of an EXISTING file must work and
-    // leave no scratch litter, including on Windows.
     const metaPath = path.join(tmpDir, 'model.safetensors' + STAGING_META_SUFFIX)
     writeStagedMeta(metaPath, validMeta({ expectedSize: 10, etag: '"v1"' }))
     writeStagedMeta(metaPath, validMeta({ expectedSize: 20, etag: '"v2"' }))
@@ -182,6 +217,48 @@ describe('scanForStagedDownloads', () => {
     expect(found[0]!.meta).toEqual(meta)
   })
 
+  it('reports the bytes the segments hold, not the preallocated file size', async () => {
+    const dir = path.join(tmpDir, 'checkpoints')
+    fs.mkdirSync(dir, { recursive: true })
+    const finalPath = path.join(dir, 'model.safetensors')
+    fs.writeFileSync(stagingPathFor(finalPath), Buffer.alloc(1000))
+    const meta = validMeta({
+      version: 3,
+      segments: [
+        { start: 0, end: 499, done: 120 },
+        { start: 500, end: 999, done: 30 }
+      ]
+    })
+    writeStagedMeta(stagingMetaPathFor(finalPath), meta)
+
+    const { downloads: found } = await scanForStagedDownloads([tmpDir])
+    expect(found).toHaveLength(1)
+    expect(found[0]!.stagedBytes).toBe(150)
+    expect(found[0]!.meta).toEqual(meta)
+  })
+
+  it('reports no saved bytes when the .part file no longer has the size the segments need', async () => {
+    const dir = path.join(tmpDir, 'checkpoints')
+    fs.mkdirSync(dir, { recursive: true })
+    const finalPath = path.join(dir, 'model.safetensors')
+    fs.writeFileSync(stagingPathFor(finalPath), Buffer.alloc(100))
+    writeStagedMeta(
+      stagingMetaPathFor(finalPath),
+      validMeta({
+        version: 3,
+        segments: [
+          { start: 0, end: 499, done: 500 },
+          { start: 500, end: 999, done: 250 }
+        ]
+      })
+    )
+
+    const { downloads: found } = await scanForStagedDownloads([tmpDir])
+    expect(found).toHaveLength(1)
+    expect(found[0]!.stagedBytes).toBe(0)
+    expect(revalidateStagedPair(finalPath)?.stagedBytes).toBe(0)
+  })
+
   it('deletes a sidecar whose .part file is missing and does not report it', async () => {
     const finalPath = path.join(tmpDir, 'model.safetensors')
     writeStagedMeta(stagingMetaPathFor(finalPath), validMeta())
@@ -212,8 +289,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('drops redundant staging when the final file has identical bytes', async () => {
-    // Crash between install and sidecar cleanup: final and staged copies are
-    // byte-identical, so the staging pair is provably redundant.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, 'the real model')
     fs.writeFileSync(stagingPathFor(finalPath), 'the real model')
@@ -227,10 +302,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('keeps a staged pair whose final name holds DIFFERENT content and hydrates it', async () => {
-    // A different file at the final name (e.g. the user dropped in another
-    // model) does not make the staged bytes disposable: keep the pair and
-    // report it so it hydrates as an actionable paused job; resuming later
-    // surfaces the conflict through the transport's no-clobber install.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, 'user-provided model')
     fs.writeFileSync(stagingPathFor(finalPath), 'partial download')
@@ -245,14 +316,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('parks a zero-byte claim marker off the final name and hydrates the staged pair', async () => {
-    // Crash inside the link-less install fallback: it claims the final name
-    // with an empty exclusive-create marker before renaming the verified
-    // bytes onto it. The zero-byte file is never a real model - ComfyUI
-    // would scan it as a broken one - so the scan parks it under a non-model
-    // name and the staged pair hydrates as a normal actionable paused job.
-    // The parked marker is NEVER deleted, even while still empty: a writer
-    // that already had the original name open can land bytes at any later
-    // moment, and unlinking would drop them into an unlinked inode.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, '')
     fs.writeFileSync(stagingPathFor(finalPath), 'downloaded bytes')
@@ -263,7 +326,6 @@ describe('scanForStagedDownloads', () => {
     expect(found[0]?.finalPath).toBe(finalPath)
     expect(unsafeFinalPaths).toHaveLength(0)
     expect(fs.existsSync(finalPath)).toBe(false)
-    // The parked marker survives as inert non-model clutter.
     expect(fs.existsSync(finalPath + '.claimed.part')).toBe(true)
     expect(fs.statSync(finalPath + '.claimed.part').size).toBe(0)
     expect(fs.readFileSync(stagingPathFor(finalPath), 'utf-8')).toBe('downloaded bytes')
@@ -271,12 +333,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('parks a zero-byte claim marker even when the staged bytes are also empty', async () => {
-    // Crash right after the placeholder + claim marker were created, before
-    // any byte landed: final name and .part are BOTH zero bytes. Two empty
-    // files are byte-identical, so without the explicit zero-final guard the
-    // redundant-staging branch would delete the pair and leave the zero-byte
-    // fake model visible to ComfyUI (#1322). The marker must still be parked
-    // and the empty pair must hydrate as a normal paused job.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, '')
     fs.writeFileSync(stagingPathFor(finalPath), '')
@@ -294,12 +350,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('reports the final path as unsafe when the zero-byte claim marker cannot be moved', async () => {
-    // The marker is locked (e.g. a scanner holds it open on Windows): the
-    // broken-looking file stays visible under a final model name, so the
-    // scan must surface it (warning row; jobs to that destination refused)
-    // instead of silently hydrating
-    // around it. The staged pair still hydrates as an actionable paused job.
-    // Both park primitives (hard link and claim+rename fallback) fail.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, '')
     fs.writeFileSync(stagingPathFor(finalPath), 'downloaded bytes')
@@ -325,10 +375,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('preserves bytes an external writer landed in the claim marker between stat and move', async () => {
-    // TOCTOU guard: the scan stats the final name as zero bytes, but by the
-    // time it moves the marker aside an external copy has started filling
-    // it. The move (a rename, never an in-place delete) carries those bytes
-    // to the parked non-model name, where the non-empty check preserves them.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(finalPath, '')
     fs.writeFileSync(stagingPathFor(finalPath), 'downloaded bytes')
@@ -337,8 +383,6 @@ describe('scanForStagedDownloads', () => {
     const realStat = fs.statSync
     const statSpy = vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike, ...rest) => {
       if (p === finalPath) {
-        // Simulate the external writer landing bytes right after the scan's
-        // zero-size observation.
         statSpy.mockRestore()
         const stat = realStat(finalPath)
         fs.writeFileSync(finalPath, 'external bytes')
@@ -369,8 +413,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('ignores and preserves a staged pair whose final name is not a model file', async () => {
-    // Only model files are launcher-staged; a foreign .part/.dl-meta pair
-    // under a model root is not ours to hydrate or delete.
     const finalPath = path.join(tmpDir, 'notes.txt')
     fs.writeFileSync(stagingPathFor(finalPath), 'abc')
     writeStagedMeta(stagingMetaPathFor(finalPath), validMeta({ filename: 'notes.txt' }))
@@ -384,7 +426,6 @@ describe('scanForStagedDownloads', () => {
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(stagingPathFor(finalPath), 'abc')
     writeStagedMeta(stagingMetaPathFor(finalPath), validMeta())
-    // A crash between writeFileSync(tmp) and renameSync leaves this behind.
     const tmpLeftover = stagingMetaPathFor(finalPath) + '.tmp'
     fs.writeFileSync(tmpLeftover, '{ torn')
     const { downloads: found } = await scanForStagedDownloads([tmpDir])
@@ -430,8 +471,6 @@ describe('scanForStagedDownloads', () => {
 
     const { downloads: found } = await scanForStagedDownloads([tmpDir])
     expect(found).toHaveLength(1)
-    // The newest durable write wins - a stale expectedSize must never
-    // resume/finalize the job.
     expect(found[0]!.meta.expectedSize).toBe(4000)
     expect(found[0]!.meta.etag).toBe('"newer"')
     expect(readStagedMeta(metaPath)?.etag).toBe('"newer"')
@@ -445,9 +484,6 @@ describe('scanForStagedDownloads', () => {
     const tmpPath = metaPath + '.tmp'
     fs.writeFileSync(tmpPath, JSON.stringify(validMeta({ expectedSize: 4000 })))
 
-    // Rename fails (e.g. a scanner holding the file open on Windows). The
-    // .tmp copy is the ONLY valid resume identity - it must be preserved and
-    // the job must still be discovered through the readStagedMeta fallback.
     const renameSpy = vi
       .spyOn(fs.promises, 'rename')
       .mockRejectedValue(Object.assign(new Error('EPERM'), { code: 'EPERM' }))
@@ -463,9 +499,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('enumerates a root nested inside another root only once', async () => {
-    // The outer root's walk already covers the nested root's tree, so the
-    // nested root must be pruned instead of walked a second time (boot-time
-    // scans over large trees are expensive and run on the main process).
     const sub = path.join(tmpDir, 'checkpoints')
     fs.mkdirSync(sub, { recursive: true })
     const finalPath = path.join(sub, 'model.safetensors')
@@ -490,8 +523,6 @@ describe('scanForStagedDownloads', () => {
   })
 
   it('still walks a nested root that sits under a skipped directory name', async () => {
-    // The outer root's walk skips node_modules, so a root inside it is NOT
-    // covered and must not be pruned.
     const nestedRoot = path.join(tmpDir, 'node_modules', 'models')
     fs.mkdirSync(nestedRoot, { recursive: true })
     const finalPath = path.join(nestedRoot, 'model.safetensors')
@@ -514,27 +545,19 @@ describe('quarantineOrphanStagedBytes', () => {
     fs.writeFileSync(stagingPath, 'second')
     expect(quarantineOrphanStagedBytes(finalPath)).toBe(true)
 
-    // Both quarantines survive with distinct names ...
     expect(fs.readFileSync(stagingPath + '.orphan', 'utf-8')).toBe('first')
     expect(fs.readFileSync(stagingPath + '.orphan-1', 'utf-8')).toBe('second')
     expect(fs.existsSync(stagingPath)).toBe(false)
-    // ... and no parked name is visible to ComfyUI's model scan or to
-    // launcher staging discovery.
     expect(hasModelExtension(path.basename(stagingPath + '.orphan'))).toBe(false)
     expect((stagingPath + '.orphan').endsWith(STAGING_SUFFIX)).toBe(false)
   })
 
   it('returns false when the bytes cannot be moved', () => {
     const finalPath = path.join(tmpDir, 'model.safetensors')
-    expect(quarantineOrphanStagedBytes(finalPath)).toBe(false) // nothing staged
+    expect(quarantineOrphanStagedBytes(finalPath)).toBe(false)
   })
 
   it('fails closed on a real link error instead of degrading to claim+rename', () => {
-    // EIO (or EACCES/ENOSPC/...) is a genuine failure, not a "hard links
-    // unsupported here" capability gap: the claim-close-rename fallback has
-    // a clobber window that is only acceptable when no atomic no-replace
-    // primitive exists. A disk-level error must abort the parking entirely -
-    // no claim marker, no rename attempt, source untouched.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     const orphanPath = stagingPathFor(finalPath)
     fs.writeFileSync(orphanPath, 'quarantined')
@@ -546,7 +569,6 @@ describe('quarantineOrphanStagedBytes', () => {
     const renameSpy = vi.spyOn(fs, 'renameSync')
     try {
       expect(quarantineOrphanStagedBytes(finalPath)).toBe(false)
-      // The rename fallback was never attempted.
       expect(openSpy).not.toHaveBeenCalled()
       expect(renameSpy).not.toHaveBeenCalled()
     } finally {
@@ -583,9 +605,6 @@ describe('ensureStagedPlaceholder', () => {
   })
 
   it('persists a new caller hash onto an existing hashless sidecar, keeping its resume identity', () => {
-    // A crash after preflight but before the transport's response-phase
-    // sidecar rewrite must still hydrate with the caller's hash - otherwise
-    // the restarted job would finalize without verification.
     const finalPath = path.join(tmpDir, 'model.safetensors')
     fs.writeFileSync(stagingPathFor(finalPath), 'staged-bytes')
     const existing = validMeta({ expectedSize: 999, etag: '"keep-me"' })
@@ -623,8 +642,6 @@ describe('ensureStagedPlaceholder', () => {
     fs.writeFileSync(stagingPathFor(finalPath), 'staged-bytes')
     writeStagedMeta(stagingMetaPathFor(finalPath), validMeta())
 
-    // Both the scratch write and its cleanup fail -> no durable copy of the
-    // upgraded sidecar can exist.
     const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
       throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
     })
@@ -641,10 +658,8 @@ describe('ensureStagedPlaceholder', () => {
 
     const meta = validMeta()
     expect(ensureStagedPlaceholder(finalPath, meta)).toBe(true)
-    // A fresh hydratable pair was created ...
     expect(fs.statSync(stagingPathFor(finalPath)).size).toBe(0)
     expect(readStagedMeta(stagingMetaPathFor(finalPath))).toEqual(meta)
-    // ... and the foreign bytes were preserved under a parked name.
     expect(fs.readFileSync(stagingPathFor(finalPath) + '.orphan', 'utf-8')).toBe('quarantined')
   })
 
@@ -653,7 +668,6 @@ describe('ensureStagedPlaceholder', () => {
     const orphanPath = stagingPathFor(finalPath)
     fs.writeFileSync(orphanPath, 'quarantined')
 
-    // Both park primitives (hard link and claim+rename fallback) fail.
     const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
       throw Object.assign(new Error('EPERM'), { code: 'EPERM' })
     })
@@ -670,7 +684,6 @@ describe('ensureStagedPlaceholder', () => {
   })
 
   it('returns false when the placeholder cannot be created', () => {
-    // Parent directory does not exist -> writeFileSync fails.
     const finalPath = path.join(tmpDir, 'missing-dir', 'model.safetensors')
     expect(ensureStagedPlaceholder(finalPath, validMeta())).toBe(false)
   })
@@ -719,7 +732,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
 
     const result = await migrateLegacyModelDownloadArtifacts([tmpDir])
     expect(result.staged).toEqual([stagingPathFor(dataPath)])
-    // The truncated bytes no longer live under a model extension.
     expect(fs.existsSync(dataPath)).toBe(false)
     expect(fs.statSync(stagingPathFor(dataPath)).size).toBe(40)
     expect(fs.existsSync(metaPath)).toBe(false)
@@ -744,7 +756,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
     expect(fs.existsSync(dataPath)).toBe(false)
     expect(fs.statSync(stagingPathFor(dataPath)).size).toBe(55)
     expect(fs.existsSync(metaPath)).toBe(false)
-    // No resumable sidecar was fabricated for unknown provenance.
     expect(fs.existsSync(stagingMetaPathFor(dataPath))).toBe(false)
   })
 
@@ -790,7 +801,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
       url: 'https://example.com/clash.safetensors',
       expectedSize: 100
     })
-    // v2 staged transfer already in progress for the same destination.
     fs.writeFileSync(stagingPathFor(dataPath), 'authoritative v2 partial')
 
     const result = await migrateLegacyModelDownloadArtifacts([tmpDir])
@@ -826,11 +836,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
   })
 
   it('tolerates a missing root but propagates an unreadable one', async () => {
-    // A root that does not exist is normal (fresh install, optional extra
-    // path) and scans as empty. A root that EXISTS but cannot be enumerated
-    // (EACCES/EIO) may hide legacy truncated files under final model names -
-    // swallowing that error would certify a scan that never happened, so it
-    // must propagate (the caller gates launch on a failed pass).
     const missing = path.join(tmpDir, 'does-not-exist')
     await expect(migrateLegacyModelDownloadArtifacts([missing])).resolves.toBeTruthy()
 
@@ -844,9 +849,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
   })
 
   it('reports a pair unsafe (and keeps its sidecar) when the data file cannot be statted', async () => {
-    // EACCES on stat: the data file may be a truncated model visible to
-    // ComfyUI. Treating it as missing would delete the sidecar - the resume
-    // identity - while the broken file stays. It must be unsafe instead.
     const { dataPath, metaPath } = writeLegacyPair(
       path.join(tmpDir, 'checkpoints'),
       'locked.safetensors',
@@ -877,9 +879,6 @@ describe('migrateLegacyModelDownloadArtifacts', () => {
 
 describe('scanForStagedDownloads root failures', () => {
   it('propagates an unreadable root instead of scanning it as empty (fail closed)', async () => {
-    // The scan is what finds zero-byte final-name claim markers; a swallowed
-    // enumeration failure would certify "no broken finals" over a tree that
-    // was never checked. The caller treats the rejection as unsafe.
     const err = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
     const readdirSpy = vi.spyOn(fs.promises, 'readdir').mockRejectedValue(err)
     try {
@@ -898,8 +897,6 @@ describe('scanForStagedDownloads root failures', () => {
   })
 
   it('discovers sidecars nested deeper than the lenient depth cap', async () => {
-    // Strict mode must not silently stop at SCAN_MAX_DEPTH: a certified scan
-    // has to cover the whole tree.
     let dir = tmpDir
     for (let i = 0; i < 10; i++) dir = path.join(dir, `d${i}`)
     fs.mkdirSync(dir, { recursive: true })

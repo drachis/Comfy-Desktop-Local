@@ -1,4 +1,3 @@
-// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { listWorkspaceMembers, listWorkspaces } from './workspaces'
 
@@ -44,27 +43,45 @@ describe('listWorkspaces', () => {
     ])
   })
 
-  it('returns [] when team-workspaces is off (404)', async () => {
-    stub(404, {})
-    expect(await listWorkspaces('tok', { apiBase: 'https://cloud/api' })).toEqual([])
+  it('keeps a null plan apart from a missing one, so the avatar can tell Free from unknown', async () => {
+    stub(200, {
+      workspaces: [
+        { id: 'w-1', name: 'Personal', type: 'personal', role: 'owner', subscription_tier: null },
+        { id: 'w-2', name: 'Team', type: 'team', role: 'member' }
+      ]
+    })
+    const ws = await listWorkspaces('tok', { apiBase: 'https://cloud/api' })
+    expect(ws).toEqual([
+      { id: 'w-1', name: 'Personal', type: 'personal', role: 'owner', subscriptionTier: null },
+      { id: 'w-2', name: 'Team', type: 'team', role: 'member' }
+    ])
   })
 
-  it('throws on unauthorized', async () => {
-    stub(401, {})
-    await expect(listWorkspaces('tok', { apiBase: 'https://cloud/api' })).rejects.toThrow(
-      /authorized/i
-    )
+  it('drops a plan that is not text, so it reads as unknown', async () => {
+    stub(200, {
+      workspaces: [
+        { id: 'w-1', name: 'One', type: 'team', role: 'owner', subscription_tier: 7 },
+        { id: 'w-2', name: 'Two', type: 'team', role: 'owner', subscription_tier: { tier: 'PRO' } },
+        { id: 'w-3', name: 'Three', type: 'team', role: 'owner', subscription_tier: ['PRO'] }
+      ]
+    })
+    const ws = await listWorkspaces('tok', { apiBase: 'https://cloud/api' })
+    expect(ws.map((workspace) => 'subscriptionTier' in workspace)).toEqual([false, false, false])
   })
 
-  it('returns [] on a null / non-object 200 body', async () => {
-    stub(200, null)
-    expect(await listWorkspaces('tok', { apiBase: 'https://cloud/api' })).toEqual([])
-  })
-
-  it.each(['nope', {}])('returns [] when workspaces is not an array', async (workspaces) => {
-    stub(200, { workspaces })
-    expect(await listWorkspaces('tok', { apiBase: 'https://cloud/api' })).toEqual([])
-  })
+  it.each([
+    { status: 404, body: {}, error: /HTTP 404/ },
+    { status: 401, body: {}, error: /authorized/i },
+    { status: 200, body: null, error: /invalid catalog/ },
+    { status: 200, body: { workspaces: 'nope' }, error: /invalid catalog/ },
+    { status: 200, body: { workspaces: {} }, error: /invalid catalog/ }
+  ])(
+    'rejects unavailable or malformed membership: $status $body',
+    async ({ status, body, error }) => {
+      stub(status, body)
+      await expect(listWorkspaces('tok', { apiBase: 'https://cloud/api' })).rejects.toThrow(error)
+    }
+  )
 })
 
 describe('listWorkspaceMembers', () => {

@@ -1,12 +1,7 @@
-/**
- * Desktop (v1) source plugin: legacy, migration-only. Lets users launch their
- * original "ComfyUI Desktop" (v1) install and migrate it to standalone. Hidden from
- * the picker; no new installs can be created through it.
- */
 import fs from 'fs'
 import path from 'path'
 import { shell } from 'electron'
-import { untrackAction } from '../lib/actions'
+import { renameAction, revealInFolderLabel, untrackAction } from '../lib/actions'
 import { findDesktopExecutable } from '../lib/desktopDetect'
 import { t } from '../lib/i18n'
 import type { InstallationRecord } from '../installations'
@@ -30,6 +25,7 @@ export const desktop: SourcePlugin = {
   category: 'local',
   hasConsole: true,
   skipInstall: true,
+  managesOwnPaths: true,
   platforms: ['win32', 'darwin'],
   hidden: true,
 
@@ -40,8 +36,6 @@ export const desktop: SourcePlugin = {
   buildInstallation(): Record<string, unknown> {
     return {
       launchMode: 'external',
-      // `skipSharedPaths` on the launch command is the real opt-out; these flags are
-      // persisted as `false` only to keep the record's intent obvious in the JSON.
       useSharedModels: false,
       useSharedInput: false,
       useSharedOutput: false
@@ -62,7 +56,6 @@ export const desktop: SourcePlugin = {
   getLaunchCommand(installation: InstallationRecord): LaunchCommand | null {
     const execPath = (installation.desktopExePath as string | undefined) || findDesktopExecutable()
     if (!execPath || !fs.existsSync(execPath)) return null
-    // macOS .app bundles cannot be spawned directly — use `open` to launch them
     if (process.platform === 'darwin' && execPath.endsWith('.app')) {
       return {
         cmd: '/usr/bin/open',
@@ -89,10 +82,6 @@ export const desktop: SourcePlugin = {
   },
 
   getTerminalEnv(installation: InstallationRecord): TerminalEnv {
-    // A legacy Desktop (v1) install keeps its venv at `<installPath>/.venv`
-    // (Legacy Desktop pip-installs its own uv there) and has no bundled
-    // `standalone-env/uv.exe`. Activate that venv so its own `pip` is on PATH;
-    // return a bare env (plain shell) when the venv is missing.
     const venvDir = path.join(installation.installPath, '.venv')
     if (!fs.existsSync(venvDir)) return {}
     return { venvDir, promptName: '.venv' }
@@ -143,9 +132,10 @@ export const desktop: SourcePlugin = {
               confirmLabel: t('desktop.migrateConfirm')
             }
           },
+          renameAction(installation.name),
           {
             id: 'open-folder',
-            label: t('actions.openDirectory'),
+            label: revealInFolderLabel(),
             style: 'default',
             enabled: !!installation.installPath
           },
@@ -164,8 +154,6 @@ export const desktop: SourcePlugin = {
     if (!hasModels || !hasUser) return null
     if (hasStandaloneEnv) return null
     if (!hasVenv) return null
-    // A Legacy Desktop data folder holds no ComfyUI source (that lives in the app itself);
-    // a folder with main.py is a runnable ComfyUI checkout and belongs to another source.
     if (
       fs.existsSync(path.join(dirPath, 'main.py')) ||
       fs.existsSync(path.join(dirPath, 'ComfyUI', 'main.py'))

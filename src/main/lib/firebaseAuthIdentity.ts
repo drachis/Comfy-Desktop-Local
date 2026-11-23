@@ -13,11 +13,10 @@ import {
 interface Reporter {
   eligible: boolean
   active: boolean
-  /** Stayed pending past the consensus deadline: excluded from consensus
-   *  (no veto, no quarantine) until it produces a resolved contribution. */
   pendingExpired: boolean
   localReportingAuthorized: boolean
   localExpectedUserId: string | null
+  signedInOrigin: string | null
   awaitingCommittedFrame: boolean
   mainFrameNavigationsInFlight: number
   provisionalFailureTerminals: Map<string, number>
@@ -78,15 +77,75 @@ interface MainVerifiedAuthState {
   rendererMayReaffirm: boolean
 }
 
+export type FirebaseIdentityConsensus =
+  | { status: 'unknown' }
+  | { status: 'pending' }
+  | { status: 'signed_out'; observed: boolean }
+  | { status: 'conflicted' }
+  | { status: 'signed_in'; userId: string }
+
 const reporters = new Map<WebContents, Reporter>()
 const mainVerifiedStates = new Map<WebContents, MainVerifiedAuthState>()
+let consensus: FirebaseIdentityConsensus = { status: 'unknown' }
+let signOutWitnessed = false
+const consensusObservers = new Set<(consensus: FirebaseIdentityConsensus) => void>()
 let requestedUserId: string | null = null
 let anonymousEpochIsUnmergeable = false
 let persistedEpochStateLoaded = false
 let epochTaintIsDurable = true
-/** A document that never resolves auth must not quarantine telemetry forever. */
 export const PENDING_CONSENSUS_DEADLINE_MS = 60_000
 let pendingConsensusDeadline: ReturnType<typeof setTimeout> | null = null
+
+function sameConsensus(
+  first: FirebaseIdentityConsensus,
+  second: FirebaseIdentityConsensus
+): boolean {
+  if (first.status !== second.status) return false
+  if (first.status === 'signed_out') {
+    return first.observed === (second as { observed: boolean }).observed
+  }
+  return first.status !== 'signed_in' || first.userId === (second as { userId: string }).userId
+}
+
+function publishConsensus(next: FirebaseIdentityConsensus): void {
+  if (sameConsensus(consensus, next)) return
+  consensus = next
+  for (const observe of [...consensusObservers]) {
+    if (!sameConsensus(consensus, next)) return
+    try {
+      observe(next)
+    } catch (err) {
+      console.log('[firebase-identity] consensus observer failed:', err)
+    }
+  }
+}
+
+export function getFirebaseIdentityConsensus(): FirebaseIdentityConsensus {
+  return consensus
+}
+
+export function observeFirebaseIdentityConsensus(
+  observe: (consensus: FirebaseIdentityConsensus) => void
+): () => void {
+  consensusObservers.add(observe)
+  return () => consensusObservers.delete(observe)
+}
+
+export function viewsReportingFirebaseUser(userId: string): WebContents[] {
+  const views: WebContents[] = []
+  for (const [webContents, reporter] of reporters) {
+    if (webContents.isDestroyed() || !reporter.active) continue
+    if (reporter.state.status === 'signed_in' && reporter.state.userId === userId) {
+      views.push(webContents)
+    }
+  }
+  for (const [webContents, state] of mainVerifiedStates) {
+    if (webContents.isDestroyed() || state.userId !== userId) continue
+    if (originOf(webContents.getURL()) !== state.origin) continue
+    if (!views.includes(webContents)) views.push(webContents)
+  }
+  return views
+}
 
 function originOf(url: string): string | null {
   try {
@@ -112,11 +171,10 @@ function revokeAcceptedLocalAuthorization(
   webContents: WebContents,
   reporter: Reporter,
   origin: string | null,
-  state: ComfyDesktop2FirebaseAuthState,
+  observedSignOut: boolean,
   userMismatch: boolean
 ): void {
-  if (!origin || !isLoopbackOrigin(origin) || (state.status !== 'signed_out' && !userMismatch))
-    return
+  if (!origin || !isLoopbackOrigin(origin) || (!observedSignOut && !userMismatch)) return
   clearVerifiedLocalFirebaseUser(origin)
   reporter.localReportingAuthorized = false
   reporter.localExpectedUserId = null
@@ -152,7 +210,6 @@ function clearPendingConsensusDeadline(): void {
   pendingConsensusDeadline = null
 }
 
-/** Flag every contributor whose pending state has outlived the deadline. */
 function markExpiredPendingContributors(): void {
   for (const [webContents, reporter] of reporters) {
     if (webContents.isDestroyed()) continue
@@ -165,7 +222,6 @@ function markExpiredPendingContributors(): void {
   }
 }
 
-/** Unconditionally hand consensus back to the anonymous identity. */
 function detachToAnonymousIdentity(): void {
   clearPendingConsensusDeadline()
   requestedUserId = null
@@ -178,23 +234,14 @@ function requestAnonymousIdentity(): void {
 }
 
 function requestPendingIdentity(): void {
-  // Before the first agreed UID there is no authenticated identity to
-  // quarantine; anonymous events should keep flowing into the eventual merge.
   if (requestedUserId === null) return
   mainTelemetry.applyFirebasePendingConsensus()
   if (pendingConsensusDeadline === null) {
     pendingConsensusDeadline = setTimeout(() => {
       pendingConsensusDeadline = null
-      // Contributors still pending after the full deadline are wedged: stop
-      // letting them veto consensus so healthy reporters can resolve it (a
-      // masked logout or account switch applies right here), and do not
-      // re-quarantine for them until they produce a real report.
       markExpiredPendingContributors()
       reconcile()
       if (pendingConsensusDeadline === null && mainTelemetry.isFirebaseConsensusPending()) {
-        // Nothing left can resolve consensus: an unresolved reporter is no
-        // evidence of sign-out, so release the quarantine and keep the bound
-        // identity. A real report still resolves through reconcile as usual.
         mainTelemetry.releaseFirebasePendingConsensus()
         mainTelemetry.capture('comfy.desktop.identity.pending_consensus_expired')
       }
@@ -210,10 +257,6 @@ function requestConflictedIdentity(): void {
   if (!wasAlreadyTainted || !epochTaintIsDurable) {
     epochTaintIsDurable = mainTelemetry.markAnonymousEpochUnmergeable()
     if (!epochTaintIsDurable && !wasAlreadyTainted) {
-      // The taint marker could not persist, so a restart would resurrect
-      // the conflicted anonymous ID untainted. Durably replace the epoch
-      // instead; attempted once per conflict episode to avoid rotation
-      // churn while the views still disagree.
       epochTaintIsDurable = mainTelemetry.discardUnmergeableAnonymousEpoch()
     }
   }
@@ -238,19 +281,6 @@ function loadPersistedEpochState(): void {
   anonymousEpochIsUnmergeable = mainTelemetry.hasUnmergeableAnonymousEpoch()
 }
 
-/**
- * Bind a user verified by Desktop's auth flow while keeping the declarative
- * renderer consensus authoritative once hosted views begin reporting.
- *
- * Called after the session was installed in the view. The injected session
- * always reloads hosted Cloud views, so the view's current report predates
- * this sign-in: the bind marks it stale (pending) and the identify fires,
- * with `properties`, once a document re-reports this user — the same
- * contract the loopback branch has always used. A view already affirming
- * this exact UID confirms immediately. The one-shot `attribution` payload is
- * staged with telemetry, which owns its lifecycle: emitted when this UID is
- * confirmed, discarded on any other resolution, drained at shutdown.
- */
 export function bindMainVerifiedFirebaseUser(
   userId: string,
   properties: Record<string, mainTelemetry.TelemetryValue> = {},
@@ -266,8 +296,6 @@ export function bindMainVerifiedFirebaseUser(
   trackFirebaseAuthReporter(source)
   const reporter = reporters.get(source)
   if (!reporter?.eligible) return
-  // Retained navigation snapshots predate this bind too: restoring one after
-  // a failed reload would resurrect a stale signed_out and discard the bind.
   const staleSnapshotUnlessAffirming = (snapshot: ReporterFrameState | null): void => {
     if (!snapshot) return
     if (snapshot.state.status === 'signed_in' && snapshot.state.userId === normalizedUserId) return
@@ -279,11 +307,13 @@ export function bindMainVerifiedFirebaseUser(
     }
     reporter.localReportingAuthorized = true
     reporter.localExpectedUserId = normalizedUserId
+    reporter.signedInOrigin = origin
     reporter.active = true
     reporter.state = { status: 'pending' }
     staleSnapshotUnlessAffirming(reporter.recoverableState)
     staleSnapshotUnlessAffirming(reporter.committedCandidate)
   } else if (isTrustedCloudUrl(source.getURL())) {
+    reporter.signedInOrigin = origin
     if (reporter.state.status !== 'signed_in' || reporter.state.userId !== normalizedUserId) {
       reporter.state = { status: 'pending' }
     }
@@ -357,15 +387,15 @@ function reconcile(): void {
   ]
 
   if (states.length === 0) {
-    // Only expired wedges remain. An unresolved document is evidence of
-    // nothing: keep the current identity until a real report resolves it.
     if (expiredPendingContributors > 0) return
     requestAnonymousIdentity()
+    publishConsensus({ status: 'unknown' })
     return
   }
 
   if (states.some((state) => state.status === 'pending')) {
     requestPendingIdentity()
+    publishConsensus({ status: 'pending' })
     return
   }
 
@@ -375,10 +405,9 @@ function reconcile(): void {
   )
 
   if (signedIn.length === 0) {
-    // A resolved all-signed-out state also clears any pending/deferred user
-    // binding even when this process has not bound a UID yet.
     detachToAnonymousIdentity()
     clearUnmergeableEpoch()
+    publishConsensus({ status: 'signed_out', observed: signOutWitnessed })
     return
   }
 
@@ -386,6 +415,7 @@ function reconcile(): void {
   const hasConflict = signedIn.length !== states.length || userIds.size !== 1
   if (hasConflict) {
     requestConflictedIdentity()
+    publishConsensus({ status: 'conflicted' })
     return
   }
 
@@ -394,6 +424,8 @@ function reconcile(): void {
 
   clearPendingConsensusDeadline()
   requestedUserId = userId
+  signOutWitnessed = false
+  publishConsensus({ status: 'signed_in', userId })
   const confirmedMainStates = mainCandidates.filter(({ webContents, state, contributes }) => {
     if (state.userId !== userId) return false
     if (contributes) return true
@@ -437,9 +469,6 @@ function settleFailedNavigation(webContents: WebContents, reporter: Reporter): v
     reporter.active = reporter.eligible && retainedState.active
     reporter.state = retainedState.state
   } else {
-    // A terminal without an attributable retained frame must not reopen stale
-    // IPC. Keep a trusted current document in consensus as pending until a
-    // later commit supplies an exact frame identity.
     reporter.awaitingCommittedFrame = true
     reporter.committedFrame = null
     reporter.active = reporter.eligible && refreshReporterAuthScope(reporter, webContents.getURL())
@@ -469,7 +498,6 @@ function isAcceptedFallbackFrame(
   )
 }
 
-/** Track a hosted view before its first navigation so unresolved views count as pending. */
 export function trackFirebaseAuthReporter(webContents: WebContents): void {
   if (reporters.has(webContents) || webContents.isDestroyed()) return
 
@@ -479,6 +507,7 @@ export function trackFirebaseAuthReporter(webContents: WebContents): void {
     pendingExpired: false,
     localReportingAuthorized: false,
     localExpectedUserId: null,
+    signedInOrigin: null,
     awaitingCommittedFrame: true,
     mainFrameNavigationsInFlight: 0,
     provisionalFailureTerminals: new Map(),
@@ -502,8 +531,6 @@ export function trackFirebaseAuthReporter(webContents: WebContents): void {
       }
       reporter.mainFrameNavigationsInFlight += 1
       reporter.awaitingCommittedFrame = true
-      // The requested destination is not the current document until commit.
-      // Keep current-frame trust active, but gate consensus as pending.
       reporter.state = { status: 'pending' }
       reconcile()
     },
@@ -517,10 +544,6 @@ export function trackFirebaseAuthReporter(webContents: WebContents): void {
       frameRoutingId
     ) => {
       if (!isMainFrame) return
-      // Electron emits a provisional failure's paired `did-fail-load` before
-      // the next main-frame commit (canceled loads never emit it at all), so
-      // entries still recorded here are unpairable; drop them rather than let
-      // canceled loads accumulate for the view's lifetime.
       reporter.provisionalFailureTerminals.clear()
       if (reporter.mainFrameNavigationsInFlight > 0) {
         reporter.mainFrameNavigationsInFlight -= 1
@@ -575,8 +598,6 @@ export function trackFirebaseAuthReporter(webContents: WebContents): void {
       frameRoutingId
     ) => {
       if (!isMainFrame) return
-      // Electron does not pair ERR_ABORTED provisional failures with this
-      // event; ignore a defensive duplicate without retaining unbounded keys.
       if (errorCode === -3) return
       const key = failureTerminalKey(errorCode, validatedURL, frameProcessId, frameRoutingId)
       const provisional = reporter.provisionalFailureTerminals.get(key)
@@ -603,7 +624,6 @@ export function trackFirebaseAuthReporter(webContents: WebContents): void {
   reconcile()
 }
 
-/** Make an attached installation's tracked view eligible to report auth. */
 export function activateFirebaseAuthReporter(webContents: WebContents): void {
   loadPersistedEpochState()
   trackFirebaseAuthReporter(webContents)
@@ -620,7 +640,6 @@ export function activateFirebaseAuthReporter(webContents: WebContents): void {
   reconcile()
 }
 
-/** Exclude a retained view while its host is detached from an installation. */
 export function deactivateFirebaseAuthReporter(webContents: WebContents): void {
   const reporter = reporters.get(webContents)
   if (!reporter) return
@@ -631,7 +650,6 @@ export function deactivateFirebaseAuthReporter(webContents: WebContents): void {
   reconcile()
 }
 
-/** Record a trusted renderer's complete Firebase state and recompute consensus. */
 export function reportFirebaseAuthState(
   webContents: WebContents,
   frame: FirebaseAuthFrameIdentity,
@@ -659,6 +677,7 @@ export function reportFirebaseAuthState(
     if (userMismatch || state.status === 'signed_out') {
       mainVerifiedState.rendererMayReaffirm = false
     }
+    if (state.status === 'signed_out') signOutWitnessed = true
     if (userMismatch) requestAnonymousIdentity()
     reconcile()
     return
@@ -668,16 +687,20 @@ export function reportFirebaseAuthState(
   const acceptedState: ComfyDesktop2FirebaseAuthState = localUserMismatch
     ? { status: 'pending' }
     : state
-  // Identity consequences must wait for frame attribution below: late IPC
-  // from a replaced document matches no accepted slot and must not detach
-  // the bound user or revoke local authorization.
   const acceptReport = (): void => {
+    if (acceptedState.status === 'signed_in') reporter.signedInOrigin = currentOrigin
+    const observedSignOut =
+      acceptedState.status === 'signed_out' && reporter.signedInOrigin === currentOrigin
+    if (observedSignOut) {
+      signOutWitnessed = true
+      reporter.signedInOrigin = null
+    }
     if (localUserMismatch) requestAnonymousIdentity()
     revokeAcceptedLocalAuthorization(
       webContents,
       reporter,
       currentOrigin,
-      acceptedState,
+      observedSignOut,
       localUserMismatch
     )
   }
@@ -709,7 +732,6 @@ export function reportFirebaseAuthState(
   reconcile()
 }
 
-/** @internal Reset process-global reporter state between tests. */
 export function _resetForTest(): void {
   for (const [webContents, reporter] of reporters) {
     if (!webContents.isDestroyed()) {
@@ -722,6 +744,9 @@ export function _resetForTest(): void {
   }
   reporters.clear()
   mainVerifiedStates.clear()
+  consensus = { status: 'unknown' }
+  signOutWitnessed = false
+  consensusObservers.clear()
   clearPendingConsensusDeadline()
   requestedUserId = null
   anonymousEpochIsUnmergeable = false

@@ -1,4 +1,3 @@
-// @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('electron', () => ({
@@ -51,6 +50,24 @@ describe('createUrlSource â€” rename action', () => {
       defaultUrl: 'http://localhost:8188'
     })
     expect(detailActionIds(remote)).toContain('rename')
+  })
+})
+
+describe('createUrlSource - Forget', () => {
+  it('confirms Forget on a remote connection with the connection message, not the build folder one', () => {
+    const remote = createUrlSource({
+      id: 'remote',
+      labelKey: 'remote.label',
+      descKey: 'remote.desc',
+      category: 'remote',
+      defaultUrl: 'http://localhost:8188',
+      includeUntrack: true
+    })
+    const sections = remote.getDetailSections(makeInstall()) as Record<string, unknown>[]
+    const forget = sections
+      .flatMap((section) => (section.actions as Record<string, unknown>[] | undefined) ?? [])
+      .find((action) => action.id === 'remove') as { confirm?: { message?: string } } | undefined
+    expect(forget?.confirm?.message).toBe('actions.untrackRemoteConfirmMessage')
   })
 })
 

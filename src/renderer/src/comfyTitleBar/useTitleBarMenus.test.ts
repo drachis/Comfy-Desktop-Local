@@ -3,7 +3,9 @@ import { defineComponent, h, shallowRef, type ShallowRef } from 'vue'
 import { mount } from '@vue/test-utils'
 import { useTitleBarMenus } from './useTitleBarMenus'
 
-vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (k: string) => k }) }))
+vi.mock('vue-i18n', async (importOriginal) =>
+  (await import('../lib/vueI18nWithAppMessages')).vueI18nWithAppMessages(importOriginal)
+)
 
 type TitleMenuKind = 'menu' | 'downloads' | 'instance-picker'
 
@@ -11,23 +13,19 @@ interface Bridge {
   openFileMenu: ReturnType<typeof vi.fn>
   dismissFileMenu: ReturnType<typeof vi.fn>
   clickDownloadsTray: ReturnType<typeof vi.fn>
-  clickInstallPill: ReturnType<typeof vi.fn>
   onMenuOpened: (cb: (info: { menu: TitleMenuKind }) => void) => () => void
   onMenuClosed: (cb: (info: { menu: TitleMenuKind }) => void) => () => void
   onDownloadsChanged: (cb: (s: unknown) => void) => () => void
 }
 
-/** Mount the composable in a throwaway host so its `onMounted` bridge
- *  subscriptions fire, then drive it via the captured menu-opened/closed
- *  callbacks the title bar would receive from main. */
 function setup() {
   const opened: ((info: { menu: TitleMenuKind }) => void)[] = []
   const closed: ((info: { menu: TitleMenuKind }) => void)[] = []
   const bridge: Bridge = {
     openFileMenu: vi.fn(),
+    openWhatsNewMenu: vi.fn(),
     dismissFileMenu: vi.fn(),
     clickDownloadsTray: vi.fn(),
-    clickInstallPill: vi.fn(),
     onMenuOpened: (cb) => {
       opened.push(cb)
       return () => {}
@@ -47,7 +45,7 @@ function setup() {
         hideTip: () => {},
         fileBtnRef: nullRef,
         downloadsBtnRef: nullRef,
-        installPillRef: nullRef
+        whatsNewBtnRef: nullRef
       })
       return () => h('div')
     }
@@ -92,5 +90,31 @@ describe('useTitleBarMenus — handleFileMenu toggle gate', () => {
     closeMenu('instance-picker')
     api.handleFileMenu()
     expect(bridge.openFileMenu).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("useTitleBarMenus — the bell opens the What's new menu", () => {
+  it("opens the What's new menu from the bell", () => {
+    const { api, bridge } = setup()
+    api.handleWhatsNewMenu()
+    expect(bridge.openWhatsNewMenu).toHaveBeenCalledTimes(1)
+    expect(bridge.openFileMenu).not.toHaveBeenCalled()
+  })
+
+  it("closes the What's new menu when the bell is clicked again", () => {
+    const { api, bridge, openMenu } = setup()
+    api.handleWhatsNewMenu()
+    openMenu('menu')
+    api.handleWhatsNewMenu()
+    expect(bridge.dismissFileMenu).toHaveBeenCalledTimes(1)
+  })
+
+  it("opens the file menu instead of closing when the What's new menu is open", () => {
+    const { api, bridge, openMenu } = setup()
+    api.handleWhatsNewMenu()
+    openMenu('menu')
+    api.handleFileMenu()
+    expect(bridge.openFileMenu).toHaveBeenCalledTimes(1)
+    expect(bridge.dismissFileMenu).not.toHaveBeenCalled()
   })
 })

@@ -34,25 +34,21 @@ export function getUpdateRepoUrl(): string {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : DEFAULT_UPDATE_REPO_URL
 }
 
-/** Background checks are opt-in; only an explicit `true` enables them. */
 export function isAutoCheckEnabled(): boolean {
   return settings.get('autoCheckUpdates') === true
 }
 
-/** The git checkout the running app was started from, or null for a packaged build. */
 export function findSourceCheckout(): string | null {
   if (app.isPackaged) return null
   const root = app.getAppPath()
   return fs.existsSync(path.join(root, '.git')) ? root : null
 }
 
-/** Fast-forward `repoDir` from `url`. `available` means new commits were pulled. */
 export async function pullFromRepo(
   repoDir: string,
   url: string,
   git: GitRunner = runGit
 ): Promise<ForkUpdateResult> {
-  // A URL beginning with "-" would be parsed by git as an option.
   if (url.startsWith('-')) return { available: false, error: `Invalid repository URL: ${url}` }
   try {
     const before = await git(['rev-parse', 'HEAD'], repoDir)
@@ -64,7 +60,6 @@ export async function pullFromRepo(
   }
 }
 
-/** Pull the configured repo into the source checkout and tell the user what happened. */
 export async function runForkUpdate(repoDir: string): Promise<ForkUpdateResult> {
   const url = getUpdateRepoUrl()
   const result = await pullFromRepo(repoDir, url)

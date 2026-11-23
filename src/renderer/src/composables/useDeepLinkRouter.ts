@@ -1,48 +1,41 @@
+import { relaunchAfterAction, stopThenRun } from '../lib/relaunchAfterAction'
 import { onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useInstallationStore } from '../stores/installationStore'
 import { useSessionStore } from '../stores/sessionStore'
+import { useProgressStore } from '../stores/progressStore'
 import { IN_PLACE_RELAUNCH, stopAndWaitForExit } from '../lib/stopWarning'
 import { successTerminalGoDashboardOrOpen } from '../lib/progressTerminalPresets'
-import { REQUIRES_STOPPED, type Installation, type ShowProgressOpts } from '../types/ipc'
+import {
+  REQUIRES_STOPPED,
+  type ActionResult,
+  type Installation,
+  type ShowProgressOpts
+} from '../types/ipc'
 
 import type { Overlay } from './useOverlay'
 
 interface DeepLinkRouterOpts {
-  /** Host id this panel is bound to. `install-update` payloads ignore
-   *  mismatched ids so a deep link fires only on the targeted host. */
   installationId: string
-  /** Resolves once `onMounted` finishes store/locale hydration. Handlers
-   *  await this so the store + translations are populated before use. */
   bootstrapReady: Promise<void>
   openOverlay: (next: Overlay | null) => Promise<boolean>
   showAppUpdateRestartPrompt: (version: string | null) => Promise<void>
   showAppUpdateDownloadPrompt: (version: string | null) => Promise<void>
-  /** Picker picked a non-running install; runs the chooser's launch flow
-   *  without the attach-claim that would swap this host's install out.
-   *  `startupRestore` marks the boot-time restore path (dashboard fallback on
-   *  missing action + reveal handshake). */
   pickInstallFromPicker?: (
     installation: Installation,
-    opts?: { startupRestore?: boolean; isRestart?: boolean }
+    opts?: { isRestart?: boolean; pickerWorkspaceId?: string }
   ) => Promise<void> | void
-  /** Picker "More" menu selected an install-level action; dispatches
-   *  through the same `useInstallContextMenu` path the dashboard kebab uses. */
   runInstallActionFromPicker?: (
     installation: Installation,
     actionId: string
   ) => Promise<void> | void
-  /** Picker's settings UI fired `show-progress`, forwarded here to the
-   *  panel's ProgressModal pipeline. */
   showProgressFromPicker?: (opts: ShowProgressOpts) => void
 }
 
-/** Routes `panel-trigger-overlay` IPCs into the right renderer surface.
- *  Registered before the panel's async bootstrap; payloads that need the
- *  store park on `bootstrapReady` until hydration completes. */
 export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
   const installationStore = useInstallationStore()
   const sessionStore = useSessionStore()
+  const progressStore = useProgressStore()
   const { t } = useI18n()
   let unsubPanelTriggerOverlay: (() => void) | null = null
 
@@ -65,8 +58,6 @@ export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
           await opts.bootstrapReady
           const inst = installationStore.getById(id)
           if (!inst) return
-          // Opens the picker on the Update tab and auto-fires
-          // `update-comfyui` so the user lands directly on its confirm modal.
           window.api.openInstancePicker({
             installationId: inst.id,
             initialTab: 'update',
@@ -78,14 +69,11 @@ export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
           await opts.bootstrapReady
           const inst = opts.installationId ? installationStore.getById(opts.installationId) : null
           const requested = payload.settingsTab
-          // Default to the host's natural tab.
           const tab = requested ?? (inst ? 'comfy' : 'global')
           if (tab === 'global' || tab === 'global-storage') {
             window.api.openGlobalSettings(tab === 'global-storage' ? 'storage' : undefined)
             return
           }
-          // Per-install deep links open the Config tab; with no install
-          // context, open without a tab so the user picks one first.
           if (inst) {
             window.api.openInstancePicker({
               installationId: inst.id,
@@ -100,18 +88,16 @@ export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
           await opts.bootstrapReady
           const id = payload.installationId
           if (!id) return
-          const inst = installationStore.getById(id)
-          if (!inst) {
-            // Boot restore against a now-missing install: tell main to reveal
-            // the dashboard rather than leaving the hidden window stuck.
-            if (payload.startupRestore) {
-              window.api.resolveStartupRestoreReveal('dashboard-fallback')
-            }
-            return
-          }
+          const inst =
+            installationStore.getById(id) ??
+            (await installationStore.fetchInstallations().catch(() => [])).find(
+              (installation) => installation.id === id
+            )
+          if (!inst) return
+          const pickerWorkspaceId = payload.actionData?.pickerWorkspaceId
           await opts.pickInstallFromPicker?.(inst, {
-            startupRestore: payload.startupRestore === true,
-            isRestart: payload.isRestart === true
+            isRestart: payload.isRestart === true,
+            pickerWorkspaceId: typeof pickerWorkspaceId === 'string' ? pickerWorkspaceId : undefined
           })
           return
         }
@@ -131,18 +117,14 @@ export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
           const actionId = payload.actionId
           const title = payload.title
           if (!id || !actionId || !title) return
-          const inst = installationStore.getById(id)
-          if (!inst) return
-          // Rebuild the apiCall here because closures don't cross IPC:
-          // self-stop for REQUIRES_STOPPED, append relaunch for IN_PLACE_RELAUNCH.
+          if (!installationStore.getById(id)) {
+            await installationStore.fetchInstallations().catch(() => {})
+          }
+          if (!installationStore.getById(id)) return
           const isRestart = !!payload.isRestart
           const actionData = (payload.actionData ?? undefined) as
-            | Record<string, unknown>
-            | undefined
+            Record<string, unknown> | undefined
           const wasRunning = sessionStore.isRunning(id)
-          // migrate-to-standalone owns its confirm UI upstream, but the
-          // reconstructed apiCall must still self-stop a running install so
-          // main doesn't reject with stopRequired.
           const requiresStoppedGuard = !isRestart && REQUIRES_STOPPED.has(actionId)
           const needsSelfStop = wasRunning && requiresStoppedGuard
           const wantsRelaunch = needsSelfStop && IN_PLACE_RELAUNCH.has(actionId)
@@ -154,23 +136,20 @@ export function useDeepLinkRouter(opts: DeepLinkRouterOpts): void {
               }
             : needsSelfStop
               ? async () => {
-                  await stopAndWaitForExit(id, isRunning)
-                  const result = await window.api.runAction(id, actionId, actionData)
-                  if (wantsRelaunch && result?.ok !== false) {
-                    await window.api.runAction(id, 'launch')
-                  }
-                  return result
+                  const run = (): Promise<ActionResult> =>
+                    window.api.runAction(id, actionId, actionData)
+                  const cancelRequested = (): boolean =>
+                    progressStore.operations.get(id)?.cancelRequested === true
+                  const result = await stopThenRun(id, isRunning, cancelRequested, run)
+                  if (result.cancelled) return result
+                  return wantsRelaunch ? relaunchAfterAction(id, result) : result
                 }
               : () => window.api.runAction(id, actionId, actionData)
-          // Built here because this side owns the i18n catalog the popup doesn't.
           const successTerminal = payload.successChoice
             ? successTerminalGoDashboardOrOpen({
-                title:
-                  payload.opKind === 'update'
-                    ? t('progress.updatedSuccess', 'Updated successfully')
-                    : undefined,
-                dashboardLabel: t('progress.successChoiceGoDashboard', 'Go to Dashboard'),
-                openLabel: t('progress.successChoiceOpen', 'Open Instance')
+                title: payload.opKind === 'update' ? t('progress.updatedSuccess') : undefined,
+                dashboardLabel: t('progress.successChoiceGoDashboard'),
+                openLabel: t('progress.successChoiceOpen')
               })
             : undefined
           opts.showProgressFromPicker?.({

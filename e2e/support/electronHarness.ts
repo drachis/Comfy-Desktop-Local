@@ -2,34 +2,34 @@ import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import { test } from '@playwright/test'
 import { _electron as electron, type ElectronApplication } from 'playwright'
 
+import {
+  createShutdown,
+  processStartTime,
+  type ShutdownHandle,
+  type ShutdownTarget
+} from './appShutdown'
 import { evalWithRetry } from './evalRetry'
+import { FOREGROUND_PROJECTS, isBackgroundRun } from './focusMode'
+import { recordVideoOptions } from './videoRecording'
+
+const HELPER_TRACKING_INTERVAL_MS = 5_000
 
 export interface LauncherAppHandle {
   application: ElectronApplication
   homeDir: string
-  /** CDP remote-debugging port for connecting to non-BrowserWindow webContents. */
-  cdpPort: number
   cleanup: () => Promise<void>
 }
 
 export interface SeedOptions {
-  /** Seed installation records into the isolated data directory. */
   installations?: SeedInstallation[]
-  /** Merge into the seeded `settings.json` to bypass one-time gates (e.g.
-   *  `firstUseCompleted`) so a test isn't racing the first-use takeover. */
   settings?: Record<string, unknown>
-  /** Runs after the isolated dirs are created but before launch. Use to drop
-   *  platform-specific files the main process inspects during early boot. */
   onSetup?: (paths: { homeDir: string; appDataDir: string }) => Promise<void>
-  /** Launch against this exact profile dir instead of a fresh mkdtemp one,
-   *  with the same semantics as `LIFECYCLE_REUSE_DIR` (persisted settings are
-   *  folded into the seed; the dir survives cleanup). Lets a spec quit and
-   *  relaunch the SAME profile to cover restart hydration. The caller owns
-   *  creating and removing the dir. Not supported on macOS (Application
-   *  Support ignores the HOME override). */
+  opsFlags?: Record<string, unknown>
   profileDir?: string
+  userDataDir?: string
 }
 
 export interface SeedInstallation {
@@ -38,14 +38,10 @@ export interface SeedInstallation {
   sourceId?: string
   installPath?: string
   status?: string
-  /** Snapshot JSON records to seed into `<installPath>/.launcher/snapshots/`,
-   *  written in the same format the live snapshot store produces. */
   snapshots?: SeedSnapshot[]
   [key: string]: unknown
 }
 
-/** Loose Snapshot shape duplicated to keep the harness free of src/ imports.
- *  Keep in sync with `src/main/lib/snapshots/types.ts`. */
 export interface SeedSnapshot {
   version?: 1
   createdAt?: string
@@ -63,12 +59,9 @@ export interface SeedSnapshot {
   pipPackages?: Record<string, string>
   pythonVersion?: string
   updateChannel?: string
-  /** Makes `snapshot-restore` skip the live pip phase (no real `uv`/Python). */
   skipPipSync?: boolean
 }
 
-/** Must mirror `formatTimestamp` in `src/main/lib/snapshots/store.ts` so
- *  seeded filenames sort identically to live ones (newest-first by name). */
 function formatSeedTimestamp(date: Date): string {
   const pad = (n: number, len = 2): string => String(n).padStart(len, '0')
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}_${pad(date.getMilliseconds(), 3)}`
@@ -76,7 +69,8 @@ function formatSeedTimestamp(date: Date): string {
 
 function buildIsolatedEnv(
   homeDir: string,
-  settingsSeed?: Record<string, unknown>
+  settingsSeed?: Record<string, unknown>,
+  opsFlagsSeed?: Record<string, unknown>
 ): Record<string, string> {
   const inheritedEnv = Object.fromEntries(
     Object.entries(process.env).filter(
@@ -92,59 +86,102 @@ function buildIsolatedEnv(
     XDG_CACHE_HOME: path.join(homeDir, '.cache'),
     XDG_DATA_HOME: path.join(homeDir, '.local', 'share'),
     XDG_STATE_HOME: path.join(homeDir, '.local', 'state'),
-    // Gates `registerE2EHooks()` in main so `globalThis.__e2e` is wired up.
     E2E: '1'
   }
 
-  // Windows resolves userData via APPDATA; point it into the isolated home
-  // so the app doesn't touch the real profile.
   if (process.platform === 'win32') {
     env['APPDATA'] = path.join(homeDir, 'AppData', 'Roaming')
+    env['LOCALAPPDATA'] = path.join(homeDir, 'AppData', 'Local')
   }
 
-  // Settings seed read by main before first load. Needed because on macOS
-  // Application Support ignores our HOME override, so a prior dev session's
-  // `firstUseCompleted: true` would persist and wedge cold-start tests.
-  // Always send a seed for a known-clean state; caller overrides win on merge.
+  if (process.platform === 'darwin') {
+    env['CFFIXED_USER_HOME'] = homeDir
+  }
+
   const effectiveSeed: Record<string, unknown> = {
     firstUseCompleted: false,
     telemetryEnabled: false,
+    homeTourDone: true,
     ...(settingsSeed ?? {})
   }
   env['E2E_SETTINGS_SEED'] = JSON.stringify(effectiveSeed)
 
+  if (opsFlagsSeed) env['E2E_OPS_FLAGS_SEED'] = JSON.stringify(opsFlagsSeed)
+
   return env
 }
 
+async function showWindowAndLogAppEvents(application: ElectronApplication): Promise<void> {
+  const page = await application.firstWindow()
+  await page.waitForLoadState('domcontentloaded')
+  await evalWithRetry(() =>
+    application.evaluate(({ BrowserWindow }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      if (win && !win.isVisible()) win.show()
+    })
+  )
+
+  await evalWithRetry(() =>
+    application.evaluate(({ app: electronApp, dialog }) => {
+      dialog.showErrorBox = () => {}
+      const marked = electronApp as typeof electronApp & {
+        __e2eRendererLossLogged?: boolean
+      }
+      if (!marked.__e2eRendererLossLogged) {
+        marked.__e2eRendererLossLogged = true
+        electronApp.on('render-process-gone', (_event, contents, details) => {
+          const pageWithoutSecrets = (): string => {
+            if (contents.isDestroyed()) return '(destroyed)'
+            try {
+              const { protocol, host, pathname } = new URL(contents.getURL())
+              return `${protocol}//${host}${pathname}`
+            } catch {
+              return '(unparsed)'
+            }
+          }
+          console.error(
+            `[e2e-harness] renderer gone reason=${details.reason} exitCode=${details.exitCode} page=${pageWithoutSecrets()}`
+          )
+        })
+        electronApp.on('child-process-gone', (_event, details) => {
+          console.error(
+            `[e2e-harness] child process gone type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`
+          )
+        })
+        for (const name of ['before-quit', 'will-quit', 'quit'] as const) {
+          electronApp.on(name as 'quit', () => {
+            console.error(`[e2e-harness] app ${name}\n${new Error().stack ?? ''}`)
+          })
+        }
+        const quit = electronApp.quit.bind(electronApp)
+        electronApp.quit = () => {
+          console.error(`[e2e-harness] app.quit() called\n${new Error().stack ?? ''}`)
+          quit()
+        }
+        const exit = electronApp.exit.bind(electronApp)
+        electronApp.exit = (code?: number) => {
+          console.error(`[e2e-harness] app.exit(${code}) called\n${new Error().stack ?? ''}`)
+          exit(code)
+        }
+      }
+    })
+  )
+}
+
 export async function launchLauncherApp(options?: SeedOptions): Promise<LauncherAppHandle> {
-  // Honor an explicit `profileDir` (spec-driven relaunch of the same
-  // profile) or `LIFECYCLE_REUSE_DIR` (operator rerun without redoing the
-  // ~2-minute install). A reused dir is preserved on cleanup; a fresh dir is
-  // printed so the operator can re-export it.
-  const reuseDir = options?.profileDir ?? process.env['LIFECYCLE_REUSE_DIR']
-  // macOS ignores the HOME override for userData (Application Support), so
-  // a reused profile's persisted settings can neither be read back nor kept
-  // from clobbering the developer's real profile - only fresh runs are
-  // supported there.
-  if (reuseDir && process.platform === 'darwin') {
-    throw new Error(
-      'Profile reuse (profileDir / LIFECYCLE_REUSE_DIR) is not supported on macOS: Electron resolves userData outside the isolated profile dir, so persisted settings cannot be reused safely - run against a fresh profile'
-    )
-  }
-  const homeDir = reuseDir ?? (await mkdtemp(path.join(os.tmpdir(), 'comfyui-launcher-e2e-')))
+  const reuseDir = options?.profileDir ?? process.env['REAL_COMFY_REUSE_DIR']
+  const homeDir = reuseDir
+    ? path.resolve(reuseDir)
+    : await mkdtemp(path.join(os.tmpdir(), 'comfyui-launcher-e2e-'))
   if (reuseDir) {
-    console.log(`[lifecycle-harness] reusing profile dir: ${homeDir}`)
+    console.log(`[e2e-harness] reusing profile dir: ${homeDir}`)
   } else {
-    console.log(`[lifecycle-harness] fresh profile dir: ${homeDir}`)
+    console.log(`[e2e-harness] fresh profile dir: ${homeDir}`)
     console.log(
-      `[lifecycle-harness] re-export as LIFECYCLE_REUSE_DIR=${homeDir} to rerun individual tests against this profile`
+      `[e2e-harness] re-export as REAL_COMFY_REUSE_DIR=${homeDir} to rerun individual tests against this profile`
     )
   }
 
-  // Pre-create the platform-specific config dir Electron resolves to so
-  // `settings.set()` writes succeed. On macOS this lives outside the mkdtemp
-  // sandbox (Application Support ignores HOME), so persisted settings are
-  // seeded via `E2E_SETTINGS_SEED` rather than a settings.json file here.
   const appDataDir =
     process.platform === 'win32'
       ? path.join(homeDir, 'AppData', 'Roaming', 'comfyui-desktop-2')
@@ -157,12 +194,6 @@ export async function launchLauncherApp(options?: SeedOptions): Promise<Launcher
     await options.onSetup({ homeDir, appDataDir })
   }
 
-  // Normalize seed records up front: they ride into main via
-  // `E2E_INSTALLATIONS_SEED` (mirroring `E2E_SETTINGS_SEED`), written to the
-  // platform-specific installations.json by main before its first read. A
-  // post-launch file write from here raced main's boot-time cloud-entry seed
-  // and the renderer store's one-shot hydration (which only refetches on an
-  // `installations-changed` broadcast that a behind-the-back write never fires).
   const seedRecords = (options?.installations ?? []).map((inst, i) => {
     const { snapshots: _snapshots, ...rest } = inst
     return {
@@ -176,12 +207,6 @@ export async function launchLauncherApp(options?: SeedOptions): Promise<Launcher
     }
   })
 
-  // Boot-time sweep protection: main reclaims install dirs that contain only
-  // ignored entries (marker file etc.) as aborted installs — removing the
-  // record. Seeded dirs typically hold just the marker, so give each EXISTING
-  // dir a `.launcher/` entry (what a real managed install has) to classify as
-  // populated. Dirs the test deliberately left missing stay missing (the sweep
-  // never reclaims those).
   for (const record of seedRecords) {
     if (!record.installPath) continue
     try {
@@ -192,9 +217,6 @@ export async function launchLauncherApp(options?: SeedOptions): Promise<Launcher
     await mkdir(path.join(record.installPath, '.launcher'), { recursive: true })
   }
 
-  // Seed snapshot JSON files under `<installPath>/.launcher/snapshots/` so
-  // the snapshots tab finds them on first read. Pure fs under the install
-  // paths (created above by the caller), so it can run before launch.
   if (options?.installations) {
     const { writeFile: writeFileFs } = await import('node:fs/promises')
     for (let i = 0; i < options.installations.length; i++) {
@@ -225,23 +247,25 @@ export async function launchLauncherApp(options?: SeedOptions): Promise<Launcher
     }
   }
 
-  // Expose a CDP remote-debugging port so tests can connect to non-BrowserWindow
-  // webContents. Derive the port from the worker index to avoid collisions.
-  const workerIndex = parseInt(process.env['TEST_WORKER_INDEX'] || '0', 10)
-  const cdpPort = 19200 + workerIndex
-
-  // Linux CI runners lack the SUID sandbox binary; disable it the same way linux-dev.sh does.
-  const args = ['.', `--remote-debugging-port=${cdpPort}`]
+  const args = ['.']
+  if (isBackgroundRun() && !FOREGROUND_PROJECTS.includes(test.info().project.name)) {
+    args.unshift(
+      '-r',
+      path.resolve('e2e/support/backgroundShim.cjs'),
+      '--disable-features=CalculateNativeWinOcclusion',
+      '--disable-backgrounding-occluded-windows'
+    )
+  }
+  if (options?.userDataDir) {
+    args.push(`--user-data-dir=${options.userDataDir}`)
+    if (process.platform === 'darwin') args.push('--use-mock-keychain')
+  }
   if (process.platform === 'linux') {
     args.push('--no-sandbox')
+    const ozone = process.env['E2E_OZONE_PLATFORM']
+    if (ozone) args.push(`--ozone-platform=${ozone}`)
   }
 
-  // A reused profile must keep its persisted settings: main overwrites
-  // settings.json with E2E_SETTINGS_SEED on every boot, so fold the
-  // profile's existing file into the seed (defaults < persisted < caller
-  // overrides). Without this a hydrated run boots with
-  // firstUseCompleted=false and lands on the first-use takeover instead
-  // of the chooser.
   let persistedSettings: Record<string, unknown> = {}
   if (reuseDir) {
     try {
@@ -251,70 +275,87 @@ export async function launchLauncherApp(options?: SeedOptions): Promise<Launcher
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         persistedSettings = parsed as Record<string, unknown>
       }
-    } catch {
-      /* no settings yet on a first run against the reuse dir */
-    }
-    // Safety invariant: a persisted profile must never re-enable telemetry
-    // under the harness. Callers can still override explicitly.
+    } catch {}
     delete persistedSettings['telemetryEnabled']
   }
-  const env = buildIsolatedEnv(homeDir, { ...persistedSettings, ...(options?.settings ?? {}) })
+  const env = buildIsolatedEnv(
+    homeDir,
+    { ...persistedSettings, ...(options?.settings ?? {}) },
+    options?.opsFlags
+  )
   if (seedRecords.length > 0) {
     env['E2E_INSTALLATIONS_SEED'] = JSON.stringify(seedRecords)
   }
 
+  const recordVideo = recordVideoOptions()
   const application = await electron.launch({
     args,
-    env
+    env,
+    ...(recordVideo ? { recordVideo } : {})
   })
 
-  // Under Playwright the ready-to-show event may fire but isVisible() can lag,
-  // so force-show once a BrowserWindow exists. Retried because the show is
-  // idempotent; side-effectful evaluate calls must NOT be blanket-retried
-  // (a retry can re-run a callback that already executed - see evalRetry.ts).
-  const page = await application.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
-  await evalWithRetry(() =>
-    application.evaluate(({ BrowserWindow }) => {
-      const win = BrowserWindow.getAllWindows()[0]
-      if (win && !win.isVisible()) win.show()
-    })
-  )
+  let connectionClosed = false
+  application.once('close', () => {
+    connectionClosed = true
+  })
+  const shutdownTarget = (appPid?: number, appStartTime?: string): ShutdownTarget => ({
+    launcher: application.process() ?? undefined,
+    appPid,
+    appStartTime,
+    profileDir: homeDir,
+    closeGracefully: () => application.close(),
+    connectionClosed: () => connectionClosed
+  })
 
-  // Suppress the native uncaught-exception dialog and exit fast so tests don't
-  // time out. `process` is rewritten by Playwright's transpiler, so use app.exit().
-  // Retried: re-assigning the stub is harmless, and the exit handler guards
-  // itself with a flag so a retry after a lost result can't register it twice.
-  await evalWithRetry(() =>
-    application.evaluate(({ app: electronApp, dialog }) => {
-      dialog.showErrorBox = () => {}
-      const marked = electronApp as typeof electronApp & {
-        __e2eRenderProcessGoneInstalled?: boolean
-      }
-      if (!marked.__e2eRenderProcessGoneInstalled) {
-        marked.__e2eRenderProcessGoneInstalled = true
-        electronApp.on('render-process-gone', () => electronApp.exit(1))
-      }
-    })
-  )
+  application.process()?.once('exit', (code, signal) => {
+    console.log(
+      `[e2e-harness] app process ended at ${new Date().toISOString()} code=${code} signal=${signal}`
+    )
+  })
+
+  let shutdownHandle: ShutdownHandle
+  try {
+    await showWindowAndLogAppEvents(application)
+    const appPid = await evalWithRetry(() => application.evaluate(() => globalThis.process.pid))
+    shutdownHandle = createShutdown(shutdownTarget(appPid, startTimeOrUnknown(appPid)))
+  } catch (error) {
+    await createShutdown(shutdownTarget())
+      .shutdown()
+      .catch((stopError: unknown) => {
+        console.error(`[e2e-harness] could not stop the app after a failed launch: ${stopError}`)
+      })
+    throw error
+  }
+  const { shutdown, trackHelpers } = shutdownHandle
+  const trackHelpersNow = (): void => {
+    try {
+      trackHelpers()
+    } catch {}
+  }
+  trackHelpersNow()
+  const helperWatch = setInterval(trackHelpersNow, HELPER_TRACKING_INTERVAL_MS)
+  helperWatch.unref()
 
   const cleanup = async (): Promise<void> => {
-    try {
-      const proc = application.process()
-      if (proc && proc.exitCode === null) {
-        await application.close().catch(() => {})
-      }
-    } catch {
-      // Application already closed / disconnected — nothing to clean up.
-    }
-    // Preserve the reuse dir so the next `LIFECYCLE_REUSE_DIR=<path>`
-    // invocation can pick it up. Only wipe dirs we created ourselves.
+    clearInterval(helperWatch)
+    await shutdown()
     if (!reuseDir) {
       await rm(homeDir, { recursive: true, force: true })
     }
   }
 
-  return { application, homeDir, cdpPort, cleanup }
+  return { application, homeDir, cleanup }
+}
+
+function startTimeOrUnknown(appPid: number): string | undefined {
+  try {
+    return processStartTime(appPid)
+  } catch (error) {
+    console.warn(
+      `[e2e-harness] could not read the start time of app process ${appPid}, so cleanup goes through the launcher only: ${error}`
+    )
+    return undefined
+  }
 }
 
 export async function waitForAppExit(

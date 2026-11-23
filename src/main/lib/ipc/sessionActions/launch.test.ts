@@ -1,15 +1,37 @@
 import { EventEmitter } from 'node:events'
+import { execFileSync } from 'child_process'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type { WriteStream } from 'fs'
 
-// Stub the electron surface ../shared touches so the test needs no runtime.
+const electronHome = vi.hoisted(() => {
+  const overrides = [
+    'XDG_CONFIG_HOME',
+    'XDG_CACHE_HOME',
+    'XDG_DATA_HOME',
+    'XDG_STATE_HOME',
+    'LOCALAPPDATA'
+  ]
+  const saved = Object.fromEntries(overrides.map((name) => [name, process.env[name]]))
+  for (const name of overrides) delete process.env[name]
+  return { dir: '', saved }
+})
+afterAll(() => {
+  for (const [name, value] of Object.entries(electronHome.saved)) {
+    if (value !== undefined) process.env[name] = value
+  }
+  if (electronHome.dir) {
+    fs.rmSync(electronHome.dir, { recursive: true, force: true, maxRetries: 3 })
+  }
+})
+
 vi.mock('electron', () => ({
   app: {
     isPackaged: false,
-    getPath: () => path.join(os.tmpdir(), 'core-beta-launch-test'),
+    getPath: () =>
+      (electronHome.dir ||= fs.mkdtempSync(path.join(os.tmpdir(), 'core-beta-launch-test-'))),
     getVersion: () => '0.0.0-test',
     getLocale: () => 'en',
     on: () => {}
@@ -22,8 +44,6 @@ vi.mock('electron', () => ({
   nativeTheme: { on: vi.fn(), shouldUseDarkColors: false }
 }))
 
-// Override only the model-download startup gate; everything else in the
-// download manager stays real (it is already part of launch.ts's graph).
 const modelStartup = vi.hoisted(() => ({
   impl: null as null | (() => Promise<{ safe: boolean; unsafePaths: string[] }>)
 }))
@@ -36,34 +56,72 @@ vi.mock('../../comfyDownloadManager', async (importOriginal) => {
   }
 })
 
-/** Drives a real `handleLaunch` far enough to reach the pre-spawn gates. Everything the launch
- *  touches on the way (source, args schema, grants, taps, spawn) is answered from here, so a
- *  test can park the launch at an exact point and observe what was reported by then. */
 const launchHarness = vi.hoisted(() => ({
   launchCommand: null as null | Record<string, unknown>,
+  plans: [] as unknown[],
   schemaNames: ['enable-assets', 'listen', 'feature-flag'] as string[],
   schemaThrows: false,
   registryThrows: false,
   registryCalls: 0,
   betaEnabled: true,
-  /** Settings can throw on read: `resolveBetaFeaturesEnabled` writes the default back on first
-   *  read, so a read-only or full disk surfaces here. */
   betaEnabledThrows: false,
-  grants: [] as { arg: string; minCoreVersion: string }[],
-  /** Runs while `acquireLaunchResources` is in flight — after the launching marker exists and
-   *  before either path's pre-spawn abort gate, which is exactly the window under test. */
+  readSettled: null as null | ((signal?: AbortSignal) => Promise<unknown>),
+  grants: [] as CoreBetaGrant[],
+  commits: null as null | CoreCommitState,
+  commitShas: [] as string[][],
   duringResourceAcquire: null as null | (() => void),
   spawn: null as null | ((...args: unknown[]) => unknown),
-  /** Called in place of the real boot probe, once per spawn attempt. Resolving means "this
-   *  attempt booted"; a never-settling promise lets the early-exit rejection win instead. */
-  waitForPort: null as null | (() => Promise<void>),
-  nextPort: 48999
+  spawnFails: false,
+  waitForPort: null as null | ((...args: unknown[]) => Promise<void>),
+  nextPort: 48999,
+  busyPorts: null as null | number[],
+  portFreeWaits: [] as number[],
+  busyPids: [31337] as number[],
+  portLockPid: null as null | number,
+  killExits: true,
+  killGate: null as null | ((proc: unknown) => Promise<void>),
+  campaigns: { registry: [] as unknown[], answers: new Map<string, unknown>() },
+  campaignRecords: {} as Record<string, Record<string, { epoch: number; enrolledAt: number }>>,
+  recordWrites: [] as Array<[string, string, number]>,
+  recordWriteThrows: false,
+  idClass: 'machine_derived' as string,
+  campaignFetches: 0,
+  records: null as null | Map<string, Record<string, unknown>>,
+  recordsUpdateThrows: false,
+  recordsUpdateGate: null as null | Promise<void>,
+  campaignsReject: false,
+  installRecords: null as null | Record<string, { name: string; sourceId: string }>,
+  listGate: null as null | Promise<void>,
+  waitForUrl: null as null | (() => Promise<void>)
 }))
+
+vi.mock('../../coreBetaCampaignFlags', () => ({
+  getCoreBetaCampaigns: async () => {
+    launchHarness.campaignFetches++
+    if (launchHarness.campaignsReject) throw new Error('campaign fetch failed')
+    return launchHarness.campaigns
+  },
+  readCampaignRecords: () => launchHarness.campaignRecords,
+  writeCampaignRecord: (key: string, arg: string, epoch: number) => {
+    if (launchHarness.recordWriteThrows) throw new Error('EIO')
+    if (launchHarness.campaignRecords[key]?.[arg]?.epoch === epoch) return false
+    launchHarness.recordWrites.push([key, arg, epoch])
+    return true
+  }
+}))
+
+vi.mock('../../deviceId', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  getIdClass: () => launchHarness.idClass
+}))
+
+const sessionPaths = vi.hoisted(() => ({ made: 0 }))
 
 vi.mock('../shared', async (importOriginal) => {
   const actual = await importOriginal<typeof SharedModule>()
   return {
     ...actual,
+    createSessionPath: () => `${actual.createSessionPath()}-${process.pid}-${++sessionPaths.made}`,
     sourceMap: {
       ...actual.sourceMap,
       'harness-source': {
@@ -74,6 +132,7 @@ vi.mock('../shared', async (importOriginal) => {
     },
     settings: new Proxy(actual.settings, {
       get(target, key) {
+        if (key === 'readSettled' && launchHarness.readSettled) return launchHarness.readSettled
         if (key === 'resolveBetaFeaturesEnabled') {
           return () => {
             if (launchHarness.betaEnabledThrows) throw new Error('settings write failed: EROFS')
@@ -84,20 +143,119 @@ vi.mock('../shared', async (importOriginal) => {
         return typeof value === 'function' ? value.bind(target) : value
       }
     }),
-    spawnProcess: (...args: unknown[]) => launchHarness.spawn?.(...args),
+    spawnProcess: (...args: unknown[]) => {
+      const proc = launchHarness.spawn?.(...args) as
+        | { emit?: (event: string, err?: Error) => void; listenerCount?: (event: string) => number }
+        | undefined
+      if (typeof proc?.emit !== 'function') return proc
+      if (!launchHarness.spawnFails) queueMicrotask(() => proc.emit!('spawn'))
+      else
+        setImmediate(() => {
+          if ((proc.listenerCount?.('error') ?? 0) > 0)
+            proc.emit!('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))
+        })
+      return proc
+    },
+    waitForUrl: (...args: Parameters<typeof actual.waitForUrl>) =>
+      launchHarness.waitForUrl ? launchHarness.waitForUrl() : actual.waitForUrl(...args),
     waitForPort: (...args: Parameters<typeof actual.waitForPort>) =>
-      launchHarness.waitForPort ? launchHarness.waitForPort() : actual.waitForPort(...args),
+      launchHarness.waitForPort ? launchHarness.waitForPort(...args) : actual.waitForPort(...args),
     getComfyFeatureFlagRegistry: async () => {
       launchHarness.registryCalls += 1
       if (launchHarness.registryThrows) throw new Error('feature registry unavailable')
       return {}
     },
     findAvailablePort: async () => launchHarness.nextPort,
-    // Never let a test reach the real one: the fake child's pid is invented, and killing it
-    // would signal whatever real process happens to hold that pid.
-    killProcessTree: async () => {}
+    installations: new Proxy(actual.installations, {
+      get(target, key) {
+        if (key === 'list' && launchHarness.installRecords) {
+          const records = launchHarness.installRecords
+          return async () => {
+            await launchHarness.listGate
+            return Object.entries(records).map(([id, r]) => ({ id, ...r }))
+          }
+        }
+        const records = launchHarness.records
+        if (records && key === 'get') return async (id: string) => records.get(id) ?? null
+        if (records && key === 'update') {
+          return async (id: string, data: Record<string, unknown>) => {
+            if (launchHarness.recordsUpdateThrows) throw new Error('EIO')
+            await launchHarness.recordsUpdateGate
+            const next = { ...(records.get(id) ?? { id }), ...data }
+            records.set(id, next)
+            return next
+          }
+        }
+        return Reflect.get(target, key) as unknown
+      }
+    }),
+    waitForPortFree: async (port: number) => {
+      launchHarness.portFreeWaits.push(port)
+      if (launchHarness.busyPorts) {
+        launchHarness.busyPorts = launchHarness.busyPorts.filter((p) => p !== port)
+      }
+      return true
+    },
+    isPortListening: (...args: Parameters<typeof actual.isPortListening>) =>
+      launchHarness.busyPorts
+        ? Promise.resolve(launchHarness.busyPorts.includes(args[0]))
+        : actual.isPortListening(...args),
+    findPidsByPort: (...args: Parameters<typeof actual.findPidsByPort>) =>
+      launchHarness.busyPorts
+        ? Promise.resolve(launchHarness.busyPorts.includes(args[0]) ? launchHarness.busyPids : [])
+        : actual.findPidsByPort(...args),
+    readPortLock: (...args: Parameters<typeof actual.readPortLock>) =>
+      launchHarness.busyPorts
+        ? launchHarness.portLockPid !== null && launchHarness.busyPorts.includes(args[0])
+          ? { pid: launchHarness.portLockPid, installationName: 'Other', timestamp: 0 }
+          : null
+        : actual.readPortLock(...args),
+    getProcessInfo: (...args: Parameters<typeof actual.getProcessInfo>) =>
+      launchHarness.busyPorts
+        ? Promise.resolve({ name: 'python', commandLine: 'python -s ComfyUI/main.py' })
+        : actual.getProcessInfo(...args),
+    killProcessTree: async (proc: unknown) => {
+      if (launchHarness.killGate) await launchHarness.killGate(proc)
+      return { exited: launchHarness.killExits, waitMs: 0 }
+    }
   }
 })
+
+const ownership = vi.hoisted(() => ({
+  prior: null as null | Record<string, unknown>,
+  priorCalls: [] as Array<{ sessionKey: string; opts: unknown }>,
+  priorThrows: false,
+  onResolve: null as null | ((opts: unknown) => unknown),
+  holderIsInstall: false as boolean | ((pid: number) => boolean),
+  tracked: [] as Array<Record<string, unknown>>
+}))
+vi.mock('../../comfyProcessRecord', () => ({
+  resolvePriorProcess: async (sessionKey: string, opts: unknown) => {
+    ownership.priorCalls.push({ sessionKey, opts })
+    ownership.onResolve?.(opts)
+    if (ownership.priorThrows) throw new Error('state dir unreadable')
+    return ownership.prior
+  },
+  holderIsInstall: async (pid: number) =>
+    typeof ownership.holderIsInstall === 'function'
+      ? ownership.holderIsInstall(pid)
+      : ownership.holderIsInstall,
+  trackSpawn: (_proc: unknown, info: Record<string, unknown>) => {
+    ownership.tracked.push(info)
+  },
+  markStopRequested: () => {},
+  listRecords: () => []
+}))
+
+const vcRuntime = vi.hoisted(() => ({ missing: [] as string[], auditThrows: false }))
+
+vi.mock('../../vcRuntimeAudit', async (importOriginal) => ({
+  ...(await importOriginal<typeof VcRuntimeAuditModule>()),
+  auditVcRuntime: async () => {
+    if (vcRuntime.auditThrows) throw new Error('System32 unreadable')
+    return vcRuntime.missing
+  }
+}))
 
 vi.mock('../../comfy-args', async (importOriginal) => {
   const actual = await importOriginal<typeof ComfyArgsModule>()
@@ -107,13 +265,77 @@ vi.mock('../../comfy-args', async (importOriginal) => {
       if (launchHarness.schemaThrows) throw new Error('schema discovery unavailable')
       return schemaOf(...launchHarness.schemaNames)
     },
-    getComfyFeatureFlagRegistry: async () => ({})
+    getComfyFeatureFlagRegistry: async () => ({}),
+    peekComfyArgsSchema: () =>
+      launchHarness.schemaThrows ? null : schemaOf(...launchHarness.schemaNames)
   }
 })
 
-vi.mock('../../coreCanary', async (importOriginal) => {
-  const actual = await importOriginal<typeof CoreCanaryModule>()
-  return { ...actual, getCoreCanaryFlagsAsync: async () => launchHarness.grants }
+vi.mock('../../coreBetaGrants', async (importOriginal) => {
+  const actual = await importOriginal<typeof CoreBetaGrantsModule>()
+  return {
+    ...actual,
+    getCoreBetaGrantsAsync: () => Promise.resolve(launchHarness.grants),
+    planCoreBetaArgs: (facts: Parameters<typeof actual.planCoreBetaArgs>[0]) => {
+      launchHarness.plans.push(facts)
+      return actual.planCoreBetaArgs(facts)
+    }
+  }
+})
+
+const pipHarness = vi.hoisted(() => ({
+  calls: [] as unknown[][],
+  checks: [] as unknown[][],
+  result: { code: 0, output: '' },
+  respond: null as null | ((args: unknown[]) => { code: number; output: string }),
+  installed: '[]',
+  duringInstall: null as null | (() => void)
+}))
+
+vi.mock('../../pip', async (importOriginal) => {
+  const actual = await importOriginal<typeof PipModule>()
+  return {
+    ...actual,
+    installFilteredRequirementsDetailed: async (...args: unknown[]) => {
+      const launchCheck =
+        String(args[4]).startsWith('.launch-agent-reqs') &&
+        (args[8] as string[]).includes('--dry-run')
+      ;(launchCheck ? pipHarness.checks : pipHarness.calls).push(args)
+      pipHarness.duringInstall?.()
+      return pipHarness.respond?.(args) ?? pipHarness.result
+    },
+    runUvPipDetailed: async () => ({ code: 0, output: pipHarness.installed })
+  }
+})
+
+const prefetchHarness = vi.hoisted(() => ({
+  requests: [] as { installationId: string; request: unknown }[],
+  onStart: null as null | ((request: unknown) => void)
+}))
+
+vi.mock('../../agentPrefetch', () => ({
+  startAgentPrefetch: (installationId: string, request: unknown) => {
+    prefetchHarness.requests.push({ installationId, request })
+    prefetchHarness.onStart?.(request)
+    return new Promise(() => {})
+  }
+}))
+
+vi.mock('../../coreBetaAncestry', async (importOriginal) => {
+  const actual = await importOriginal<typeof CoreBetaAncestryModule>()
+  return {
+    ...actual,
+    resolveCoreCommitState: (...args: Parameters<typeof actual.resolveCoreCommitState>) => {
+      launchHarness.commitShas.push([...args[2]])
+      const { commits } = launchHarness
+      if (commits === null) return actual.resolveCoreCommitState(...args)
+      const asked = new Set(args[2])
+      return Promise.resolve({
+        head: commits.head,
+        ancestry: new Map([...commits.ancestry].filter(([sha]) => asked.has(sha)))
+      })
+    }
+  }
 })
 
 vi.mock('../../hardwareTap', async (importOriginal) => {
@@ -129,39 +351,95 @@ vi.mock('../../hardwareTap', async (importOriginal) => {
 
 import {
   attachLaunchStreams,
+  createAgentTapSafe,
   createAssetsTapSafe,
   buildLaunchArgs,
   desktopFeatureFlags,
   emitCoreBetaRecords,
   emitCoreBetaTelemetry,
   handleLaunch,
+  recordCampaignEnrolments,
   isCrashedExit,
+  isPortInUseOutput,
+  launchedCoreCommit,
   onProcessTerminated,
   writeLog,
-  _cleanupFailedLaunchSetup
+  describeLockHolder,
+  describePriorOutcome,
+  _cleanupFailedLaunchSetup,
+  _resolveLaunchMode,
+  _resolvePortConflictPolicy
 } from './launch'
 import * as assetsTapModule from '../../assetsTap'
+import * as agentTapModule from '../../agentTap'
+import {
+  BETA_NOTICE_ANNOUNCED_ARGS_KEY,
+  _resetForTest as _resetBetaNotice,
+  acknowledgeBetaActivationNotice,
+  armBetaActivationNotice,
+  peekBetaActivationNotice
+} from '../../betaActivationNotice'
+import * as settingsModule from '../../../settings'
+import { setHardwareProbe } from '../../agentClientContext'
+import { getAppVersion } from '../shared'
+import { instanceModelPathsYaml } from '../../models'
+import { lookupEnMessage } from '../../localeTestHelper'
+import { previewCoreBetaArgs } from '../../coreBetaPreview'
 import type { ActionContext } from './types'
+import type { BlockingSession } from '../../../../types/ipc'
 import type * as ComfyDownloadManagerModule from '../../comfyDownloadManager'
 import type { createExecutionTap } from '../../executionTap'
 import type { createHardwareTap } from '../../hardwareTap'
 import type { LaunchProgressTracker } from '../../launchProgress'
+import type { WaitForPortOptions } from '../../process'
 import type { ComfyArgsSchema } from '../../comfy-args'
-import type { CoreCanaryFlag } from '../../coreCanary'
+import type { LaunchCommand } from '../../../types/sources'
+import { ASSETS_MIN_CORE_COMMIT, NO_CORE_COMMITS } from '../../coreBetaGrants'
+import { appliedPassThrough, parseCampaignAnswer } from '../../coreBetaCampaigns'
+import type { CoreBetaGrant, CoreCommitState } from '../../coreBetaGrants'
 import * as telemetry from '../../telemetry'
+import * as i18nModule from '../../i18n'
+import { getCloudSession } from '../../../devplatform/session'
 import {
+  COMFY_BOOT_QUIET_MS,
+  COMFY_BOOT_TIMEOUT_MS,
   makeSendOutput,
   _getLaunchingInstallationIds,
   _markLaunching,
   _operationAborts,
   _pendingPorts,
-  _reservePort
+  _runningSessions,
+  _reservePort,
+  _beginLaunch,
+  _endLaunch,
+  _hasActiveLocalLaunch,
+  _setActiveLaunchPickerWorkspace,
+  _stoppingInstallationIds,
+  cancelAll,
+  noteWindowClosed,
+  setCallbacks,
+  stopRunning
 } from '../shared'
+import { clearCrash, getCrash } from '../../crashBuffer'
+import type { InstanceStartedCallbackInfo, SessionInfo } from '../shared'
 import type { ChildProcess, InstallationRecord } from '../shared'
 import type * as SharedModule from '../shared'
 import type * as ComfyArgsModule from '../../comfy-args'
-import type * as CoreCanaryModule from '../../coreCanary'
+import type * as CoreBetaGrantsModule from '../../coreBetaGrants'
+import type * as CoreBetaAncestryModule from '../../coreBetaAncestry'
 import type * as HardwareTapModule from '../../hardwareTap'
+import type * as PipModule from '../../pip'
+import type * as VcRuntimeAuditModule from '../../vcRuntimeAudit'
+import { getUvPath, getVenvPythonPath } from '../../pythonEnv'
+import {
+  _resetAgentPrefetchesForTest,
+  holdAgentPrefetch,
+  prefetchAgentRequirements,
+  stopAgentPrefetches
+} from '../../agentRequirementsLaunch'
+import type { PrefetchRequest } from '../../agentRequirementsLaunch'
+import { getLogDir } from '../../logRotation'
+import en from '../../../../../locales/en.json'
 
 const installOf = (sourceId: string) => ({ sourceId }) as InstallationRecord
 
@@ -174,25 +452,95 @@ type FakeChild = EventEmitter & {
 }
 
 describe('desktopFeatureFlags', () => {
+  const withConsent = (consent: boolean | undefined): void => {
+    vi.spyOn(settingsModule, 'telemetryConsent').mockReturnValue(consent)
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('always injects the unconditional desktop flags', () => {
-    const flags = desktopFeatureFlags(installOf('standalone'), false)
+    withConsent(false)
+    const flags = desktopFeatureFlags(installOf('standalone'))
     expect(flags.show_signin_button).toBe('true')
     expect(flags.supports_terminal).toBe('false')
   })
 
   it('injects enable_telemetry only for standalone installs that opted in', () => {
-    expect(desktopFeatureFlags(installOf('standalone'), true).enable_telemetry).toBe('true')
+    withConsent(true)
+    expect(desktopFeatureFlags(installOf('standalone')).enable_telemetry).toBe('true')
   })
 
-  it('omits enable_telemetry when telemetry is disabled (default off)', () => {
-    expect(desktopFeatureFlags(installOf('standalone'), false)).not.toHaveProperty(
-      'enable_telemetry'
-    )
+  it.each([false, undefined])('omits enable_telemetry with telemetry consent %s', (consent) => {
+    withConsent(consent)
+    expect(desktopFeatureFlags(installOf('standalone'))).not.toHaveProperty('enable_telemetry')
+  })
+
+  it('omits enable_telemetry when settings serve a consent the accessor withholds', () => {
+    settingsModule.set('telemetryEnabled', true)
+    onTestFinished(() => settingsModule.set('telemetryEnabled', undefined))
+    expect(settingsModule.get('telemetryEnabled'), 'settings serve the opt-in').toBe(true)
+    withConsent(undefined)
+    expect(desktopFeatureFlags(installOf('standalone'))).not.toHaveProperty('enable_telemetry')
   })
 
   it('omits enable_telemetry for non-standalone installs even when opted in', () => {
-    expect(desktopFeatureFlags(installOf('portable'), true)).not.toHaveProperty('enable_telemetry')
-    expect(desktopFeatureFlags(installOf('git'), true)).not.toHaveProperty('enable_telemetry')
+    withConsent(true)
+    expect(desktopFeatureFlags(installOf('portable'))).not.toHaveProperty('enable_telemetry')
+    expect(desktopFeatureFlags(installOf('git'))).not.toHaveProperty('enable_telemetry')
+  })
+})
+
+describe('_resolveLaunchMode', () => {
+  it('allows a launch-scoped console override without changing the installation', () => {
+    const installation = { ...installOf('standalone'), launchMode: 'window' }
+
+    expect(_resolveLaunchMode(installation, { launchModeOverride: 'console' })).toBe('console')
+    expect(installation.launchMode).toBe('window')
+  })
+
+  it('uses the persisted mode for unsupported overrides', () => {
+    const installation = { ...installOf('standalone'), launchMode: 'window' }
+
+    expect(_resolveLaunchMode(installation, { launchModeOverride: 'external' })).toBe('window')
+  })
+})
+
+describe('_resolvePortConflictPolicy', () => {
+  it('allows a launch-scoped automatic port without changing the installation', () => {
+    const installation = {
+      ...installOf('standalone'),
+      launchArgs: '--enable-manager --port 8188',
+      portConflict: 'prompt'
+    }
+
+    expect(
+      _resolvePortConflictPolicy(
+        installation,
+        { portConflict: 'prompt' },
+        {
+          autoPortOnConflict: true
+        }
+      )
+    ).toEqual({ mode: 'auto', portIsExplicit: false })
+    expect(installation).toMatchObject({
+      launchArgs: '--enable-manager --port 8188',
+      portConflict: 'prompt'
+    })
+  })
+
+  it('preserves the configured policy and explicit port for normal launches', () => {
+    const installation = {
+      ...installOf('standalone'),
+      launchArgs: '--port=8188',
+      portConflict: 'prompt'
+    }
+
+    expect(_resolvePortConflictPolicy(installation, { portConflict: 'auto' })).toEqual({
+      mode: 'prompt',
+      portIsExplicit: true
+    })
   })
 })
 
@@ -207,7 +555,6 @@ describe('isCrashedExit', () => {
   })
 
   it('treats a POSIX signal-only kill (code null, signal set) as crashed', () => {
-    // SIGKILL via `kill -9` or OOM: Node hands back null code + signal.
     expect(isCrashedExit(null, 'SIGKILL')).toBe(true)
     expect(isCrashedExit(null, 'SIGTERM')).toBe(true)
   })
@@ -217,7 +564,6 @@ describe('isCrashedExit', () => {
   })
 
   it('treats Windows TerminateProcess (numeric code, null signal) as crashed', () => {
-    // Windows force-kill reports a large unsigned code; signal is always null.
     expect(isCrashedExit(4294967295, null)).toBe(true)
     expect(isCrashedExit(0xc0000005, null)).toBe(true)
   })
@@ -234,7 +580,7 @@ describe('onProcessTerminated', () => {
     proc.emit('close', 3, null)
 
     expect(callback).toHaveBeenCalledOnce()
-    expect(callback).toHaveBeenCalledWith(2, 'SIGTERM')
+    expect(callback).toHaveBeenCalledWith(2, 'SIGTERM', { pipesHeld: false })
   })
 
   it('handles rejected async termination callbacks', async () => {
@@ -267,7 +613,7 @@ describe('onProcessTerminated', () => {
       vi.runAllTimers()
 
       expect(callback).toHaveBeenCalledOnce()
-      expect(callback).toHaveBeenCalledWith(null, 'SIGKILL')
+      expect(callback).toHaveBeenCalledWith(null, 'SIGKILL', { pipesHeld: true })
     } finally {
       vi.useRealTimers()
     }
@@ -297,6 +643,16 @@ describe('_cleanupFailedLaunchSetup', () => {
     expect(abort.signal.aborted).toBe(true)
   })
 
+  it('drops a beta claim armed by a launch that then failed to spawn', () => {
+    _resetBetaNotice()
+    armBetaActivationNotice(INSTALL, [{ arg: '--enable-assets', minCoreVersion: '0.3.80' }])
+    expect(peekBetaActivationNotice(INSTALL)?.args).toEqual(['--enable-assets'])
+
+    _cleanupFailedLaunchSetup(INSTALL, new AbortController())
+
+    expect(peekBetaActivationNotice(INSTALL)).toBeNull()
+  })
+
   it('ends the log stream when one was opened', () => {
     const end = vi.fn()
     _cleanupFailedLaunchSetup(INSTALL, new AbortController(), { logStream: { end } })
@@ -324,8 +680,6 @@ describe('handleLaunch model-download startup await (#1322)', () => {
   const ctxFor = (installationId: string): ActionContext => ({
     event: { sender: { send: vi.fn() } } as unknown as Electron.IpcMainInvokeEvent,
     installationId,
-    // An unknown source makes runLaunch fail at the FIRST check after the
-    // gate, proving how far a safe pass proceeded without spawning anything.
     inst: installOf('not-a-real-source'),
     actionData: {}
   })
@@ -341,10 +695,6 @@ describe('handleLaunch model-download startup await (#1322)', () => {
     })
     const res = await handleLaunch(ctxFor('gate-unsafe-paths'))
     expect(res.ok).toBe(false)
-    // Failure comes from the NEXT check (unknown source): the unsafe pass
-    // warned and the launch proceeded past the model-download startup await.
-    // A truncated file that fails to load in ComfyUI is strictly better than
-    // refusing to start; the Downloads warning rows carry the details.
     expect(res.message).toMatch(/unknownSource|unrecognized source/)
   })
 
@@ -368,7 +718,6 @@ describe('handleLaunch model-download startup await (#1322)', () => {
     modelStartup.impl = async () => ({ safe: true, unsafePaths: [] })
     const res = await handleLaunch(ctxFor('gate-safe'))
     expect(res.ok).toBe(false)
-    // Failure comes from the NEXT check (unknown source), not the gate.
     expect(res.message).toMatch(/unknownSource|unrecognized source/)
   })
 
@@ -376,6 +725,50 @@ describe('handleLaunch model-download startup await (#1322)', () => {
     modelStartup.impl = async () => ({ safe: false, unsafePaths: [] })
     await handleLaunch(ctxFor('gate-slot-release'))
     expect(_operationAborts.has('gate-slot-release')).toBe(false)
+  })
+})
+
+describe('handleLaunch of a start whose window was left', () => {
+  const ctxFor = (installationId: string): ActionContext => ({
+    event: {
+      sender: { send: vi.fn(), isDestroyed: () => true }
+    } as unknown as Electron.IpcMainInvokeEvent,
+    installationId,
+    inst: { ...installOf('not-a-real-source'), name: 'Studio' },
+    actionData: {}
+  })
+
+  afterEach(() => {
+    modelStartup.impl = null
+  })
+
+  it('records its failure where a Home opened later reads it', async () => {
+    const id = 'left-start-fails'
+    onTestFinished(() => clearCrash(id))
+    modelStartup.impl = async () => {
+      noteWindowClosed(id)
+      return { safe: true, unsafePaths: [] }
+    }
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(false)
+    expect(getCrash(id)).toMatchObject({
+      installationId: id,
+      installationName: 'Studio',
+      message: res.message,
+      startFailed: true
+    })
+  })
+
+  it('records nothing when the window that started it is still there', async () => {
+    const id = 'kept-start-fails'
+    modelStartup.impl = async () => ({ safe: true, unsafePaths: [] })
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(false)
+    expect(getCrash(id)).toBeNull()
   })
 })
 
@@ -420,8 +813,6 @@ describe('createAssetsTapSafe', () => {
     }).not.toThrow()
     expect(consoleError).toHaveBeenCalled()
 
-    // Every lifecycle call the launch path makes must be a safe no-op on the
-    // substitute, or containment at construction buys nothing.
     const inert = tap as unknown as ReturnType<typeof createAssetsTapSafe>
     expect(() => {
       inert.beginBoot()
@@ -435,12 +826,50 @@ describe('createAssetsTapSafe', () => {
   })
 })
 
-describe('attachLaunchStreams assets tap wiring', () => {
+describe('createAgentTapSafe', () => {
+  const BASE = {
+    installationId: 'agent-tap-base',
+    variant: 'nvidia',
+    release: '0.3.68',
+    coreBetaFlags: []
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('forwards the base context to the agent tap', () => {
+    const create = vi.spyOn(agentTapModule, 'createAgentTap')
+    createAgentTapSafe(BASE)
+    expect(create).toHaveBeenCalledWith(BASE)
+  })
+
+  it('substitutes an inert tap when construction throws, letting no exception escape', () => {
+    vi.spyOn(agentTapModule, 'createAgentTap').mockImplementation(() => {
+      throw new Error('agent tap construction exploded')
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    let tap: ReturnType<typeof createAgentTapSafe> | null = null
+    expect(() => {
+      tap = createAgentTapSafe(BASE)
+    }).not.toThrow()
+    expect(consoleError).toHaveBeenCalled()
+
+    const inert = tap as unknown as ReturnType<typeof createAgentTapSafe>
+    expect(() => {
+      inert.beginBoot()
+      inert.ingest('[agent-event] agent_started duration_ms=12\n', 'stdout')
+    }).not.toThrow()
+  })
+})
+
+describe('attachLaunchStreams event-log tap wiring', () => {
   function fakeTap() {
     return { ingest: vi.fn(), beginBoot: vi.fn(), flushSummary: vi.fn() }
   }
 
-  function harness(assetsTap = fakeTap()) {
+  function harness(assetsTap = fakeTap(), agentTap = fakeTap()) {
     const stdout = new EventEmitter()
     const stderr = new EventEmitter()
     const proc = { stdout, stderr } as unknown as ChildProcess
@@ -450,17 +879,33 @@ describe('attachLaunchStreams assets tap wiring', () => {
     const tracker = { ingest: vi.fn() } as unknown as LaunchProgressTracker
     const sendOutput = vi.fn()
 
-    const { getStderr } = attachLaunchStreams(
+    const { getStderr, lastOutputAt } = attachLaunchStreams(
       proc,
       logStream,
       sendOutput,
       execTap as unknown as ReturnType<typeof createExecutionTap>,
       hwTap as unknown as ReturnType<typeof createHardwareTap>,
       assetsTap,
+      agentTap,
       tracker
     )
-    return { stdout, stderr, execTap, hwTap, assetsTap, getStderr }
+    return { stdout, stderr, execTap, hwTap, assetsTap, agentTap, getStderr, lastOutputAt }
   }
+
+  it('stamps lastOutputAt at attach and on every chunk from either stream', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    onTestFinished(() => now.mockRestore())
+    const h = harness()
+    expect(h.lastOutputAt()).toBe(1_000)
+    now.mockReturnValue(2_000)
+    h.stderr.emit('data', Buffer.from('Loading: ComfyUI-Impact-Pack\n'))
+    expect(h.lastOutputAt()).toBe(2_000)
+    now.mockReturnValue(3_000)
+    h.stdout.emit('data', Buffer.from('still importing\n'))
+    expect(h.lastOutputAt()).toBe(3_000)
+    now.mockReturnValue(9_000)
+    expect(h.lastOutputAt()).toBe(3_000)
+  })
 
   it('feeds stdout chunks to the assets tap tagged as stdout', () => {
     const h = harness()
@@ -481,6 +926,17 @@ describe('attachLaunchStreams assets tap wiring', () => {
       '[assets-event] scanner.stat_failed error_type=OSError site=discovery\n',
       'stderr'
     )
+  })
+
+  it('feeds both streams to the agent tap with their source tags', () => {
+    const h = harness()
+    h.stdout.emit('data', Buffer.from('[agent-event] agent_started duration_ms=12\n'))
+    h.stderr.emit('data', Buffer.from('[agent-event] agent_exited code=1\n'))
+    expect(h.agentTap.ingest).toHaveBeenCalledWith(
+      '[agent-event] agent_started duration_ms=12\n',
+      'stdout'
+    )
+    expect(h.agentTap.ingest).toHaveBeenCalledWith('[agent-event] agent_exited code=1\n', 'stderr')
   })
 
   it('leaves the hardware and execution taps receiving both streams unchanged', () => {
@@ -521,8 +977,6 @@ describe('attachLaunchStreams assets tap wiring', () => {
   })
 })
 
-/** Every arg the pinned core knows is boolean here; the beta grants and the
- *  opposite tokens under test are all switches. */
 const schemaOf = (...names: string[]): ComfyArgsSchema => ({
   args: names.map((name) => ({
     name,
@@ -534,19 +988,21 @@ const schemaOf = (...names: string[]): ComfyArgsSchema => ({
   knownFlags: new Set(names)
 })
 
-const ASSETS_GRANT: CoreCanaryFlag = { arg: '--enable-assets', minCoreVersion: '0.3.80' }
+const ASSETS_GRANT: CoreBetaGrant = { arg: '--enable-assets', minCoreVersion: '0.3.80' }
 const PREFIX = ['/opt/py', '-s', 'ComfyUI/main.py']
 const DESKTOP_FLAGS = ['--feature-flag', 'show_signin_button=true']
 
 const build = (over: {
   userArgs?: string[]
   schema: ComfyArgsSchema
-  betaFlags?: CoreCanaryFlag[]
+  betaFlags?: CoreBetaGrant[]
   coreVersion?: string | null
   coreVersionExact?: boolean
   coreVersionVerified?: boolean
   coreVersionCurrent?: boolean
+  coreCommits?: CoreCommitState
   betaEnabled?: boolean
+  campaign?: Parameters<typeof buildLaunchArgs>[0]['campaign']
 }): ReturnType<typeof buildLaunchArgs> =>
   buildLaunchArgs({
     prefixArgs: PREFIX,
@@ -558,8 +1014,118 @@ const build = (over: {
     coreVersionExact: over.coreVersionExact ?? true,
     coreVersionVerified: over.coreVersionVerified ?? true,
     coreVersionCurrent: over.coreVersionCurrent ?? true,
-    betaEnabled: over.betaEnabled ?? true
+    coreCommits: over.coreCommits ?? NO_CORE_COMMITS,
+    betaEnabled: over.betaEnabled ?? true,
+    ...(over.campaign && { campaign: over.campaign })
   })
+
+describe('buildLaunchArgs user args', () => {
+  const schema: ComfyArgsSchema = {
+    args: [
+      { name: 'cuda-device', flag: '--cuda-device', help: '', type: 'value', category: 'gpuVram' }
+    ],
+    knownFlags: new Set(['cuda-device'])
+  }
+
+  it('never passes a --cuda-device with no value to ComfyUI', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { args } = build({ userArgs: ['--cuda-device'], schema, betaFlags: [] })
+      expect(args, 'argparse would exit: "expected one argument"').not.toContain('--cuda-device')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it("drops only from the user's args, never Desktop's or a grant's", () => {
+    const valueTyped: ComfyArgsSchema = {
+      args: [
+        ...schema.args,
+        { name: 'enable-assets', flag: '--enable-assets', help: '', type: 'value', category: 'x' }
+      ],
+      knownFlags: new Set(['cuda-device', 'enable-assets'])
+    }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { args } = build({ userArgs: ['--cuda-device'], schema: valueTyped })
+      expect(args, 'a grant is never filtered for a missing value').toContain('--enable-assets')
+      expect(args).not.toContain('--cuda-device')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('passes --cuda-device with its value through', () => {
+    const { args } = build({ userArgs: ['--cuda-device', '1'], schema, betaFlags: [] })
+    expect(args.slice(-2)).toEqual(['--cuda-device', '1'])
+  })
+})
+
+describe('buildLaunchArgs campaigns', () => {
+  const KEY = 'desktop_core_beta_agent'
+  const schema = schemaOf('enable-assets', 'enable-agent', 'disable-agent')
+  const campaign = (variant = 'enrol', answer?: unknown) => ({
+    registry: [{ key: KEY, args: ['--enable-agent'] }],
+    answers: new Map([
+      [
+        KEY,
+        (answer ??
+          parseCampaignAnswer(
+            variant,
+            {
+              grants: [
+                {
+                  arg: '--enable-agent',
+                  min_core_version: '0.3.60',
+                  requires_args: ['--enable-assets'],
+                  enrolment: { epoch: 1, epochs: [1] }
+                }
+              ]
+            },
+            Date.now()
+          )) as NonNullable<ReturnType<typeof parseCampaignAnswer>>
+      ]
+    ]),
+    records: {},
+    idClass: 'machine_derived' as const,
+    now: Date.now()
+  })
+
+  it("never injects the arg when the user's own args opt out", () => {
+    const built = build({ userArgs: ['--disable-agent'], schema, campaign: campaign() })
+    expect(built.args, 'the user opt-out wins').not.toContain('--enable-agent')
+    expect(built.beta.campaign.misses).toMatchObject([{ reason: 'present' }])
+  })
+
+  it("counts the user's own --enable-assets for requires_args while slot #0 grants nothing", () => {
+    const built = build({
+      userArgs: ['--enable-assets'],
+      betaFlags: [],
+      schema,
+      campaign: campaign()
+    })
+    expect(built.args).toContain('--enable-agent')
+    expect(built.beta.campaign.applied).toMatchObject([{ key: KEY, enrolledNow: true }])
+  })
+
+  it("counts Desktop's own --enable-assets for requires_args", () => {
+    const built = build({
+      betaFlags: [],
+      coreCommits: { head: 'e'.repeat(40), ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]]) },
+      schema,
+      campaign: campaign()
+    })
+    expect(built.args).toEqual(expect.arrayContaining(['--enable-assets', '--enable-agent']))
+    expect(built.beta.campaign.applied).toMatchObject([{ key: KEY, enrolledNow: true }])
+  })
+
+  it("keeps slot #0's args when campaign planning throws", () => {
+    const broken = { enrol: true, grants: null, payload: null }
+    const built = build({ schema, campaign: campaign('enrol', broken) })
+    expect(built.args, 'slot #0 survives a campaign failure').toContain('--enable-assets')
+    expect(built.beta.campaign).toEqual({ applied: [], misses: [] })
+  })
+})
 
 describe('buildLaunchArgs core beta injection', () => {
   afterEach(() => {
@@ -577,6 +1143,24 @@ describe('buildLaunchArgs core beta injection', () => {
     expect(built.beta.droppedUnsupported).toEqual([])
   })
 
+  it("places Desktop's own --enable-assets after the desktop flags and before beta grants", () => {
+    const hashing = { arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }
+    const built = build({
+      userArgs: ['--listen'],
+      schema: schemaOf('enable-assets', 'enable-asset-hashing', 'listen'),
+      betaFlags: [hashing],
+      coreCommits: { head: 'e'.repeat(40), ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]]) }
+    })
+
+    expect(built.args).toEqual([
+      ...PREFIX,
+      ...DESKTOP_FLAGS,
+      '--enable-assets',
+      '--enable-asset-hashing',
+      '--listen'
+    ])
+  })
+
   it('injects nothing when the beta toggle is off', () => {
     const built = build({
       userArgs: ['--listen'],
@@ -586,7 +1170,9 @@ describe('buildLaunchArgs core beta injection', () => {
 
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS, '--listen'])
     expect(built.beta.applied).toEqual([])
-    expect(built.beta.logRecords).toEqual([])
+    expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: core 0.3.81 proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n'
+    ])
     expect(built.beta.droppedUnsupported).toEqual([])
   })
 
@@ -602,7 +1188,10 @@ describe('buildLaunchArgs core beta injection', () => {
 
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
     expect(built.beta.applied).toEqual([])
-    expect(built.beta.logRecords).toEqual([])
+    expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: core unknown proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n',
+      '[core-beta] --enable-assets withheld: entry 1: core version unknown\n'
+    ])
   })
 
   it("injects nothing when the install's base tag was not established by ancestry", () => {
@@ -610,8 +1199,10 @@ describe('buildLaunchArgs core beta injection', () => {
 
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
     expect(built.beta.applied).toEqual([])
-    expect(built.beta.logRecords).toEqual([])
-    // Refusing the version claim is not the core refusing the arg; telemetry must not conflate them.
+    expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: core 0.3.81 proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n',
+      '[core-beta] --enable-assets withheld: entry 1: no ancestry-proven release (base 0.3.81)\n'
+    ])
     expect(built.beta.droppedUnsupported).toEqual([])
   })
 
@@ -620,22 +1211,27 @@ describe('buildLaunchArgs core beta injection', () => {
 
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS])
     expect(built.beta.applied).toEqual([])
-    expect(built.beta.logRecords).toEqual([])
+    expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: core 0.3.81 proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n',
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record\n'
+    ])
     expect(built.beta.droppedUnsupported).toEqual([])
   })
 
   it('drops a granted arg the running core does not accept, and reports it', () => {
-    // Version window and toggle both pass; only the args schema says no.
     const built = build({ userArgs: ['--listen'], schema: schemaOf('listen') })
 
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS, '--listen'])
     expect(built.beta.applied).toEqual([])
-    expect(built.beta.logRecords).toEqual([])
+    expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: not supported by this core\n',
+      '[core-beta] --enable-assets withheld: not supported by this core\n'
+    ])
     expect(built.beta.droppedUnsupported).toEqual(['--enable-assets'])
   })
 
   it('keeps a supported grant while dropping an unsupported one from the same payload', () => {
-    const hashing: CoreCanaryFlag = { arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }
+    const hashing: CoreBetaGrant = { arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }
     const built = build({
       schema: schemaOf('enable-assets'),
       betaFlags: [ASSETS_GRANT, hashing]
@@ -650,7 +1246,29 @@ describe('buildLaunchArgs core beta injection', () => {
     const built = build({ schema: schemaOf('enable-assets') })
 
     expect(built.beta.logRecords).toEqual([
+      '[assets] --enable-assets withheld: core 0.3.81 proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n',
       '[core-beta] --enable-assets (core 0.3.81 >= 0.3.80, opted in)\n'
+    ])
+  })
+
+  it('names the matched HEAD in the record of a commit-bound grant', () => {
+    const head = 'e'.repeat(40)
+    const lower = 'a'.repeat(40)
+    const commitGrant: CoreBetaGrant = { arg: '--enable-assets', commitRanges: [[lower, null]] }
+    const built = build({
+      schema: schemaOf('enable-assets'),
+      betaFlags: [commitGrant],
+      coreVersion: null,
+      coreCommits: { head, ancestry: new Map([[lower, true]]) }
+    })
+
+    expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS, '--enable-assets'])
+    expect(built.beta.applied, 'a commit grant reads HEAD, so needs no usable version').toEqual([
+      commitGrant
+    ])
+    expect(built.beta.logRecords).toEqual([
+      `[assets] --enable-assets withheld: core ${'e'.repeat(12)} proves neither 7897b4ee3527 nor a verified v0.38.0+ release\n`,
+      '[core-beta] --enable-assets (core eeeeeeeeeeee in a granted commit range, opted in)\n'
     ])
   })
 
@@ -667,14 +1285,10 @@ describe('buildLaunchArgs core beta injection', () => {
     expect(built.args).toEqual([...PREFIX, ...DESKTOP_FLAGS, '--enable-assets'])
     expect(built.args.filter((arg) => arg === '--enable-assets')).toHaveLength(1)
     expect(built.beta.applied).toEqual([])
-    // A grant withheld because the user already had the arg is not a grant the core refused.
     expect(built.beta.droppedUnsupported).toEqual([])
   })
 
   it("keeps the user's own --enable-assets when the beta toggle is off", () => {
-    // `--enable-assets` is a first-class launch argument the Desktop UI invites users to set.
-    // The canary may only ADD flags: opting out of beta withdraws the GRANT, never the user's
-    // own argument.
     const built = build({
       userArgs: ['--enable-assets', '--listen'],
       schema: schemaOf('enable-assets', 'listen'),
@@ -709,8 +1323,6 @@ describe('buildLaunchArgs core beta injection', () => {
   })
 
   it('drops a user arg the running core cannot parse', () => {
-    // With no grant in play, the args schema is the only thing left that removes a user token —
-    // an unparseable `--enable-assets` goes exactly like any other unsupported user arg.
     const built = build({
       userArgs: ['--enable-assets', '--listen'],
       schema: schemaOf('listen'),
@@ -723,8 +1335,6 @@ describe('buildLaunchArgs core beta injection', () => {
   })
 
   it('suppresses the grant when the user typed the opposite the core cannot parse', () => {
-    // Conflict suppression reads the UNFILTERED user args, so a user who opted out still wins
-    // even on a core too old to parse their token.
     const built = build({
       userArgs: ['--disable-assets', '--listen'],
       schema: schemaOf('enable-assets', 'listen')
@@ -757,7 +1367,7 @@ describe('buildLaunchArgs core beta injection', () => {
     expect(built.beta.applied).toEqual([])
   })
 
-  it('never touches user args the canary has no opinion about', () => {
+  it('never touches user args the grants have no opinion about', () => {
     const built = build({
       userArgs: ['--listen', '--port', '8188'],
       schema: schemaOf('enable-assets', 'listen', 'port')
@@ -777,30 +1387,21 @@ describe('buildLaunchArgs core beta injection', () => {
     ['opted in', true],
     ['opted out', false]
   ])('carries the resolved beta toggle on the DTO when %s', (_label, betaEnabled) => {
-    // The DTO is the only carrier of `opt_state`: the report site no longer re-reads settings,
-    // so a launch that never reaches arg assembly still reports the real toggle.
     expect(build({ schema: schemaOf('enable-assets'), betaEnabled }).beta.optedIn).toBe(betaEnabled)
   })
 
   it('keeps injecting for a user who declined telemetry but opted into beta features', () => {
-    // Consent is not an input here at all — the gate is the beta toggle alone.
     telemetry.setConsentState('denied')
     const built = build({ schema: schemaOf('enable-assets') })
 
     expect(built.args).toContain('--enable-assets')
-    expect(built.beta.logRecords).toHaveLength(1)
+    expect(built.beta.logRecords).toHaveLength(2)
   })
 })
 
 const RECORD = '[core-beta] --enable-assets (core 0.3.81 >= 0.3.80, opted in)\n'
 const CHILD_LINE = 'Total VRAM 24576 MB, total RAM 64000 MB\n'
 
-// Both launch paths build the same sink pair — the log stream from
-// `acquireLaunchResources` and `makeSendOutput` for the renderer — so the wiring is pinned
-// once. This was a `describe.each(['skip-port','normal'])` whose callback took no parameter:
-// the label alternated while the body stayed byte-identical, running the same assertions
-// twice and proving nothing about either path. Path-specific behaviour is covered by the
-// report-placement tests below instead.
 describe('emitCoreBetaRecords', () => {
   const sinksWithBuffers = (): {
     sinks: { writeLog: (text: string) => void; sendOutput: (text: string) => void }
@@ -908,39 +1509,125 @@ describe('core beta report placement', () => {
     launchHarness.registryCalls = 0
     launchHarness.betaEnabled = true
     launchHarness.betaEnabledThrows = false
+    launchHarness.readSettled = null
     launchHarness.schemaNames = ['enable-assets', 'listen', 'feature-flag']
     spawnArgs = []
     launchHarness.grants = [HARNESS_GRANT]
+    launchHarness.campaigns = { registry: [], answers: new Map() }
+    launchHarness.campaignRecords = {}
+    launchHarness.recordWrites = []
+    launchHarness.recordWriteThrows = false
+    launchHarness.idClass = 'machine_derived'
+    launchHarness.campaignFetches = 0
+    launchHarness.campaignsReject = false
+    launchHarness.commits = null
+    launchHarness.commitShas = []
     launchHarness.duringResourceAcquire = null
+    launchHarness.waitForPort = null
+    _resetBetaNotice()
+    settingsModule.set(BETA_NOTICE_ANNOUNCED_ARGS_KEY, [])
     launchHarness.spawn = (_cmd: unknown, args: unknown) => {
       spawnArgs = args as string[]
       return fakeChild()
     }
-    // `process.execPath` is a real executable, so the pre-launch existsSync passes without
-    // mocking fs. `-s <main.py>` is the shape the arg splitter keys on.
     launchHarness.launchCommand = {
       cmd: process.execPath,
       args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
       cwd: installDir,
       skipPortWait: true
     }
+    vi.spyOn(telemetry, 'getConsentState').mockReturnValue('granted')
     vi.spyOn(telemetry, 'emit').mockImplementation(((
       event: string,
       properties?: Record<string, unknown>
     ) => {
       events.push({ event, properties })
     }) as unknown as typeof telemetry.emit)
+    vi.spyOn(telemetry, 'capture').mockImplementation(((
+      event: string,
+      properties?: Record<string, unknown>
+    ) => {
+      events.push({ event, properties })
+    }) as unknown as typeof telemetry.capture)
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
+    launchHarness.waitForUrl = null
     fs.rmSync(installDir, { recursive: true, force: true })
   })
 
   const reportedEvents = (): string[] => events.map((e) => e.event)
 
-  /** Minimal live child: streams to attach to, a pid to kill, and no exit unless a test
-   *  emits one, so a launch that reaches spawn settles instead of hanging. */
+  describe.each([
+    ['skip-port', true],
+    ['port-wait', false]
+  ])('agent client context (%s path)', (pathName, skipPortWait) => {
+    let spawnEnv: Record<string, string | undefined> | undefined
+    let port = 48240 + (skipPortWait ? 0 : 10)
+    beforeEach(() => {
+      spawnEnv = undefined
+      launchHarness.spawn = (_cmd: unknown, _args: unknown, _cwd: unknown, env: unknown) => {
+        spawnEnv = env as Record<string, string | undefined>
+        return fakeChild()
+      }
+      launchHarness.launchCommand = { ...launchHarness.launchCommand, skipPortWait, port: ++port }
+      launchHarness.waitForPort = async () => {}
+      launchHarness.busyPorts = []
+    })
+    afterEach(() => {
+      vi.restoreAllMocks()
+      settingsModule.set('telemetryEnabled', undefined)
+      setHardwareProbe(null)
+      launchHarness.busyPorts = null
+    })
+
+    it('hands the agent its channel and the probed GPU tier with telemetry consent', async () => {
+      settingsModule.set('telemetryEnabled', true)
+      setHardwareProbe(async () => ({ gpu_tier: 'mid' }))
+      expect((await handleLaunch(ctxFor(`harness-client-context-on-${pathName}`))).ok).toBe(true)
+      expect(spawnEnv, 'ComfyUI was spawned').toBeDefined()
+      expect(spawnEnv!.AGENT_CLIENT_CONTEXT).toBe('desktop')
+      expect(spawnEnv!.AGENT_CLIENT_CHANNEL).toBe(telemetry.deriveAppChannel(getAppVersion()))
+      expect(spawnEnv!.AGENT_CLIENT_GPU_TIER).toBe('mid')
+    })
+
+    it('still launches, without the context, when reading consent throws', async () => {
+      vi.spyOn(settingsModule, 'telemetryConsent').mockImplementation(() => {
+        throw new Error('EPERM: settings.json write failed')
+      })
+      const res = await handleLaunch(ctxFor(`harness-client-context-throws-${pathName}`))
+      expect(res.ok, 'a failed consent read must not fail the launch').toBe(true)
+      expect(spawnEnv, 'ComfyUI was spawned').toBeDefined()
+      expect(spawnEnv).not.toHaveProperty('AGENT_CLIENT_CONTEXT')
+    })
+
+    it('sends none when settings serve a consent the accessor withholds', async () => {
+      settingsModule.set('telemetryEnabled', true)
+      vi.spyOn(settingsModule, 'telemetryConsent').mockReturnValue(undefined)
+      setHardwareProbe(async () => ({ gpu_tier: 'mid' }))
+      const res = await handleLaunch(ctxFor(`harness-client-context-withheld-${pathName}`))
+      expect(res.ok).toBe(true)
+      expect(spawnEnv, 'ComfyUI was spawned').toBeDefined()
+      expect(spawnEnv).not.toHaveProperty('AGENT_CLIENT_CONTEXT')
+    })
+
+    it.each([false, undefined])('sends none with telemetry consent %s', async (consent) => {
+      settingsModule.set('telemetryEnabled', consent)
+      setHardwareProbe(async () => ({ gpu_tier: 'mid' }))
+      const res = await handleLaunch(ctxFor(`harness-client-context-${consent}-${pathName}`))
+      expect(res.ok).toBe(true)
+      expect(spawnEnv, 'ComfyUI was spawned').toBeDefined()
+      for (const name of [
+        'AGENT_CLIENT_CONTEXT',
+        'AGENT_CLIENT_CHANNEL',
+        'AGENT_CLIENT_GPU_TIER'
+      ]) {
+        expect(spawnEnv).not.toHaveProperty(name)
+      }
+    })
+  })
+
   function fakeChild(): FakeChild {
     const proc = new EventEmitter() as FakeChild
     proc.stdout = new EventEmitter()
@@ -951,6 +1638,324 @@ describe('core beta report placement', () => {
     return proc
   }
 
+  describe('campaigns', () => {
+    const KEY = 'desktop_core_beta_agent'
+    const agentAnswer = (variant: string): unknown =>
+      parseCampaignAnswer(
+        variant,
+        {
+          grants: [
+            {
+              arg: '--enable-agent',
+              min_core_version: '0.3.60',
+              requires_args: ['--enable-assets'],
+              enrolment: { epoch: 1, epochs: [1] }
+            }
+          ]
+        },
+        Date.now() - 5_000
+      )
+    const serveCampaign = (variant: string): void => {
+      launchHarness.campaigns = {
+        registry: [{ key: KEY, args: ['--enable-agent'] }],
+        answers: new Map([[KEY, agentAnswer(variant)]])
+      }
+    }
+    const appliedEvent = (): Record<string, unknown> | undefined =>
+      events.filter((e) => e.event === 'comfy.desktop.core_beta.applied').at(-1)?.properties
+
+    const missedEvent = (): Record<string, unknown> | undefined =>
+      events.find((e) => e.event === 'comfy.desktop.core_beta.campaign_missed')?.properties
+
+    const HASHING = { arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }
+    const belowFloor = { head: 'e'.repeat(40), ancestry: new Map<string, boolean>() }
+
+    beforeEach(() => {
+      launchHarness.schemaNames = [
+        'enable-assets',
+        'enable-asset-hashing',
+        'enable-agent',
+        'listen',
+        'feature-flag'
+      ]
+      launchHarness.grants = []
+      launchHarness.commits = {
+        head: 'e'.repeat(40),
+        ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]])
+      }
+    })
+
+    it('enrols an assets-on machine on enrol: arg after slot #0, a record, and the enrolled event', async () => {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 9, 12))
+      onTestFinished(() => clock.mockRestore())
+      serveCampaign('enrol')
+      const id = 'campaign-enrol'
+      expect((await handleLaunch(ctxFor(id))).ok).toBe(true)
+      expect(spawnArgs).toEqual(expect.arrayContaining(['--enable-assets', '--enable-agent']))
+      expect(spawnArgs.indexOf('--enable-agent')).toBe(spawnArgs.indexOf('--enable-assets') + 1)
+      expect(launchHarness.recordWrites).toEqual([[KEY, '--enable-agent', 1]])
+      expect(
+        events.find((e) => e.event === 'comfy.desktop.core_beta.enrolled')?.properties
+      ).toEqual({
+        key: KEY,
+        arg: '--enable-agent',
+        epoch: 1,
+        lag_ms: 5_000
+      })
+      expect(appliedEvent()).toMatchObject({
+        args: ['--enable-agent'],
+        campaign_args: [`${KEY}:--enable-agent:1`]
+      })
+      expect(missedEvent()).toBeUndefined()
+      expect(_runningSessions.get(id)?.coreBetaArgs?.map((view) => view.arg)).toEqual([
+        '--enable-agent'
+      ])
+      expect(peekBetaActivationNotice(id)?.args).toEqual(['--enable-agent'])
+      expect(sent.join('')).toContain('[core-beta] --enable-agent')
+    })
+
+    it.each([
+      ['skip-port', true],
+      ['normal', false]
+    ])('makes no member of a launch cancelled at the %s pre-spawn gate', async (_path, skip) => {
+      serveCampaign('enrol')
+      const id = `campaign-cancelled-${String(skip)}`
+      if (!skip)
+        launchHarness.launchCommand = {
+          cmd: process.execPath,
+          args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+          cwd: installDir,
+          skipPortWait: false,
+          port: 48232
+        }
+      launchHarness.duringResourceAcquire = () => {
+        _operationAborts.get(id)?.abort()
+      }
+      expect(await handleLaunch(ctxFor(id))).toMatchObject({ ok: false, cancelled: true })
+      expect(launchHarness.recordWrites).toEqual([])
+      expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.enrolled')
+    })
+
+    it.each([
+      ['skip-port', true],
+      ['normal', false]
+    ])('makes no member on the %s path when the process is never created', async (_path, skip) => {
+      serveCampaign('enrol')
+      launchHarness.spawnFails = true
+      onTestFinished(() => {
+        launchHarness.spawnFails = false
+      })
+      if (!skip) {
+        launchHarness.launchCommand = {
+          cmd: process.execPath,
+          args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+          cwd: installDir,
+          skipPortWait: false,
+          port: 48233
+        }
+        launchHarness.waitForPort = () => new Promise<void>(() => {})
+      }
+      await handleLaunch(ctxFor(`campaign-spawn-failed-${String(skip)}`))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(launchHarness.recordWrites).toEqual([])
+      expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.enrolled')
+      expect(sent.join(''), 'the decision is still logged').toContain('[core-beta] --enable-agent')
+    })
+
+    it('holds for an enrolled machine on hold, writing nothing new', async () => {
+      serveCampaign('hold')
+      launchHarness.campaignRecords = { [KEY]: { '--enable-agent': { epoch: 1, enrolledAt: 1 } } }
+      await handleLaunch(ctxFor('campaign-hold'))
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(launchHarness.recordWrites).toEqual([])
+      expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.enrolled')
+      expect(appliedEvent()).toMatchObject({ campaign_args: [`${KEY}:--enable-agent:1`] })
+      expect(missedEvent()).toBeUndefined()
+    })
+
+    it('refuses enrolment while assets is off, and reports why', async () => {
+      launchHarness.commits = belowFloor
+      serveCampaign('enrol')
+      await handleLaunch(ctxFor('campaign-assets-off'))
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(launchHarness.recordWrites).toEqual([])
+      expect(appliedEvent(), 'nothing applied, so the applied event stays silent').toBeUndefined()
+      expect(missedEvent()).toEqual({
+        idle: [],
+        enrol_refused: [`${KEY}:--enable-agent:requires_args`]
+      })
+    })
+
+    it('idles an enrolled machine while assets is off, keeping its record', async () => {
+      launchHarness.commits = belowFloor
+      serveCampaign('hold')
+      launchHarness.campaignRecords = { [KEY]: { '--enable-agent': { epoch: 1, enrolledAt: 1 } } }
+      await handleLaunch(ctxFor('campaign-idle'))
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(missedEvent()).toEqual({
+        idle: [`${KEY}:--enable-agent:requires_args`],
+        enrol_refused: []
+      })
+    })
+
+    it('reports an enrolled machine with no campaign answer as idle', async () => {
+      launchHarness.campaignRecords = { [KEY]: { '--enable-agent': { epoch: 1, enrolledAt: 1 } } }
+      await handleLaunch(ctxFor('campaign-no-answer'))
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(missedEvent()).toEqual({
+        idle: [`${KEY}:--enable-agent:no_answer`],
+        enrol_refused: []
+      })
+    })
+
+    it('never enrols a random_fallback launch', async () => {
+      launchHarness.idClass = 'random_fallback'
+      serveCampaign('enrol')
+      await handleLaunch(ctxFor('campaign-fallback-id'))
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(launchHarness.recordWrites).toEqual([])
+    })
+
+    it('leaves a non-member launch exactly as a launch without campaigns', async () => {
+      launchHarness.grants = [HASHING]
+      const commandBeforeLaunchMutatesIt = structuredClone(launchHarness.launchCommand)
+      await handleLaunch(ctxFor('campaign-none'))
+      const without = spawnArgs
+      const withoutApplied = appliedEvent()
+      launchHarness.launchCommand = commandBeforeLaunchMutatesIt
+      serveCampaign('hold')
+      await handleLaunch(ctxFor('campaign-non-member'))
+      const normalise = (args: string[]): string[] =>
+        args.map((arg) => arg.replace('campaign-non-member', 'campaign-none'))
+      expect(normalise(spawnArgs)).toEqual(without)
+      expect(appliedEvent()).toEqual(withoutApplied)
+      expect(events.filter((e) => e.event === 'comfy.desktop.core_beta.applied')).toHaveLength(2)
+    })
+
+    it('applies the arg but counts no enrolment when the record cannot be written', async () => {
+      launchHarness.recordWriteThrows = true
+      serveCampaign('enrol')
+      await handleLaunch(ctxFor('campaign-write-fails'))
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.enrolled')
+      expect(appliedEvent(), 'running, but not counted as active').not.toHaveProperty(
+        'campaign_args'
+      )
+      expect(missedEvent()).toEqual({
+        idle: [],
+        enrol_refused: [`${KEY}:--enable-agent:record_failed`]
+      })
+    })
+
+    it('proves a campaign commit range against the live HEAD', async () => {
+      const head = gitInitComfyUI()
+      launchHarness.commits = null
+      launchHarness.campaigns = {
+        registry: [{ key: KEY, args: ['--enable-agent'] }],
+        answers: new Map([
+          [
+            KEY,
+            parseCampaignAnswer(
+              'enrol',
+              {
+                grants: [
+                  {
+                    arg: '--enable-agent',
+                    commit_ranges: [[head, null]],
+                    enrolment: { epoch: 1, epochs: [1] }
+                  }
+                ]
+              },
+              Date.now()
+            )
+          ]
+        ])
+      }
+      await handleLaunch(ctxFor('campaign-commit-range'))
+      expect(spawnArgs).toContain('--enable-agent')
+    })
+
+    describe('recordCampaignEnrolments', () => {
+      const enrolment = {
+        key: KEY,
+        grant: { arg: '--enable-agent', minCoreVersion: '0.3.60' },
+        epoch: 1,
+        enrolledNow: true,
+        payload: { agent_requirements_override: { 'comfy-agent': '0.2.3' } },
+        fetchedAt: Date.now()
+      }
+
+      it('keeps an unrecorded enrolment in applied, so its pass-through still reaches the override', () => {
+        launchHarness.recordWriteThrows = true
+        const result = recordCampaignEnrolments({ applied: [enrolment], misses: [] })
+        expect(appliedPassThrough(result.applied, '--enable-agent')).toEqual({
+          'comfy-agent': '0.2.3'
+        })
+        expect(result.misses).toEqual([
+          { key: KEY, arg: '--enable-agent', member: false, reason: 'record_failed' }
+        ])
+      })
+
+      it('writes and counts nothing when a concurrent launch already recorded it', () => {
+        launchHarness.campaignRecords = { [KEY]: { '--enable-agent': { epoch: 1, enrolledAt: 7 } } }
+        const result = recordCampaignEnrolments({ applied: [enrolment], misses: [] })
+        expect(launchHarness.recordWrites).toEqual([])
+        expect(reportedEvents(), 'no second enrolled event').not.toContain(
+          'comfy.desktop.core_beta.enrolled'
+        )
+        expect(result).toEqual({ applied: [enrolment], misses: [] })
+      })
+
+      it('survives a telemetry sink that throws', () => {
+        vi.mocked(telemetry.emit).mockImplementation(() => {
+          throw new Error('sink down')
+        })
+        let result: ReturnType<typeof recordCampaignEnrolments> | undefined
+        expect(() => {
+          result = recordCampaignEnrolments({ applied: [enrolment], misses: [] })
+        }).not.toThrow()
+        expect(launchHarness.recordWrites).toEqual([[KEY, '--enable-agent', 1]])
+        expect(result, 'a recorded enrolment is not record_failed').toEqual({
+          applied: [enrolment],
+          misses: []
+        })
+      })
+    })
+
+    it("keeps slot #0's args when the campaign fetch fails", async () => {
+      launchHarness.grants = [HASHING]
+      launchHarness.campaignsReject = true
+      await handleLaunch(ctxFor('campaign-fetch-fails'))
+      expect(spawnArgs, 'a campaign failure never costs slot #0').toContain(
+        '--enable-asset-hashing'
+      )
+      expect(spawnArgs).not.toContain('--enable-agent')
+    })
+
+    it("keeps slot #0's args when a campaign answer is malformed", async () => {
+      launchHarness.grants = [HASHING]
+      launchHarness.campaigns = {
+        registry: [{ key: KEY, args: ['--enable-agent'] }],
+        answers: new Map([[KEY, { enrol: true, grants: null, payload: null }]])
+      }
+      await handleLaunch(ctxFor('campaign-malformed'))
+      expect(spawnArgs, 'a campaign failure never costs slot #0').toContain(
+        '--enable-asset-hashing'
+      )
+      expect(spawnArgs).not.toContain('--enable-agent')
+    })
+
+    it('fetches no campaign answer and applies none when beta is off', async () => {
+      launchHarness.betaEnabled = false
+      serveCampaign('enrol')
+      await handleLaunch(ctxFor('campaign-beta-off'))
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(launchHarness.recordWrites).toEqual([])
+      expect(launchHarness.campaignFetches, 'an opted-out launch never waits on campaigns').toBe(0)
+    })
+  })
+
   it('reports on a launch that reaches the skip-port spawn', async () => {
     const res = await handleLaunch(ctxFor('harness-skip-port-spawns'))
 
@@ -960,23 +1965,533 @@ describe('core beta report placement', () => {
     expect(reportedEvents()).toContain('comfy.desktop.core_beta.opt_state')
   })
 
-  /** The commit `harnessInstall`'s record names, i.e. what the version gate believes is running. */
+  describe('settings.json and its .bak unreadable', () => {
+    let spawned = false
+    beforeEach(() => {
+      spawned = false
+      launchHarness.spawn = () => {
+        spawned = true
+        return fakeChild()
+      }
+      launchHarness.readSettled = async () => null
+    })
+
+    it('refuses to launch, with a translated message', async () => {
+      const res = await handleLaunch(ctxFor('harness-settings-unreadable'))
+
+      expect(res).toEqual({ ok: false, message: i18nModule.t('errors.settingsUnreadable') })
+      expect(lookupEnMessage('errors.settingsUnreadable')).toMatch(/settings file/)
+      expect(spawned).toBe(false)
+      expect(fs.existsSync(instanceModelPathsYaml('harness-settings-unreadable'))).toBe(false)
+    })
+
+    it('reports a cancel during the wait as cancelled, not as a failure', async () => {
+      let waitSignal: AbortSignal | undefined
+      launchHarness.readSettled = async (signal?: AbortSignal) => {
+        waitSignal = signal
+        _operationAborts.get('harness-settings-cancelled')?.abort()
+        return null
+      }
+
+      const res = await handleLaunch(ctxFor('harness-settings-cancelled'))
+
+      expect(res).toEqual({ ok: false, cancelled: true })
+      expect(waitSignal?.aborted).toBe(true)
+      expect(spawned).toBe(false)
+    })
+
+    it('does not wait for settings for a Remote or Cloud connection', async () => {
+      launchHarness.launchCommand = {
+        remote: true,
+        url: 'http://127.0.0.1:8188/',
+        host: '127.0.0.1',
+        port: '8188'
+      }
+      launchHarness.waitForUrl = async () => {}
+      let reads = 0
+      launchHarness.readSettled = async () => {
+        reads++
+        return null
+      }
+
+      const res = await handleLaunch(ctxFor('harness-settings-remote'))
+
+      expect(res.ok).toBe(true)
+      expect(reads).toBe(0)
+    })
+
+    it('does not count a Cloud connection that is still connecting as a local start', async () => {
+      const installationId = 'harness-cloud-not-local'
+      const ctx = ctxFor(installationId)
+      vi.spyOn(getCloudSession(), 'status').mockReturnValue({ signedIn: true })
+      let localWhileConnecting: boolean | undefined
+      launchHarness.waitForUrl = async () => {
+        localWhileConnecting = _hasActiveLocalLaunch()
+      }
+
+      const result = await handleLaunch({
+        ...ctx,
+        inst: {
+          ...ctx.inst,
+          id: installationId,
+          sourceId: 'cloud',
+          remoteUrl: 'https://cloud.comfy.org/'
+        },
+        actionData: { pickerWorkspaceId: 'team-a' }
+      })
+
+      expect(result.ok).toBe(true)
+      expect(localWhileConnecting).toBe(false)
+    })
+
+    it('opens Cloud in the latest picker workspace requested while it connects', async () => {
+      const installationId = 'harness-cloud-picker'
+      const ctx = ctxFor(installationId)
+      const session = getCloudSession()
+      vi.spyOn(session, 'status').mockReturnValue({ signedIn: true })
+      launchHarness.waitForUrl = async () => {
+        _setActiveLaunchPickerWorkspace(installationId, 'team-b')
+      }
+
+      const result = await handleLaunch({
+        ...ctx,
+        inst: {
+          ...ctx.inst,
+          id: installationId,
+          sourceId: 'cloud',
+          remoteUrl: 'https://cloud.comfy.org/'
+        },
+        actionData: { pickerWorkspaceId: 'team-a' }
+      })
+
+      expect(result.ok).toBe(true)
+      expect(new URL(result.url!).searchParams.get('workspace')).toBe('team-b')
+    })
+
+    it('opens the newer picker workspace even when the superseded Personal lookup fails', async () => {
+      const installationId = 'harness-cloud-picker-after-personal'
+      const ctx = ctxFor(installationId)
+      const session = getCloudSession()
+      vi.spyOn(session, 'status').mockReturnValue({
+        signedIn: true,
+        workspaceId: 'team-a',
+        workspaceType: 'team'
+      })
+      vi.spyOn(session, 'listWorkspaces').mockImplementationOnce(async () => {
+        _setActiveLaunchPickerWorkspace(installationId, 'team-b')
+        throw new Error('Workspace list unavailable')
+      })
+      launchHarness.waitForUrl = async () => {}
+
+      const result = await handleLaunch({
+        ...ctx,
+        inst: {
+          ...ctx.inst,
+          id: installationId,
+          sourceId: 'cloud',
+          remoteUrl: 'https://cloud.comfy.org/'
+        },
+        actionData: { pickerWorkspaceId: 'personal' }
+      })
+
+      expect(result.ok).toBe(true)
+      expect(new URL(result.url!).searchParams.get('workspace')).toBe('team-b')
+    })
+
+    it('still launches a command that takes none of the folder arguments', async () => {
+      launchHarness.launchCommand = { ...launchHarness.launchCommand, skipSharedPaths: true }
+      let reads = 0
+      launchHarness.readSettled = async () => {
+        reads++
+        return null
+      }
+
+      const res = await handleLaunch(ctxFor('harness-settings-skip-shared'))
+
+      expect(res.ok).toBe(true)
+      expect(spawned).toBe(true)
+      expect(reads).toBe(0)
+    })
+  })
+
+  it('launches with the folders from settings', async () => {
+    const inputDir = path.join(installDir, 'custom-input')
+    const outputDir = path.join(installDir, 'custom-output')
+    fs.mkdirSync(inputDir)
+    fs.mkdirSync(outputDir)
+    settingsModule.set('inputDir', inputDir)
+    settingsModule.set('outputDir', outputDir)
+    try {
+      const res = await handleLaunch(ctxFor('harness-settings-folders'))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs).toEqual(
+        expect.arrayContaining(['--input-directory', inputDir, '--output-directory', outputDir])
+      )
+    } finally {
+      settingsModule.set('inputDir', undefined)
+      settingsModule.set('outputDir', undefined)
+    }
+  })
+
+  function gitInitComfyUI(): string {
+    const cwd = path.join(installDir, 'ComfyUI')
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 't',
+      GIT_AUTHOR_EMAIL: 't@example.com',
+      GIT_COMMITTER_NAME: 't',
+      GIT_COMMITTER_EMAIL: 't@example.com',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: os.devNull
+    }
+    execFileSync('git', ['init', '-q'], { cwd, env })
+    execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'c'], { cwd, env })
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd, env, encoding: 'utf-8' }).trim()
+  }
+
+  it('grants a commit-bound entry the live HEAD falls inside', async () => {
+    const head = gitInitComfyUI()
+    launchHarness.grants = [{ arg: '--enable-assets', commitRanges: [[head, null]] }]
+
+    const res = await handleLaunch(ctxFor('harness-commit-grant'))
+
+    expect(res.ok).toBe(true)
+    expect(
+      spawnArgs,
+      'the record contradicts the checkout, which refuses version entries but not commit entries'
+    ).toContain('--enable-assets')
+    expect(sent.join('')).toContain(
+      `[core-beta] --enable-assets (core ${head.slice(0, 12)} in a granted commit range`
+    )
+  })
+
+  it('attributes the beta and boot events to the live HEAD, not the recorded commit', async () => {
+    const head = gitInitComfyUI()
+    launchHarness.grants = [{ arg: '--enable-assets', commitRanges: [[head, null]] }]
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: false,
+      port: 48233
+    }
+    launchHarness.waitForPort = async () => {}
+
+    await handleLaunch(ctxFor('harness-commit-attribution'))
+
+    const applied = events.find((e) => e.event === 'comfy.desktop.core_beta.applied')
+    expect(applied?.properties).toMatchObject({ core_commit: head, core_version_label: 'v0.3.81' })
+    const boot = events.find((e) => e.event === 'comfy.desktop.comfyui.boot_started')
+    expect(boot?.properties).toMatchObject({ core_commit: head, core_version_label: 'v0.3.81' })
+  })
+
+  it('launches a legacy record whose version carries no commit', async () => {
+    const ctx = ctxFor('harness-legacy-record')
+    ctx.inst = {
+      ...ctx.inst,
+      comfyVersion: { baseTag: 'v0.3.81' }
+    } as unknown as InstallationRecord
+
+    const res = await handleLaunch(ctx)
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs.length).toBeGreaterThan(0)
+  })
+
+  it("attributes a not-git install's events to its recorded commit", async () => {
+    await handleLaunch(ctxFor('harness-record-attribution'))
+
+    const applied = events.find((e) => e.event === 'comfy.desktop.core_beta.applied')
+    expect(applied?.properties).toMatchObject({
+      core_commit: '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
+    })
+  })
+
+  it('reports a commit-bound grant withheld because HEAD is past its upper bound', async () => {
+    const head = gitInitComfyUI()
+    launchHarness.grants = [{ arg: '--enable-assets', commitRanges: [[head, head]] }]
+
+    const res = await handleLaunch(ctxFor('harness-commit-past-upper'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    const short = head.slice(0, 12)
+    expect(sent.join('')).toContain(
+      `[core-beta] --enable-assets withheld: entry 1: commit range ${short}..${short}: HEAD past upper ${short}\n`
+    )
+  })
+
+  it('withholds a commit-bound entry on a not-git install', async () => {
+    launchHarness.grants = [{ arg: '--enable-assets', commitRanges: [['a'.repeat(40), null]] }]
+
+    const res = await handleLaunch(ctxFor('harness-commit-grant-not-git'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+  })
+
+  it('still grants through a version entry for the same arg on a not-git install', async () => {
+    launchHarness.grants = [
+      { arg: '--enable-assets', commitRanges: [['a'.repeat(40), null]] },
+      HARNESS_GRANT
+    ]
+
+    const res = await handleLaunch(ctxFor('harness-mixed-not-git'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs.filter((arg) => arg === '--enable-assets')).toHaveLength(1)
+    expect(sent.join('')).toContain(RECORD)
+  })
+
+  it('stops writing to a log stream that has errored', () => {
+    const stream = fs.createWriteStream(path.join(installDir, 'destroyed.log'))
+    stream.on('error', () => {})
+    stream.destroy(new Error('disk gone'))
+    const write = vi.spyOn(stream, 'write')
+
+    writeLog(stream, 'a line of ComfyUI output\n')
+
+    expect(
+      write,
+      'each write to a destroyed stream would raise another error'
+    ).not.toHaveBeenCalled()
+  })
+
+  it('launches without a log file when the log directory cannot be created', async () => {
+    fs.writeFileSync(path.join(installDir, 'logs'), '')
+
+    const res = await handleLaunch(ctxFor('harness-logdir-blocked'))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(res.ok, 'a log directory problem must not fail the launch').toBe(true)
+  })
+
+  it('launches without a log file, rather than crashing, when comfyui.log cannot be opened', async () => {
+    const logs = path.join(installDir, 'logs')
+    fs.mkdirSync(logs, { recursive: true })
+    fs.chmodSync(logs, 0o500)
+    try {
+      const res = await handleLaunch(ctxFor('harness-log-unopenable'))
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(res.ok, 'a log file problem must not fail the launch').toBe(true)
+    } finally {
+      fs.chmodSync(logs, 0o700)
+    }
+  })
+
+  it('arms the activation notice from the same latch that reports the grant', async () => {
+    const id = 'harness-arms-beta-notice'
+    expect(peekBetaActivationNotice(id)).toBeNull()
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(true)
+    expect(peekBetaActivationNotice(id)?.args).toEqual(['--enable-assets'])
+  })
+
+  it('arms nothing on a launch whose grants the args schema refused', async () => {
+    launchHarness.schemaNames = ['listen', 'feature-flag']
+    const id = 'harness-schema-refused'
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).not.toContain('--enable-assets')
+    expect(peekBetaActivationNotice(id)).toBeNull()
+  })
+
+  it('arms nothing for an install that opted out of beta features', async () => {
+    launchHarness.betaEnabled = false
+    const id = 'harness-opted-out'
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(true)
+    expect(peekBetaActivationNotice(id)).toBeNull()
+  })
+
+  describe('assets without a grant', () => {
+    const atFloor: CoreCommitState = {
+      head: 'e'.repeat(40),
+      ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]])
+    }
+    const forceOff: CoreBetaGrant = {
+      arg: '--disable-assets',
+      commitRanges: [[ASSETS_MIN_CORE_COMMIT, null]]
+    }
+
+    beforeEach(() => {
+      launchHarness.betaEnabled = false
+      launchHarness.grants = []
+      launchHarness.commits = atFloor
+    })
+
+    it('asks an opted-out install with no grant for assets once its core has the floor commit', async () => {
+      const res = await handleLaunch(ctxFor('harness-assets-floor'))
+
+      expect(res.ok).toBe(true)
+      expect(launchHarness.commitShas).toEqual([[ASSETS_MIN_CORE_COMMIT], []])
+      expect(spawnArgs).toContain('--enable-assets')
+      expect(peekBetaActivationNotice('harness-assets-floor')).toBeNull()
+    })
+
+    it('says why a launch whose schema discovery failed starts without the assets flag', async () => {
+      launchHarness.schemaThrows = true
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const res = await handleLaunch(ctxFor('harness-assets-schema-failure'))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs).not.toContain('--enable-assets')
+      expect(warn).toHaveBeenCalledWith(
+        '[launch] flag planning failed; launching without Desktop-planned flags or the unsupported-arg filter:',
+        expect.objectContaining({ message: 'schema discovery unavailable' })
+      )
+    })
+
+    it('does not ask a core without the floor commit', async () => {
+      launchHarness.commits = { head: 'e'.repeat(40), ancestry: new Map() }
+
+      const res = await handleLaunch(ctxFor('harness-assets-below-floor'))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs).not.toContain('--enable-assets')
+    })
+
+    it('asks a core whose verified release is at the floor without proving its ancestry', async () => {
+      launchHarness.commits = null
+      const ctx = ctxFor('harness-assets-release')
+      ctx.inst = {
+        ...ctx.inst,
+        version: '0.38.0',
+        comfyVersion: { ...ctx.inst.comfyVersion!, baseTag: 'v0.38.0' }
+      }
+
+      const res = await handleLaunch(ctx)
+
+      expect(res.ok).toBe(true)
+      expect(launchHarness.commitShas).toEqual([[], []])
+      expect(spawnArgs).toContain('--enable-assets')
+    })
+
+    it('proves no floor when the user already turned assets off', async () => {
+      launchHarness.launchCommand!.args = [
+        '-s',
+        path.join(installDir, 'ComfyUI', 'main.py'),
+        '--disable-assets'
+      ]
+
+      await handleLaunch(ctxFor('harness-assets-user-off'))
+
+      expect(launchHarness.commitShas).toEqual([[], []])
+      expect(spawnArgs).not.toContain('--enable-assets')
+    })
+
+    it('resolves no SHA of a beta grant an opted-out install cannot receive', async () => {
+      launchHarness.grants = [{ arg: '--enable-agent', commitRanges: [['a'.repeat(40), null]] }]
+
+      await handleLaunch(ctxFor('harness-assets-opted-out-shas'))
+
+      expect(launchHarness.commitShas).toEqual([[ASSETS_MIN_CORE_COMMIT], []])
+    })
+
+    it('proves the floor in its own resolve, apart from a payload as large as the grant SHA cap', async () => {
+      launchHarness.betaEnabled = true
+      const sha = (i: number): string => i.toString(16).padStart(40, '0')
+      const ranges = Array.from({ length: 8 }, (_, i): [string, string] => [
+        sha(2 * i + 1),
+        sha(2 * i + 2)
+      ])
+      launchHarness.grants = [{ arg: '--enable-agent', commitRanges: ranges }]
+
+      await handleLaunch(ctxFor('harness-assets-full-payload'))
+
+      expect(launchHarness.commitShas[0]).toEqual([ASSETS_MIN_CORE_COMMIT])
+      expect(launchHarness.commitShas[1]).toHaveLength(16)
+      expect(spawnArgs).toContain('--enable-assets')
+    })
+
+    it.each([
+      ['opted out', false],
+      ['opted in', true]
+    ])(
+      'applies a force-off %s, once, without presenting it as beta',
+      async (label, betaEnabled) => {
+        launchHarness.betaEnabled = betaEnabled
+        launchHarness.grants = [
+          { arg: '--disable-assets', minCoreVersion: '0.3.80', notice: { description: 'Assets' } }
+        ]
+        launchHarness.schemaNames = ['enable-assets', 'disable-assets', 'listen', 'feature-flag']
+        const id = `harness-assets-force-off-${label}`
+
+        const res = await handleLaunch(ctxFor(id))
+
+        expect(res.ok).toBe(true)
+        expect(spawnArgs.filter((arg) => arg === '--disable-assets')).toHaveLength(1)
+        expect(spawnArgs).not.toContain('--enable-assets')
+        expect(peekBetaActivationNotice(id)).toBeNull()
+        expect(_runningSessions.get(id)?.coreBetaArgs).toEqual([])
+        expect(sent.join('')).not.toContain('[core-beta]')
+        _runningSessions.delete(id)
+      }
+    )
+
+    it('stops the ask with a force-off grant the core cannot parse', async () => {
+      launchHarness.grants = [forceOff]
+
+      const res = await handleLaunch(ctxFor('harness-assets-force-off-unparsed'))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs).not.toContain('--disable-assets')
+      expect(spawnArgs).not.toContain('--enable-assets')
+    })
+  })
+
+  it('arms nothing when the payload asked for a silent grant', async () => {
+    launchHarness.grants = [{ ...HARNESS_GRANT, notice: { silent: true } }]
+    const id = 'harness-silent-grant'
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+    expect(peekBetaActivationNotice(id)).toBeNull()
+  })
+
+  it('carries the payload feature name onto the pending card', async () => {
+    launchHarness.grants = [{ ...HARNESS_GRANT, notice: { description: 'Asset library' } }]
+    const id = 'harness-named-grant'
+
+    await handleLaunch(ctxFor(id))
+
+    expect(peekBetaActivationNotice(id)).toEqual({
+      args: ['--enable-assets'],
+      direction: 'enabled',
+      description: 'Asset library'
+    })
+  })
+
+  it('stays silent on the NEXT launch once the notice has been acknowledged', async () => {
+    const id = 'harness-announces-once'
+    await handleLaunch(ctxFor(id))
+    acknowledgeBetaActivationNotice(id)
+    expect(settingsModule.get(BETA_NOTICE_ANNOUNCED_ARGS_KEY)).toEqual(['--enable-assets'])
+
+    await handleLaunch(ctxFor(id))
+
+    expect(peekBetaActivationNotice(id)).toBeNull()
+  })
+
   const RECORDED_COMMIT = '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
-  /** A different commit, as a `git pull` would leave the checkout after the record was written. */
   const PULLED_COMMIT = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c'
 
-  /** Give the install a git checkout at `sha`, in the detached-HEAD shape `readGitHead` reads.
-   *  Absent by default, which is the standalone/archive install the other cases launch as. */
   function writeGitHead(sha: string): void {
     const gitDir = path.join(installDir, 'ComfyUI', '.git')
     fs.mkdirSync(gitDir, { recursive: true })
     fs.writeFileSync(path.join(gitDir, 'HEAD'), `${sha}\n`)
   }
 
-  /** Give the install a git checkout whose HEAD cannot be established: the `.git` directory is
-   *  there, but HEAD is empty. Empty rather than chmod-ed or deleted because it is the one
-   *  shape that reproduces identically on every platform CI runs on, and it is a real state —
-   *  mid-`git pull`, HEAD is rewritten, which is exactly when this gate is asked. */
   function writeUnreadableGitHead(): void {
     const gitDir = path.join(installDir, 'ComfyUI', '.git')
     fs.mkdirSync(gitDir, { recursive: true })
@@ -984,18 +2499,16 @@ describe('core beta report placement', () => {
   }
 
   it('withholds grants when the live checkout has moved off the recorded commit', async () => {
-    // A `git pull` after the record was written leaves `commitsAhead: 0` true of a commit that
-    // is no longer checked out, so `exact` and `verified` both still pass — they are assertions
-    // about the recorded commit, not about the checkout still being at it. Core's args schema
-    // does not cover for that here: a NEWER core still parses `--enable-assets`, so the upper
-    // bound has nothing behind it but the stale record.
     writeGitHead(PULLED_COMMIT)
 
     const res = await handleLaunch(ctxFor('harness-record-superseded'))
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).not.toContain('--enable-assets')
-    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+    expect(sent.join(''), 'no grant record').not.toContain('[core-beta] --enable-assets (')
+    expect(sent.join(''), 'the refusal is reported with its reason').toContain(
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record'
+    )
   })
 
   it('applies grants when the live checkout is still at the recorded commit', async () => {
@@ -1008,9 +2521,6 @@ describe('core beta report placement', () => {
   })
 
   it('applies grants to a standalone install, which has no HEAD to contradict the record', async () => {
-    // No `.git` at all: `readGitHead` returns null and there is no contradiction to observe, so
-    // the record stands. Archive installs are the majority of Desktop — they must not lose
-    // grants to a check that only git checkouts can answer.
     expect(fs.existsSync(path.join(installDir, 'ComfyUI', '.git'))).toBe(false)
 
     const res = await handleLaunch(ctxFor('harness-standalone-no-git'))
@@ -1020,25 +2530,19 @@ describe('core beta report placement', () => {
   })
 
   it('withholds grants when the install is git-managed but its HEAD cannot be read', async () => {
-    // Between "no git" and "HEAD says X" sits a third state: a git checkout whose HEAD we could
-    // not establish. Collapsing it into the no-git case grants on it, which inverts the gate —
-    // an unreadable HEAD is most likely mid-pull, i.e. precisely the move this check exists to
-    // catch. The `.git` directory is the observable difference from the standalone case.
     writeUnreadableGitHead()
 
     const res = await handleLaunch(ctxFor('harness-git-head-unreadable'))
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).not.toContain('--enable-assets')
-    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+    expect(sent.join(''), 'no grant record').not.toContain('[core-beta] --enable-assets (')
+    expect(sent.join(''), 'the refusal is reported with its reason').toContain(
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record'
+    )
   })
 
   it('withholds grants when .git is a pointer file the git dir cannot be resolved from', async () => {
-    // One layer below the unreadable-HEAD case: `.git` exists, so this IS a git-managed
-    // checkout, but it is a worktree/submodule pointer with no `gitdir:` line, so there is no
-    // git directory to read a HEAD out of. Classifying that as "not a git install" — which is
-    // what a bare `resolveGitDir() === null` check does — hands it the standalone install's
-    // unconditional grant, on a checkout whose commit was never established.
     const dotGit = path.join(installDir, 'ComfyUI', '.git')
     fs.writeFileSync(dotGit, 'this file is not a gitdir pointer\n')
 
@@ -1046,36 +2550,32 @@ describe('core beta report placement', () => {
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).not.toContain('--enable-assets')
-    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+    expect(sent.join(''), 'no grant record').not.toContain('[core-beta] --enable-assets (')
+    expect(sent.join(''), 'the refusal is reported with its reason').toContain(
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record'
+    )
   })
 
   it('withholds grants when .git is a dangling symlink', async () => {
-    // The case that forces `lstat` over `stat`: `stat` follows the link, finds nothing, and
-    // raises ENOENT — indistinguishable from an install that never had a `.git` at all, so the
-    // checkout is waved through as standalone. `lstat` sees the link itself, and a link
-    // pointing at a missing git dir is a broken checkout, not an absent one.
     const dotGit = path.join(installDir, 'ComfyUI', '.git')
     try {
       fs.symlinkSync(path.join(installDir, 'no-such-git-dir'), dotGit)
     } catch {
-      // Windows without Developer Mode / SeCreateSymbolicLink cannot create one at all.
       return
     }
-    expect(fs.existsSync(dotGit)).toBe(false) // `stat`-based existence says "absent"
+    expect(fs.existsSync(dotGit)).toBe(false)
 
     const res = await handleLaunch(ctxFor('harness-git-dangling-symlink'))
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).not.toContain('--enable-assets')
-    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+    expect(sent.join(''), 'no grant record').not.toContain('[core-beta] --enable-assets (')
+    expect(sent.join(''), 'the refusal is reported with its reason').toContain(
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record'
+    )
   })
 
   it('withholds grants when the .git entry cannot be stat-ed at all', async () => {
-    // The third way `.git` resolution fails: the entry is neither absent nor readable — an
-    // EACCES/EPERM/ELOOP on the `lstat` itself. No portable way to produce that on a real
-    // filesystem (a chmod-ed parent does nothing when the suite runs as root, and Windows has
-    // no equivalent), so the error is injected at the one syscall that classifies it. Every
-    // other path stays real.
     const realLstatSync = fs.lstatSync
     vi.spyOn(fs, 'lstatSync').mockImplementation(((target: fs.PathLike, opts?: object) => {
       if (String(target).endsWith(`${path.sep}.git`)) {
@@ -1088,7 +2588,10 @@ describe('core beta report placement', () => {
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).not.toContain('--enable-assets')
-    expect(sent.join('')).not.toContain('[core-beta] --enable-assets')
+    expect(sent.join(''), 'no grant record').not.toContain('[core-beta] --enable-assets (')
+    expect(sent.join(''), 'the refusal is reported with its reason').toContain(
+      '[core-beta] --enable-assets withheld: entry 1: checkout does not confirm the record'
+    )
   })
 
   it('continues a skip-port launch when renderer reporting throws', async () => {
@@ -1158,9 +2661,6 @@ describe('core beta report placement', () => {
     ).toEqual(expected)
   })
 
-  // Assets can now run without the canary having granted anything, so attribution must report what
-  // the canary applied rather than what is on the command line — otherwise a self-enrolled user
-  // lands inside the cohort and skews the soak denominator.
   it("reports no beta flags when assets run from the user's own argument", async () => {
     launchHarness.betaEnabled = false
     launchHarness.grants = []
@@ -1187,6 +2687,91 @@ describe('core beta report placement', () => {
     )
     expect(assetsEvents).toHaveLength(1)
     expect(assetsEvents[0]!.properties).toMatchObject({ core_beta_flags: [] })
+  })
+
+  it('forwards agent events from both streams of the launched core', async () => {
+    const child = fakeChild()
+    launchHarness.spawn = () => child
+
+    const ctx = ctxFor('harness-agent-events')
+    Object.assign(ctx.inst, { variant: 'harness-variant', release: 'harness-release' })
+    const res = await handleLaunch(ctx)
+    expect(res.ok).toBe(true)
+    child.stdout.emit('data', Buffer.from('[agent-event] agent_started duration_ms=12\n'))
+    child.stderr.emit('data', Buffer.from('[agent-event] agent_exited code=1\n'))
+
+    const agentEvents = events.filter((e) => e.event.startsWith('comfy.desktop.comfyui.agent.'))
+    expect(agentEvents.map((e) => [e.event, e.properties])).toEqual([
+      ['comfy.desktop.comfyui.agent.agent_started', expect.objectContaining({ duration_ms: 12 })],
+      ['comfy.desktop.comfyui.agent.agent_exited', expect.objectContaining({ code: 1 })]
+    ])
+    for (const { properties } of agentEvents) {
+      expect(properties, "the launch's own attribution, not a default").toMatchObject({
+        installation_id: 'harness-agent-events',
+        variant: 'harness-variant',
+        release: 'harness-release',
+        core_beta_flags: ['--enable-assets']
+      })
+    }
+  })
+
+  it("reports an unknown agent event as the launch's unknown_events_dropped", async () => {
+    const child = fakeChild()
+    launchHarness.spawn = () => child
+
+    const res = await handleLaunch(ctxFor('harness-agent-unknown'))
+    expect(res.ok).toBe(true)
+    child.stdout.emit('data', Buffer.from('[agent-event] mystery_event\n'))
+
+    expect(
+      events
+        .filter((e) => e.event === 'comfy.desktop.comfyui.agent.unknown_events_dropped')
+        .map((e) => e.properties),
+      'reported as it is seen, with no flush to wait for'
+    ).toEqual([
+      expect.objectContaining({
+        count: 1,
+        installation_id: 'harness-agent-unknown',
+        core_beta_flags: ['--enable-assets']
+      })
+    ])
+  })
+
+  it("drops a killed attempt's unterminated agent line before a port-conflict retry", async () => {
+    const children: FakeChild[] = []
+    let attempt = 0
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: false,
+      port: 48233
+    }
+    launchHarness.spawn = () => {
+      const child = fakeChild()
+      children.push(child)
+      return child
+    }
+    launchHarness.waitForPort = async () => {
+      attempt++
+      if (attempt > 1) return
+      const first = children[0]!
+      first.stderr.emit('data', Buffer.from('OSError: [Errno 98] Address already in use\n'))
+      first.stdout.emit('data', Buffer.from('[agent-event] agent_exited code=1'))
+      first.emit('close', 1, null)
+      return new Promise<void>(() => {})
+    }
+
+    const res = await handleLaunch(ctxFor('harness-agent-retry-drops-tail'))
+
+    expect(res.ok).toBe(true)
+    expect(children).toHaveLength(2)
+    children[1]!.stdout.emit('data', Buffer.from('2\n'))
+    children[1]!.stdout.emit('data', Buffer.from('[agent-event] agent_started\n'))
+    expect(
+      events.filter((e) => e.event.startsWith('comfy.desktop.comfyui.agent.')).map((e) => e.event),
+      'the cut-off code=1 must not complete as code=12 after the respawn'
+    ).toEqual(['comfy.desktop.comfyui.agent.agent_started'])
   })
 
   it.each([
@@ -1232,11 +2817,8 @@ describe('core beta report placement', () => {
       ])
       expect(spawnArgs).toContain('--listen')
       expect(spawnArgs).toContain('--cpu')
-      // The fallback injects no grants, but it withdraws nothing either: discovery failing is
-      // not a reason to launch with fewer of the user's own args than they asked for.
       expect(spawnArgs.slice(3)).toContain('--enable-assets')
       expect(spawnArgs).toContain('--enable-asset-hashing')
-      // Mutating `launchCmd.args` in place would edit the array the source object owns.
       expect(storedArgs).toEqual([
         '--enable-assets',
         '-s',
@@ -1251,8 +2833,6 @@ describe('core beta report placement', () => {
   )
 
   it('does not report when cancelled at the skip-port pre-spawn gate', async () => {
-    // Cancel lands while resources are being acquired — after the launching marker, before
-    // the gate. The launch must return cancelled having attributed nothing.
     launchHarness.duringResourceAcquire = () => {
       _operationAborts.get('harness-skip-port-cancelled')?.abort()
     }
@@ -1266,8 +2846,6 @@ describe('core beta report placement', () => {
   })
 
   it('does not report when cancelled at the normal-path pre-spawn gate', async () => {
-    // The normal path's last gate sits INSIDE the recursing `tryLaunch`, past port reservation
-    // and resource acquisition — a different call site from the skip-port one above.
     launchHarness.launchCommand = {
       cmd: process.execPath,
       args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
@@ -1287,9 +2865,7 @@ describe('core beta report placement', () => {
     expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.opt_state')
   })
 
-  it('reports once and drains both assets tails before a port-conflict retry without resetting caps', async () => {
-    // The only test that proves the latch: the report site lives INSIDE the recursing
-    // `tryLaunch`, so an unlatched report fires once per attempt.
+  it('reports once and drops both unterminated assets tails before a port-conflict retry without resetting caps', async () => {
     const children: FakeChild[] = []
     let attempt = 0
     launchHarness.launchCommand = {
@@ -1302,11 +2878,13 @@ describe('core beta report placement', () => {
     launchHarness.spawn = () => {
       if (children.length === 1) {
         expect(
-          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.assets.enabled')
-        ).toHaveLength(1)
+          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.assets.enabled'),
+          "a killed attempt's unterminated line is never parsed"
+        ).toHaveLength(0)
         expect(
-          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.scanner.stat_failed')
-        ).toHaveLength(1)
+          events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.scanner.stat_failed'),
+          "a killed attempt's unterminated line is never parsed"
+        ).toHaveLength(0)
       }
       const child = fakeChild()
       children.push(child)
@@ -1315,8 +2893,6 @@ describe('core beta report placement', () => {
     launchHarness.waitForPort = async () => {
       attempt++
       if (attempt > 1) return
-      // Everything is wired by the time the boot probe runs, so failing the first attempt
-      // from here is deterministic — no racing the stream/exit handler registration.
       const first = children[0]!
       first.stderr.emit('data', Buffer.from('OSError: [Errno 98] Address already in use\n'))
       first.stdout.emit(
@@ -1343,15 +2919,146 @@ describe('core beta report placement', () => {
       'data',
       Buffer.from('[assets-event] seeder.scan_started root=models\n')
     )
+    children[1]!.stdout.emit('data', Buffer.from('\n'))
+    children[1]!.stderr.emit('data', Buffer.from('\n'))
+    expect(
+      events.filter(
+        (e) =>
+          e.event === 'comfy.desktop.comfyui.assets.assets.enabled' ||
+          e.event === 'comfy.desktop.comfyui.assets.scanner.stat_failed'
+      ),
+      "beginBoot must drop the killed attempt's tails; each is a valid record once a newline arrives"
+    ).toEqual([])
     expect(
       events.filter((e) => e.event === 'comfy.desktop.comfyui.assets.seeder.scan_started')
     ).toHaveLength(60)
+    const bootEvents = events.filter((e) => e.event.startsWith('comfy.desktop.comfyui.boot_'))
+    expect(bootEvents.map((e) => e.event)).toEqual([
+      'comfy.desktop.comfyui.boot_started',
+      'comfy.desktop.comfyui.boot_started',
+      'comfy.desktop.comfyui.boot_completed'
+    ])
+    expect(bootEvents.every((e) => e.properties?.assets_enabled === true)).toBe(true)
+    expect(bootEvents.map((e) => e.properties?.core_beta_flags)).toEqual([
+      ['--enable-assets'],
+      ['--enable-assets'],
+      ['--enable-assets']
+    ])
+    for (const { properties } of bootEvents) {
+      expect(properties).toMatchObject({ core_beta_opted_in: true, core_version: '0.3.81' })
+    }
+  })
+
+  it.each([
+    ['opted out without a flag', false, false, false, true, false],
+    ['opted out with a manual flag', false, true, false, true, true],
+    ['discovery fails with a manual flag', true, true, true, true, true],
+    ['discovery fails without a flag', true, false, true, true, false],
+    ['schema removes an unsupported manual flag', false, true, false, false, false],
+    ['opted in without a grant', true, false, false, true, false]
+  ] as const)(
+    'tags boot arguments independently of grants: %s',
+    async (_description, optedIn, manualFlag, discoveryFails, supported, expected) => {
+      launchHarness.betaEnabled = optedIn
+      launchHarness.grants = []
+      launchHarness.schemaThrows = discoveryFails
+      launchHarness.schemaNames = supported ? ['enable-assets', 'listen'] : ['listen']
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: [
+          '-s',
+          path.join(installDir, 'ComfyUI', 'main.py'),
+          '--listen',
+          ...(manualFlag ? ['--enable-assets'] : [])
+        ],
+        cwd: installDir,
+        skipPortWait: false,
+        port: 48233
+      }
+      launchHarness.waitForPort = async () => {}
+
+      const res = await handleLaunch(ctxFor(`harness-assets-cohort-${_description}`))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs.includes('--enable-assets')).toBe(expected)
+      const bootEvents = events.filter((e) => e.event.startsWith('comfy.desktop.comfyui.boot_'))
+      expect(bootEvents.map((e) => e.event)).toEqual([
+        'comfy.desktop.comfyui.boot_started',
+        'comfy.desktop.comfyui.boot_completed'
+      ])
+      for (const { properties } of bootEvents) {
+        expect(properties).toMatchObject({
+          assets_enabled: expected,
+          core_beta_flags: [],
+          core_beta_opted_in: optedIn,
+          core_version: '0.3.81'
+        })
+      }
+    }
+  )
+
+  it("tags Desktop's own --enable-assets as assets, never as a beta grant", async () => {
+    launchHarness.grants = []
+    launchHarness.commits = {
+      head: 'e'.repeat(40),
+      ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]])
+    }
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: false,
+      port: 48234
+    }
+    launchHarness.waitForPort = async () => {}
+    const id = 'harness-assets-cohort-desktop-ask'
+
+    const res = await handleLaunch(ctxFor(id))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-assets')
+    const booted = events.find((e) => e.event === 'comfy.desktop.comfyui.boot_started')
+    expect(booted?.properties).toMatchObject({ assets_enabled: true, core_beta_flags: [] })
+    expect(events.some((e) => e.event === 'comfy.desktop.core_beta.applied')).toBe(false)
+    expect(peekBetaActivationNotice(id)).toBeNull()
+    expect(_runningSessions.get(id)?.coreBetaArgs).toEqual([])
+    expect(sent.join('')).toContain('[assets] --enable-assets passed')
+    _runningSessions.delete(id)
+  })
+
+  it('keeps the applied Assets cohort on terminal boot failure', async () => {
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: false,
+      port: 48234
+    }
+    launchHarness.waitForPort = async () => {
+      throw new Error('boot timed out')
+    }
+
+    const res = await handleLaunch(ctxFor('harness-assets-failed'))
+
+    expect(res.ok).toBe(false)
+    const bootEvents = events.filter((e) =>
+      ['comfy.desktop.comfyui.boot_started', 'comfy.desktop.comfyui.boot_failed'].includes(e.event)
+    )
+    expect(bootEvents.map((e) => e.event)).toEqual([
+      'comfy.desktop.comfyui.boot_started',
+      'comfy.desktop.comfyui.boot_failed'
+    ])
+    expect(bootEvents.every((e) => e.properties?.assets_enabled === true)).toBe(true)
+    expect(bootEvents.map((e) => e.properties?.core_beta_flags)).toEqual([
+      ['--enable-assets'],
+      ['--enable-assets']
+    ])
+    for (const { properties } of bootEvents) {
+      expect(properties).toMatchObject({ core_beta_opted_in: true, core_version: '0.3.81' })
+    }
   })
 
   it('still filters user args, injecting nothing, when the beta setting cannot be resolved', async () => {
-    // Resolving the toggle writes the default back on first read, so a read-only profile makes
-    // it throw. That must cost the launch its beta grants — never its arg filtering, and never
-    // the launch itself.
     launchHarness.betaEnabledThrows = true
     launchHarness.launchCommand = {
       cmd: process.execPath,
@@ -1369,15 +3076,11 @@ describe('core beta report placement', () => {
 
     expect(res.ok).toBe(true)
     expect(spawnArgs).toContain('--listen')
-    // Filtering still ran: an arg the pinned core does not know never reaches it.
     expect(spawnArgs).not.toContain('--not-a-real-comfy-flag')
-    // Fail closed: the grant is schema-supported and would have been injected at `true`.
     expect(spawnArgs).not.toContain('--enable-assets')
   })
 
   it('reports opt_state true when schema discovery is unavailable', async () => {
-    // Arg assembly never runs, so there are no grants — but the user IS opted in, and the
-    // report site no longer re-reads settings to find that out.
     launchHarness.schemaThrows = true
     launchHarness.betaEnabled = true
 
@@ -1388,9 +3091,509 @@ describe('core beta report placement', () => {
     expect(optState?.properties).toMatchObject({ opted_in: true })
     expect(reportedEvents()).not.toContain('comfy.desktop.core_beta.applied')
   })
+
+  describe('session record of the applied grants (settings beta-args pill)', () => {
+    const launched: string[] = []
+    const launch = async (id: string): Promise<void> => {
+      launched.push(id)
+      const res = await handleLaunch(ctxFor(id))
+      expect(res.ok).toBe(true)
+    }
+    const recorded = (id: string): unknown => _runningSessions.get(id)?.coreBetaArgs
+
+    afterEach(() => {
+      while (launched.length) _runningSessions.delete(launched.pop()!)
+    })
+
+    it('still prints the selection trace that explains each grant', async () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      await launch('harness-session-trace')
+      expect(log.mock.calls.map((call) => String(call[0]))).toContain(
+        '[core-beta] window --enable-assets: >=0.3.80 version=0.3.81 exact=true'
+      )
+    })
+
+    it('records each applied grant with its payload name on the skip-port spawn', async () => {
+      launchHarness.grants = [{ ...HARNESS_GRANT, notice: { description: 'Asset browser' } }]
+      await launch('harness-session-skip-port')
+      expect(recorded('harness-session-skip-port')).toEqual([
+        { arg: '--enable-assets', name: 'Asset browser' }
+      ])
+    })
+
+    it('records the grants on the port-wait spawn too', async () => {
+      launchHarness.grants = [{ ...HARNESS_GRANT, notice: { description: 'Asset browser' } }]
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+        cwd: installDir,
+        skipPortWait: false,
+        port: 48236
+      }
+      launchHarness.waitForPort = async () => {}
+      await launch('harness-session-port-wait')
+      expect(recorded('harness-session-port-wait')).toEqual([
+        { arg: '--enable-assets', name: 'Asset browser' }
+      ])
+    })
+
+    it('records a silent grant, since it is still on the command line', async () => {
+      launchHarness.grants = [{ ...HARNESS_GRANT, notice: { silent: true } }]
+      await launch('harness-session-silent')
+      expect(recorded('harness-session-silent')).toEqual([{ arg: '--enable-assets', name: null }])
+    })
+
+    it('records no grants for an opted-out launch', async () => {
+      launchHarness.betaEnabled = false
+      await launch('harness-session-opted-out')
+      expect(recorded('harness-session-opted-out')).toEqual([])
+    })
+
+    it("omits a grant the user's own args override", async () => {
+      launchHarness.schemaNames = ['enable-assets', 'disable-assets', 'listen', 'feature-flag']
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--disable-assets'],
+        cwd: installDir,
+        skipPortWait: true
+      }
+      await launch('harness-session-user-override')
+      expect(spawnArgs).not.toContain('--enable-assets')
+      expect(recorded('harness-session-user-override')).toEqual([])
+    })
+  })
+
+  describe('the next-launch preview decides from the facts the launch uses', () => {
+    afterEach(() => {
+      _runningSessions.delete('harness-equivalence')
+    })
+
+    it('hands planCoreBetaArgs the same facts as the launch that follows it, on a git-less install', async () => {
+      settingsModule.set('betaFeaturesEnabled', true)
+      launchHarness.grants = [{ ...HARNESS_GRANT, notice: { description: 'Asset browser' } }]
+      launchHarness.plans = []
+
+      const preview = await previewCoreBetaArgs(
+        'harness-equivalence',
+        harnessInstall(),
+        launchHarness.launchCommand as LaunchCommand
+      )
+      const res = await handleLaunch(ctxFor('harness-equivalence'))
+      expect(res.ok).toBe(true)
+
+      expect(launchHarness.plans).toHaveLength(2)
+      const [previewFacts, launchFacts] = launchHarness.plans
+      expect(previewFacts).toEqual(launchFacts)
+      expect(preview).toEqual(_runningSessions.get('harness-equivalence')?.coreBetaArgs)
+      expect(preview).toEqual([{ arg: '--enable-assets', name: 'Asset browser' }])
+    })
+
+    it("lists a held campaign's arg exactly as the launch then passes it", async () => {
+      settingsModule.set('betaFeaturesEnabled', true)
+      const key = 'desktop_core_beta_agent'
+      launchHarness.schemaNames = ['enable-asset-hashing', 'enable-agent', 'listen', 'feature-flag']
+      launchHarness.grants = [{ arg: '--enable-asset-hashing', minCoreVersion: '0.3.80' }]
+      launchHarness.campaigns = {
+        registry: [{ key, args: ['--enable-agent'] }],
+        answers: new Map([
+          [
+            key,
+            parseCampaignAnswer(
+              'hold',
+              {
+                grants: [
+                  {
+                    arg: '--enable-agent',
+                    min_core_version: '0.3.60',
+                    requires_args: ['--enable-asset-hashing'],
+                    enrolment: { epoch: 1, epochs: [1] }
+                  }
+                ]
+              },
+              Date.now()
+            )
+          ]
+        ])
+      }
+      launchHarness.campaignRecords = { [key]: { '--enable-agent': { epoch: 1, enrolledAt: 1 } } }
+
+      const preview = await previewCoreBetaArgs(
+        'harness-equivalence',
+        harnessInstall(),
+        launchHarness.launchCommand as LaunchCommand
+      )
+      expect((await handleLaunch(ctxFor('harness-equivalence'))).ok).toBe(true)
+
+      expect(preview.map((view) => view.arg)).toEqual(['--enable-asset-hashing', '--enable-agent'])
+      expect(preview).toEqual(_runningSessions.get('harness-equivalence')?.coreBetaArgs)
+    })
+  })
+})
+
+describe('Performance Test guardrail', () => {
+  let events: { event: string; properties?: Record<string, unknown> }[] = []
+  let spawned = 0
+  let child: FakeChild | null = null
+  let started: InstanceStartedCallbackInfo[] = []
+  let installDir = ''
+  let bootLogs: unknown[] = []
+  const launches: [string, { abort: AbortController }][] = []
+  let leftRunning: [string, SessionInfo][] = []
+  let leftStopping: string[] = []
+
+  const PERF = 'performance-test:guard-bench'
+
+  const ctxFor = (installationId: string, sessionId?: string): ActionContext => ({
+    event: {
+      sender: {
+        isDestroyed: () => false,
+        send: (channel: string, payload: unknown) => {
+          if (channel === 'comfy-boot-log') bootLogs.push(payload)
+        }
+      }
+    } as unknown as Electron.IpcMainInvokeEvent,
+    installationId,
+    sessionId,
+    inst: {
+      id: installationId,
+      name: 'Bench',
+      sourceId: 'harness-source',
+      installPath: installDir,
+      version: '0.17.0'
+    } as unknown as InstallationRecord,
+    actionData: {}
+  })
+
+  function runSession(id: string, name: string): void {
+    _runningSessions.set(id, {
+      proc: {} as ChildProcess,
+      port: 48300,
+      mode: 'window',
+      installationName: name,
+      startedAt: Date.now()
+    })
+  }
+
+  beforeEach(() => {
+    leftRunning = [..._runningSessions]
+    leftStopping = [..._stoppingInstallationIds]
+    _runningSessions.clear()
+    _stoppingInstallationIds.clear()
+    installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'perf-guard-launch-'))
+    fs.mkdirSync(path.join(installDir, 'ComfyUI'), { recursive: true })
+    events = []
+    spawned = 0
+    child = null
+    started = []
+    bootLogs = []
+    setCallbacks({ onInstanceStarted: (info) => started.push(info) })
+    launchHarness.installRecords = {
+      'guard-bench': { name: 'Bench', sourceId: 'standalone' },
+      'guard-other': { name: 'Other Install', sourceId: 'standalone' },
+      'guard-remote': { name: 'Remote Box', sourceId: 'remote' },
+      'guard-cloud': { name: 'Cloud', sourceId: 'cloud' },
+      'guard-unknown': { name: 'Unknown Source', sourceId: 'no-such-source' }
+    }
+    launchHarness.schemaThrows = false
+    launchHarness.registryThrows = false
+    launchHarness.betaEnabled = true
+    launchHarness.betaEnabledThrows = false
+    launchHarness.readSettled = null
+    launchHarness.schemaNames = ['enable-assets', 'listen', 'feature-flag']
+    launchHarness.grants = []
+    launchHarness.duringResourceAcquire = null
+    launchHarness.waitForPort = async () => {}
+    launchHarness.busyPorts = []
+    ownership.prior = null
+    ownership.onResolve = null
+    launchHarness.spawn = () => {
+      spawned++
+      const proc = new EventEmitter() as FakeChild
+      proc.stdout = new EventEmitter()
+      proc.stderr = new EventEmitter()
+      proc.pid = 4244
+      proc.killed = false
+      proc.kill = () => true
+      child = proc
+      return proc
+    }
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--enable-assets'],
+      cwd: installDir,
+      skipPortWait: false,
+      port: 48234
+    }
+    for (const kind of ['emit', 'capture'] as const) {
+      vi.spyOn(telemetry, kind).mockImplementation(((
+        event: string,
+        properties?: Record<string, unknown>
+      ) => {
+        events.push({ event, properties })
+      }) as unknown as typeof telemetry.emit)
+    }
+    vi.spyOn(i18nModule, 't').mockImplementation((key, params) =>
+      params ? `${key} ${JSON.stringify(params)}` : key
+    )
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    launchHarness.busyPorts = null
+    launchHarness.installRecords = null
+    launchHarness.listGate = null
+    launchHarness.waitForUrl = null
+    setCallbacks({})
+    for (const [id, launch] of launches.splice(0)) {
+      _endLaunch(id, launch)
+      if (_operationAborts.get(id) === launch.abort) _operationAborts.delete(id)
+    }
+    _runningSessions.clear()
+    _stoppingInstallationIds.clear()
+    for (const [key, session] of leftRunning) _runningSessions.set(key, session)
+    for (const key of leftStopping) _stoppingInstallationIds.add(key)
+    fs.rmSync(installDir, { recursive: true, force: true })
+  })
+
+  async function expectRefused(blockingSessions: BlockingSession[]): Promise<void> {
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+    expect(res).toEqual({
+      ok: false,
+      message: 'errors.performanceTestOtherInstanceRunning',
+      blockingSessions
+    })
+    expect(spawned, 'no ComfyUI was started').toBe(0)
+    expect(events).toEqual([
+      {
+        event: 'comfy.desktop.performance_test.refused',
+        properties: { installation_id: 'guard-bench', other_count: blockingSessions.length }
+      }
+    ])
+    expect(_operationAborts.has(PERF), 'no operation slot claimed').toBe(false)
+    expect(_getLaunchingInstallationIds()).not.toContain(PERF)
+  }
+
+  const other = { sessionId: 'guard-other', name: 'Other Install' }
+  const otherPerf = { sessionId: 'performance-test:guard-other', name: 'Other Install' }
+
+  it('refuses while another installation is running, and names it', async () => {
+    runSession('guard-other', 'Other Install')
+    await expectRefused([other])
+  })
+
+  function preparing(id: string): void {
+    const launch = _beginLaunch(id)
+    _operationAborts.set(id, launch.abort)
+    launches.push([id, launch])
+  }
+
+  it('refuses while another installation is still preparing or starting', async () => {
+    preparing('guard-other')
+    await expectRefused([other])
+  })
+
+  it('does not count a launch handler still running after its session was stopped', async () => {
+    launches.push(['guard-other', _beginLaunch('guard-other')])
+
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+
+    expect(res.ok).toBe(true)
+  })
+
+  it('refuses while another installation is stopping', async () => {
+    _stoppingInstallationIds.add('guard-other')
+    await expectRefused([other])
+  })
+
+  it('names a running Performance Test of another installation by its session', async () => {
+    runSession('performance-test:guard-other', 'Other Install')
+    await expectRefused([otherPerf])
+  })
+
+  it("names another installation's Performance Test that is still starting by that installation", async () => {
+    preparing('performance-test:guard-other')
+    await expectRefused([otherPerf])
+  })
+
+  it('lists Performance Tests after the installations', async () => {
+    runSession('performance-test:guard-other', 'Other Install')
+    runSession('guard-gone', 'Gone Install')
+    await expectRefused([{ sessionId: 'guard-gone', name: 'Gone Install' }, otherPerf])
+  })
+
+  it('counts an installation of an unknown source as local', async () => {
+    runSession('guard-unknown', 'Unknown Source')
+    await expectRefused([{ sessionId: 'guard-unknown', name: 'Unknown Source' }])
+  })
+
+  it('counts a session whose installation record is gone, by its session name', async () => {
+    runSession('guard-gone', 'Gone Install')
+    await expectRefused([{ sessionId: 'guard-gone', name: 'Gone Install' }])
+  })
+
+  it('lets only one of two Performance Tests started together through', async () => {
+    let open!: () => void
+    launchHarness.listGate = new Promise<void>((resolve) => (open = resolve))
+    const first = handleLaunch(ctxFor('guard-bench', PERF))
+    const second = handleLaunch(ctxFor('guard-other', 'performance-test:guard-other'))
+    open()
+
+    const results = await Promise.all([first, second])
+
+    expect(results.map((r) => r.ok)).toEqual([true, false])
+    expect(events.filter((e) => e.event === 'comfy.desktop.performance_test.refused')).toEqual([
+      {
+        event: 'comfy.desktop.performance_test.refused',
+        properties: { installation_id: 'guard-other', other_count: 1 }
+      }
+    ])
+    expect(results[1]!.blockingSessions).toEqual([{ sessionId: PERF, name: 'Bench' }])
+    expect(spawned).toBe(1)
+  })
+
+  it('refuses while the same installation runs its own session', async () => {
+    runSession('guard-bench', 'Bench')
+    await expectRefused([{ sessionId: 'guard-bench', name: 'Bench' }])
+  })
+
+  it.each([
+    ['remote', 'guard-remote'],
+    ['cloud', 'guard-cloud']
+  ])('does not count a %s installation, which runs elsewhere', async (_category, id) => {
+    _runningSessions.set(id, {
+      proc: null,
+      port: 8188,
+      mode: 'window',
+      installationName: 'Elsewhere',
+      startedAt: Date.now()
+    })
+
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+
+    expect(res.ok).toBe(true)
+    expect(spawned).toBe(1)
+  })
+
+  it('does not guard a Performance Test of a remote installation', async () => {
+    runSession('guard-other', 'Other Install')
+    launchHarness.waitForUrl = async () => {}
+
+    const res = await handleLaunch({
+      ...ctxFor('guard-remote', 'performance-test:guard-remote'),
+      inst: { id: 'guard-remote', name: 'Remote Box', sourceId: 'remote' } as InstallationRecord
+    })
+
+    expect(res).toMatchObject({ ok: true })
+  })
+
+  it('refuses while its own earlier run is still stopping', async () => {
+    _stoppingInstallationIds.add(PERF)
+    await expectRefused([{ sessionId: PERF, name: 'Bench' }])
+  })
+
+  it('does not count its own earlier run', async () => {
+    runSession(PERF, 'Bench')
+
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+
+    expect(res).toEqual({ ok: false, message: 'errors.alreadyRunning' })
+  })
+
+  it('never refuses a normal launch while a Performance Test runs', async () => {
+    runSession('performance-test:guard-other', 'Other Install')
+
+    const res = await handleLaunch(ctxFor('guard-bench'))
+
+    expect(res.ok).toBe(true)
+    expect(spawned).toBe(1)
+  })
+
+  it('tags a Performance Test run as one in its boot, start and tap events', async () => {
+    const createAssetsTap = vi.spyOn(assetsTapModule, 'createAssetsTap')
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+    expect(res.ok).toBe(true)
+
+    const boots = events.filter((e) => /comfyui\.boot_(started|completed)$/.test(e.event))
+    expect(boots).toHaveLength(2)
+    for (const boot of boots)
+      expect(boot.properties).toMatchObject({ session_kind: 'performance_test' })
+    expect(started).toEqual([expect.objectContaining({ sessionKind: 'performance_test' })])
+    expect(bootLogs).toEqual([{ installationId: PERF, bootStderr: expect.any(String) }])
+    expect(createAssetsTap).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionKind: 'performance_test' })
+    )
+    child!.stderr.emit(
+      'data',
+      '[WARNING] Asset scan error: phase=discovery_stat error_type=permission_denied\n'
+    )
+    child!.stdout.emit('data', 'got prompt\n')
+    child!.emit('close', 0, null)
+    await vi.waitFor(() => {
+      for (const name of [
+        'comfy.desktop.comfyui.asset_scan_error',
+        'comfy.desktop.execution.session_summary'
+      ]) {
+        expect(events.find((e) => e.event === name)?.properties, name).toMatchObject({
+          session_kind: 'performance_test'
+        })
+      }
+    })
+  })
+
+  it.each([
+    ['waits for its port', false],
+    ['skips the port wait', true]
+  ])('tags the exit of a Performance Test that %s', async (_label, skipPortWait) => {
+    launchHarness.launchCommand = { ...launchHarness.launchCommand!, skipPortWait }
+
+    const res = await handleLaunch(ctxFor('guard-bench', PERF))
+    expect(res.ok).toBe(true)
+    child!.emit('close', 0, null)
+
+    await vi.waitFor(() =>
+      expect(
+        events.find((e) => e.event === 'comfy.desktop.comfyui.exited')?.properties
+      ).toMatchObject({ session_kind: 'performance_test' })
+    )
+  })
+
+  it('names every other ComfyUI running', async () => {
+    runSession('guard-other', 'Other Install')
+    _stoppingInstallationIds.add('guard-bench')
+    await expectRefused([other, { sessionId: 'guard-bench', name: 'Bench' }])
+  })
+
+  it.each([
+    ['waits for its port', false],
+    ['skips the port wait', true]
+  ])("tags the user's own session as normal when it %s", async (_label, skipPortWait) => {
+    launchHarness.launchCommand = { ...launchHarness.launchCommand!, skipPortWait }
+    const createAssetsTap = vi.spyOn(assetsTapModule, 'createAssetsTap')
+    const res = await handleLaunch(ctxFor('guard-bench'))
+    expect(res.ok).toBe(true)
+
+    const boots = events.filter((e) => /comfyui\.boot_(started|completed)$/.test(e.event))
+    expect(boots).toHaveLength(skipPortWait ? 0 : 2)
+    for (const boot of boots) expect(boot.properties).toMatchObject({ session_kind: 'normal' })
+    if (!skipPortWait) expect(started).toEqual([expect.objectContaining({ sessionKind: 'normal' })])
+    expect(createAssetsTap).toHaveBeenCalledWith(expect.objectContaining({ sessionKind: 'normal' }))
+    child!.stdout.emit('data', 'got prompt\n')
+    child!.emit('close', 0, null)
+    await vi.waitFor(() => {
+      for (const name of [
+        'comfy.desktop.comfyui.exited',
+        'comfy.desktop.execution.session_summary'
+      ]) {
+        expect(events.find((e) => e.event === name)?.properties, name).toMatchObject({
+          session_kind: 'normal'
+        })
+      }
+    })
+  })
 })
 
 describe('emitCoreBetaTelemetry', () => {
+  const COMMIT = '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
   let captured: Array<{ event: string; ctx: Record<string, unknown> }>
 
   beforeEach(() => {
@@ -1410,6 +3613,8 @@ describe('emitCoreBetaTelemetry', () => {
       appliedArgs: ['--enable-assets'],
       droppedUnsupported: [],
       coreVersion: '0.3.81',
+      coreCommit: COMMIT,
+      coreVersionLabel: 'v0.3.81+15',
       optedIn: true
     })
 
@@ -1417,6 +3622,8 @@ describe('emitCoreBetaTelemetry', () => {
     expect(applied!.ctx).toEqual({
       args: ['--enable-assets'],
       core_version: '0.3.81',
+      core_commit: COMMIT,
+      core_version_label: 'v0.3.81+15',
       dropped_unsupported: []
     })
   })
@@ -1426,6 +3633,8 @@ describe('emitCoreBetaTelemetry', () => {
       appliedArgs: [],
       droppedUnsupported: ['--enable-assets'],
       coreVersion: '0.3.81',
+      coreCommit: COMMIT,
+      coreVersionLabel: 'v0.3.81+15',
       optedIn: true
     })
 
@@ -1438,6 +3647,8 @@ describe('emitCoreBetaTelemetry', () => {
       appliedArgs: [],
       droppedUnsupported: [],
       coreVersion: null,
+      coreCommit: null,
+      coreVersionLabel: null,
       optedIn: false
     })
 
@@ -1450,6 +3661,8 @@ describe('emitCoreBetaTelemetry', () => {
       appliedArgs: ['--enable-assets'],
       droppedUnsupported: [],
       coreVersion: '0.3.81',
+      coreCommit: COMMIT,
+      coreVersionLabel: 'v0.3.81+15',
       optedIn: true
     })
 
@@ -1460,14 +3673,14 @@ describe('emitCoreBetaTelemetry', () => {
   })
 
   it('hands both events to the consent-gated emit path without consulting consent itself', () => {
-    // Delivery for a telemetry-declining user is suppressed by telemetry.ts's
-    // own gate — never by a branch here, which would also silence opted-in users.
     telemetry.setConsentState('denied')
 
     emitCoreBetaTelemetry({
       appliedArgs: ['--enable-assets'],
       droppedUnsupported: [],
       coreVersion: '0.3.81',
+      coreCommit: COMMIT,
+      coreVersionLabel: 'v0.3.81+15',
       optedIn: true
     })
 
@@ -1475,5 +3688,2448 @@ describe('emitCoreBetaTelemetry', () => {
       'comfy.desktop.core_beta.applied',
       'comfy.desktop.core_beta.opt_state'
     ])
+  })
+})
+
+describe('agent requirements at launch', () => {
+  const AGENT_GRANT: CoreBetaGrant = { arg: '--enable-agent', minCoreVersion: '0.3.80' }
+  let installDir = ''
+  let sent: string[] = []
+  let progress: { phase: string; steps?: { phase: string }[] }[] = []
+  let spawnArgs: string[] = []
+  let spawned = 0
+
+  const touch = (target: string): void => {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, '')
+  }
+
+  const agentReqPath = (): string => path.join(installDir, 'ComfyUI', 'agent_requirements.txt')
+  const frontendRestores = (): unknown[] =>
+    pipHarness.calls.filter((args) => String(args[4]).startsWith('.launch-frontend-restore-'))
+
+  const harnessInstall = (): InstallationRecord =>
+    ({
+      id: 'agent-reqs-inst',
+      name: 'Agent Harness',
+      sourceId: 'harness-source',
+      installPath: installDir,
+      version: '0.3.81',
+      comfyVersion: {
+        commit: '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
+        baseTag: 'v0.3.81',
+        commitsAhead: 0,
+        baseTagVerified: true
+      }
+    }) as unknown as InstallationRecord
+
+  const ctxFor = (installationId: string): ActionContext => ({
+    event: {
+      sender: {
+        isDestroyed: () => false,
+        send: (channel: string, payload: { text?: string; phase?: string }) => {
+          if (typeof payload?.text === 'string') sent.push(payload.text)
+          if (channel === 'install-progress' && typeof payload?.phase === 'string') {
+            progress.push(payload as { phase: string; steps?: { phase: string }[] })
+          }
+        }
+      }
+    } as unknown as Electron.IpcMainInvokeEvent,
+    installationId,
+    inst: harnessInstall(),
+    actionData: {}
+  })
+
+  beforeEach(() => {
+    installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-reqs-launch-'))
+    fs.mkdirSync(path.join(installDir, 'ComfyUI'), { recursive: true })
+    touch(getUvPath(installDir))
+    touch(getVenvPythonPath(installDir))
+    fs.writeFileSync(agentReqPath(), 'comfyui-agent==1.0.0\n')
+    sent = []
+    progress = []
+    spawnArgs = []
+    spawned = 0
+    pipHarness.calls = []
+    pipHarness.checks = []
+    prefetchHarness.requests = []
+    prefetchHarness.onStart = null
+    pipHarness.result = { code: 0, output: '' }
+    pipHarness.duringInstall = null
+    pipHarness.respond = null
+    launchHarness.records = null
+    launchHarness.schemaThrows = false
+    launchHarness.registryThrows = false
+    launchHarness.betaEnabled = true
+    launchHarness.betaEnabledThrows = false
+    launchHarness.schemaNames = ['enable-agent', 'listen', 'feature-flag']
+    launchHarness.grants = []
+    launchHarness.duringResourceAcquire = null
+    launchHarness.spawn = (_cmd: unknown, args: unknown) => {
+      spawned += 1
+      spawnArgs = args as string[]
+      const proc = new EventEmitter() as FakeChild
+      proc.stdout = new EventEmitter()
+      proc.stderr = new EventEmitter()
+      proc.pid = 4243
+      proc.killed = false
+      proc.kill = () => true
+      return proc
+    }
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--enable-agent', '--listen'],
+      cwd: installDir,
+      skipPortWait: true
+    }
+    vi.spyOn(telemetry, 'emit').mockImplementation((() => {}) as unknown as typeof telemetry.emit)
+  })
+
+  afterEach(async () => {
+    if (spawned > 0) {
+      const logFile = path.join(getLogDir(installDir), 'comfyui.log')
+      await vi.waitFor(() => expect(fs.existsSync(logFile)).toBe(true), { timeout: 10_000 })
+    }
+    vi.restoreAllMocks()
+    fs.rmSync(installDir, { recursive: true, force: true })
+  })
+
+  it('installs the requirements when the user typed the flag by hand', async () => {
+    const res = await handleLaunch(ctxFor('agent-reqs-hand-typed'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toHaveLength(1)
+    expect(pipHarness.calls[0]![0]).toBe(agentReqPath())
+    expect(pipHarness.calls[0]![1]).toBe(getUvPath(installDir))
+    expect(pipHarness.calls[0]![2]).toBe(getVenvPythonPath(installDir))
+    expect(spawnArgs).toContain('--enable-agent')
+  })
+
+  it('installs the requirements when a beta grant added the flag', async () => {
+    launchHarness.grants = [AGENT_GRANT]
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: true
+    }
+
+    const res = await handleLaunch(ctxFor('agent-reqs-granted'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toHaveLength(1)
+    expect(spawnArgs).toContain('--enable-agent')
+  })
+
+  it('installs nothing when the flag never reaches the final args', async () => {
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+      cwd: installDir,
+      skipPortWait: true
+    }
+
+    const res = await handleLaunch(ctxFor('agent-reqs-flag-absent'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toEqual([])
+  })
+
+  it('installs nothing when the running core cannot parse the flag', async () => {
+    launchHarness.schemaNames = ['listen', 'feature-flag']
+
+    const res = await handleLaunch(ctxFor('agent-reqs-unsupported-core'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toEqual([])
+    expect(spawnArgs).not.toContain('--enable-agent')
+  })
+
+  it('installs nothing when core ships no agent requirements file', async () => {
+    fs.rmSync(agentReqPath())
+
+    const res = await handleLaunch(ctxFor('agent-reqs-file-absent'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toEqual([])
+    expect(spawnArgs).toContain('--enable-agent')
+  })
+
+  it('installs nothing for an install with no Desktop-managed Python environment', async () => {
+    fs.rmSync(getUvPath(installDir))
+
+    const res = await handleLaunch(ctxFor('agent-reqs-unmanaged-env'))
+
+    expect(res.ok).toBe(true)
+    expect(pipHarness.calls).toEqual([])
+    expect(spawnArgs).toContain('--enable-agent')
+  })
+
+  it('launches with the flag still set, and downloads in the background, when the cache misses', async () => {
+    pipHarness.result = { code: 2, output: 'error: Failed to fetch\n' }
+    vi.spyOn(i18nModule, 't').mockImplementation(((key: string) => key) as never)
+
+    const res = await handleLaunch(ctxFor('agent-reqs-install-failed'))
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-agent')
+    expect(sent.join('')).toContain('exited with code 2')
+    expect(sent.join('')).toContain('Downloading the agent in the background')
+    expect(prefetchHarness.requests.map((r) => r.request)).toEqual([
+      expect.objectContaining({ steps: [{ text: 'comfyui-agent==1.0.0\n' }], signature: 'core' })
+    ])
+    expect(progress.filter((p) => p.phase === 'agentRequirements').at(-1)).toMatchObject({
+      status: 'launch.agentRequirements.deferred'
+    })
+    expect(
+      vi.mocked(telemetry.emit).mock.calls.map(([event]) => event),
+      'a download failure is handed to the background download, not reported as a core failure'
+    ).not.toContain('comfy.desktop.agent_requirements_core')
+  })
+
+  it('launches with a failure caption, and reports it, when no download can fix core file', async () => {
+    pipHarness.result = {
+      code: 1,
+      output: 'error: No solution found when resolving dependencies\n'
+    }
+    vi.spyOn(i18nModule, 't').mockImplementation(((key: string) => key) as never)
+    settingsModule.set('pypiMirror', 'https://mirror.example/simple/')
+
+    const res = await handleLaunch(ctxFor('agent-reqs-core-unsolvable')).finally(() =>
+      settingsModule.set('pypiMirror', '')
+    )
+
+    expect(res.ok).toBe(true)
+    expect(spawnArgs).toContain('--enable-agent')
+    expect(prefetchHarness.requests, 'no download can fix it, so none is handed over').toEqual([])
+    expect(progress.filter((p) => p.phase === 'agentRequirements').at(-1)).toMatchObject({
+      status: 'launch.agentRequirements.failed'
+    })
+    expect(
+      vi
+        .mocked(telemetry.emit)
+        .mock.calls.filter(([event]) => event === 'comfy.desktop.agent_requirements_core')
+    ).toEqual([
+      [
+        'comfy.desktop.agent_requirements_core',
+        {
+          installation_id: 'agent-reqs-core-unsolvable',
+          install_outcome: 'exited',
+          exit_code: 1,
+          elapsed_ms: expect.any(Number),
+          budget_ms: expect.any(Number),
+          error_tail: 'error: No solution found when resolving dependencies',
+          index: 'custom'
+        }
+      ]
+    ])
+  })
+
+  it('publishes the install as a step the renderer can show', async () => {
+    await handleLaunch(ctxFor('agent-reqs-step-published'))
+
+    const lastSteps = progress.filter((p) => p.phase === 'steps').at(-1)
+    expect(lastSteps?.steps?.map((s) => s.phase)).toContain('agentRequirements')
+    expect(progress.some((p) => p.phase === 'agentRequirements')).toBe(true)
+  })
+
+  it('cancels the launch without spawning when it is aborted mid-install', async () => {
+    pipHarness.duringInstall = () => _operationAborts.get('agent-reqs-cancelled')?.abort()
+
+    const res = await handleLaunch(ctxFor('agent-reqs-cancelled'))
+
+    expect(res).toEqual({ ok: false, cancelled: true })
+    expect(spawned).toBe(0)
+  })
+
+  describe('with a version override from the agent campaign', { timeout: 15_000 }, () => {
+    const KEY = 'desktop_core_beta_agent'
+    const ID = 'agent-override-inst'
+    const CORE_FILE = 'comfy-agent==0.2.0\ncomfy-cli==1.21.0\n'
+    const OVERRIDDEN = 'comfy-agent==0.2.3\ncomfy-cli==1.21.0\n'
+    let proc: FakeChild | null = null
+    let spawnCount = 0
+    let sessionFile = ''
+    const settle = async (): Promise<void> => {
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    const serveCampaign = (override: unknown): void => {
+      const answer = parseCampaignAnswer(
+        'enrol',
+        {
+          grants: [
+            {
+              arg: '--enable-agent',
+              min_core_version: '0.3.60',
+              enrolment: { epoch: 1, epochs: [1] }
+            }
+          ],
+          agent_requirements_override: override
+        },
+        Date.now()
+      )
+      launchHarness.campaigns = {
+        registry: [{ key: KEY, args: ['--enable-agent'] }],
+        answers: new Map([[KEY, answer]])
+      }
+    }
+
+    let installed: string[] = []
+    const overrideEvents = (): Record<string, unknown>[] =>
+      vi
+        .mocked(telemetry.emit)
+        .mock.calls.filter(([event]) => event === 'comfy.desktop.agent_requirements_override')
+        .map(([, props]) => props as Record<string, unknown>)
+    const overrideState = (): unknown => launchHarness.records!.get(ID)?.agentRequirementsOverride
+
+    const launchCommand = (...extra: string[]): Record<string, unknown> => ({
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), ...extra, '--listen'],
+      cwd: installDir,
+      skipPortWait: true
+    })
+
+    const launchAndPrint = async (
+      opts: {
+        lines?: string[]
+        stream?: 'stdout' | 'stderr'
+        handTyped?: boolean
+        portWait?: boolean
+      } = {}
+    ): Promise<void> => {
+      launchHarness.launchCommand = opts.handTyped
+        ? launchCommand('--enable-agent')
+        : launchCommand()
+      if (opts.portWait) {
+        launchHarness.launchCommand = {
+          ...launchHarness.launchCommand,
+          skipPortWait: false,
+          port: 48233
+        }
+        launchHarness.waitForPort = async () => {}
+      }
+      const ctx = ctxFor(ID)
+      ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+      expect((await handleLaunch(ctx)).ok).toBe(true)
+      for (const line of opts.lines ?? []) {
+        proc![opts.stream ?? 'stderr'].emit('data', Buffer.from(`[INFO] ${line}\n`))
+      }
+      await settle()
+      proc!.emit('exit', 0, null)
+      proc!.emit('close', 0, null)
+      await vi.waitFor(() => expect(_runningSessions.has(ID)).toBe(false), { timeout: 10_000 })
+    }
+
+    beforeEach(() => {
+      fs.writeFileSync(agentReqPath(), CORE_FILE)
+      launchHarness.schemaNames = ['enable-agent', 'listen', 'feature-flag']
+      launchHarness.campaignRecords = {}
+      launchHarness.recordWrites = []
+      launchHarness.idClass = 'machine_derived'
+      launchHarness.records = new Map([[ID, { id: ID }]])
+      const spawn = launchHarness.spawn!
+      spawnCount = 0
+      launchHarness.spawn = (...args: unknown[]) => {
+        spawnCount++
+        sessionFile = (args[3] as Record<string, string> | undefined)?.__COMFY_CLI_SESSION__ ?? ''
+        proc = spawn(...args) as FakeChild
+        return proc
+      }
+      installed = []
+      pipHarness.installed = JSON.stringify([
+        { name: 'comfy-agent', version: '0.2.0' },
+        { name: 'comfy-cli', version: '1.21.0' },
+        { name: 'requests', version: '2.32.0' }
+      ])
+      pipHarness.respond = (args) => {
+        if (!(args[8] as string[]).includes('--dry-run'))
+          installed.push(fs.readFileSync(args[0] as string, 'utf-8'))
+        return { code: 0, output: '' }
+      }
+    })
+
+    afterEach(() => {
+      launchHarness.campaigns = { registry: [], answers: new Map() }
+      launchHarness.recordWriteThrows = false
+      launchHarness.recordsUpdateThrows = false
+      launchHarness.recordsUpdateGate = null
+      launchHarness.waitForPort = null
+      launchHarness.records = null
+      pipHarness.installed = '[]'
+    })
+
+    it('installs the overridden version the campaign applied, and reports it', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint()
+
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(installed).toEqual([OVERRIDDEN])
+      expect(overrideEvents()).toEqual([
+        expect.objectContaining({ decision: 'applied', pins: 'comfy-agent==0.2.3' })
+      ])
+    })
+
+    it("defers to core file on a fresh install, then applies once core's packages are in", async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.installed = JSON.stringify([{ name: 'requests', version: '2.32.0' }])
+
+      await launchAndPrint({ lines: ['[agent-event] agent_started duration_ms=1'] })
+
+      expect(installed).toEqual([CORE_FILE])
+      expect(overrideEvents()).toEqual([
+        expect.objectContaining({ decision: 'refused', reason: 'core_first' })
+      ])
+      expect(overrideState(), 'deferring is not a failure').toBeUndefined()
+
+      pipHarness.installed = JSON.stringify([
+        { name: 'comfy-agent', version: '0.2.0' },
+        { name: 'comfy-cli', version: '1.21.0' }
+      ])
+      await launchAndPrint({ lines: ['[agent-event] agent_started duration_ms=1'] })
+
+      expect(installed).toEqual([CORE_FILE, OVERRIDDEN])
+      expect(overrideEvents().at(-1)).toEqual(
+        expect.objectContaining({ decision: 'applied', pins: 'comfy-agent==0.2.3' })
+      )
+    })
+
+    it('applies the override for an enrolment whose record could not be saved', async () => {
+      launchHarness.recordWriteThrows = true
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint()
+
+      expect(spawnArgs, 'the unrecorded enrolment still starts the agent').toContain(
+        '--enable-agent'
+      )
+      expect(installed).toEqual([OVERRIDDEN])
+    })
+
+    it('installs core file unchanged when the campaign carries no override', async () => {
+      serveCampaign(undefined)
+
+      await launchAndPrint()
+
+      expect(installed).toEqual([CORE_FILE])
+      expect(overrideEvents()).toEqual([])
+    })
+
+    it('ignores the campaign override when the user typed the flag themselves', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint({ handTyped: true })
+
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(installed).toEqual([CORE_FILE])
+      expect(overrideEvents()).toEqual([])
+    })
+
+    it('refuses an invalid override and installs core file', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3 --index-url https://evil.example/simple' })
+
+      await launchAndPrint()
+
+      expect(installed).toEqual([CORE_FILE])
+      expect(overrideEvents()).toEqual([
+        expect.objectContaining({ decision: 'refused', reason: 'bad_version' })
+      ])
+    })
+
+    it('goes back to core file after two failed starts of the same version', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint({ lines: ['[agent-event] health_check_failed reason=crashed'] })
+      expect(overrideState()).toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 1,
+        startFailures: 1
+      })
+
+      await launchAndPrint({ lines: ['[agent-event] agent_error reason=spawn_failed'] })
+      expect(overrideEvents().at(-1)).toEqual(
+        expect.objectContaining({ decision: 'reverted', reason: 'start_failed', failures: 2 })
+      )
+
+      installed = []
+      await launchAndPrint()
+      expect(installed).toEqual([CORE_FILE])
+    })
+
+    it('goes back to core file through the standalone launch path too', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint({ portWait: true, lines: ['[agent-event] agent_error reason=crashed'] })
+      await launchAndPrint({ portWait: true, lines: ['[agent-event] agent_error reason=crashed'] })
+
+      expect(overrideState()).toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 2,
+        startFailures: 2
+      })
+    })
+
+    it("counts a respawned ComfyUI's agent start on its own", async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.launchCommand = { ...launchCommand(), skipPortWait: false, port: 48233 }
+      launchHarness.waitForPort = async () => {}
+      const ctx = ctxFor(ID)
+      ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+      expect((await handleLaunch(ctx)).ok).toBe(true)
+
+      proc!.stderr.emit('data', Buffer.from('[INFO] [agent-event] agent_error reason=crashed\n'))
+      await settle()
+      expect(overrideState()).toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 1,
+        startFailures: 1
+      })
+
+      fs.writeFileSync(`${sessionFile}.reboot`, '')
+      const first = proc!
+      first.emit('exit', 0, null)
+      first.emit('close', 0, null)
+      await vi.waitFor(() => expect(spawnCount).toBe(2), { timeout: 10_000 })
+      proc!.stderr.emit('data', Buffer.from('[INFO] [agent-event] agent_started duration_ms=1\n'))
+      await settle()
+
+      expect(overrideState(), 'the respawn started fine, so the count resets').toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 0,
+        startFailures: 0
+      })
+      proc!.emit('exit', 0, null)
+      proc!.emit('close', 0, null)
+      await vi.waitFor(() => expect(_runningSessions.has(ID)).toBe(false), { timeout: 10_000 })
+    })
+
+    it('counts two outcomes that land at once, one after the other', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.launchCommand = { ...launchCommand(), skipPortWait: false, port: 48233 }
+      launchHarness.waitForPort = async () => {}
+      let release = (): void => {}
+      launchHarness.recordsUpdateGate = new Promise((resolve) => (release = resolve))
+      try {
+        const ctx = ctxFor(ID)
+        ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+        expect((await handleLaunch(ctx)).ok).toBe(true)
+
+        proc!.stderr.emit('data', Buffer.from('[INFO] [agent-event] agent_error reason=crashed\n'))
+        fs.writeFileSync(`${sessionFile}.reboot`, '')
+        const first = proc!
+        first.emit('exit', 0, null)
+        first.emit('close', 0, null)
+        await vi.waitFor(() => expect(spawnCount).toBe(2), { timeout: 10_000 })
+        proc!.stderr.emit('data', Buffer.from('[INFO] [agent-event] agent_error reason=crashed\n'))
+      } finally {
+        release()
+      }
+      await vi.waitFor(
+        () =>
+          expect(overrideState(), 'neither failure is lost').toEqual({
+            signature: 'comfy-agent==0.2.3',
+            failures: 2,
+            startFailures: 2
+          }),
+        { timeout: 10_000 }
+      )
+      proc!.emit('exit', 0, null)
+      proc!.emit('close', 0, null)
+      await vi.waitFor(() => expect(_runningSessions.has(ID)).toBe(false), { timeout: 10_000 })
+    })
+
+    const missesOverride = (args: unknown[]): boolean =>
+      (args[8] as string[]).includes('--constraint')
+
+    it('hands a cache miss of the override to the background download, for this install', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = () => ({ code: 2, output: '' })
+      vi.spyOn(i18nModule, 't').mockImplementation(((key: string) => key) as never)
+
+      await launchAndPrint()
+
+      expect(
+        progress.filter((p) => p.phase === 'agentRequirements').at(-1),
+        "core's agent runs now; only the newer version waits"
+      ).toMatchObject({ status: 'launch.agentRequirements.deferredUpdate' })
+      expect(prefetchHarness.requests).toEqual([
+        {
+          installationId: ID,
+          request: expect.objectContaining({
+            steps: [{ text: OVERRIDDEN, constraints: 'requests>=2.32.0\n' }],
+            signature: 'comfy-agent==0.2.3'
+          })
+        }
+      ])
+    })
+
+    it('shows the failed caption when core file cannot install after the override was deferred', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.installed = JSON.stringify([
+        { name: 'comfy-agent', version: '0.1.0' },
+        { name: 'comfy-cli', version: '1.20.0' },
+        { name: 'requests', version: '2.32.0' }
+      ])
+      pipHarness.respond = (args) =>
+        missesOverride(args)
+          ? { code: 2, output: 'error: Failed to fetch: `comfy-agent`\n' }
+          : { code: 1, output: 'error: No solution found when resolving dependencies\n' }
+      vi.spyOn(i18nModule, 't').mockImplementation(((key: string) => key) as never)
+
+      await launchAndPrint()
+
+      expect(
+        progress
+          .filter((p) => p.phase === 'agentRequirements')
+          .map((p) => (p as { status?: string }).status),
+        "the deferral's caption is replaced: core's agent is not running either"
+      ).toEqual(expect.arrayContaining(['launch.agentRequirements.deferredUpdate']))
+      expect(progress.filter((p) => p.phase === 'agentRequirements').at(-1)).toMatchObject({
+        status: 'launch.agentRequirements.failed'
+      })
+      expect(overrideEvents()).toEqual([
+        expect.objectContaining({ decision: 'deferred', reason: 'not_cached' })
+      ])
+      expect(
+        prefetchHarness.requests,
+        "the override's download is still handed back: core's failure does not cancel it"
+      ).toEqual([
+        {
+          installationId: ID,
+          request: expect.objectContaining({
+            steps: [{ text: OVERRIDDEN, constraints: 'requests>=2.32.0\n' }],
+            signature: 'comfy-agent==0.2.3'
+          })
+        }
+      ])
+    })
+
+    it('keeps trying a version that is not cached yet, without latching it', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = (args) => {
+        installed.push(fs.readFileSync(args[0] as string, 'utf-8'))
+        return { code: missesOverride(args) ? 2 : 0, output: '' }
+      }
+
+      await launchAndPrint()
+      await launchAndPrint()
+      installed = []
+      await launchAndPrint()
+
+      expect(
+        installed,
+        "not latched, so it is tried again: the cache check, the network, then core file's check and install"
+      ).toEqual([OVERRIDDEN, OVERRIDDEN, CORE_FILE, CORE_FILE])
+      expect(overrideState()).toBeUndefined()
+      expect(prefetchHarness.requests.map((r) => r.request)).toEqual(
+        Array(3).fill(
+          expect.objectContaining({
+            steps: [expect.objectContaining({ text: OVERRIDDEN })],
+            signature: 'comfy-agent==0.2.3'
+          })
+        )
+      )
+    })
+
+    it('never retires a version uv finds no solution for: an index may not have synced it yet', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = (args) => ({
+        code: missesOverride(args) ? 1 : 0,
+        output: missesOverride(args) ? 'error: No solution found when resolving dependencies\n' : ''
+      })
+
+      await launchAndPrint()
+      await launchAndPrint()
+      await launchAndPrint()
+
+      expect(overrideEvents().map((e) => [e.decision, e.reason, e.failures])).toEqual([
+        ['reverted', 'resolve_failed', null],
+        ['reverted', 'resolve_failed', null],
+        ['reverted', 'resolve_failed', null]
+      ])
+      expect(overrideEvents()[0]).toMatchObject({
+        exit_code: 1,
+        error_tail: 'error: No solution found when resolving dependencies'
+      })
+      expect(prefetchHarness.requests, 'no download can fix it').toEqual([])
+      expect(overrideState(), 'nothing counted toward retiring it').toBeUndefined()
+    })
+
+    it('retires a version that fails to install on two launches, as before', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = (args) =>
+        missesOverride(args)
+          ? { code: 1, output: 'error: failed to remove file `x.pyd`: Access is denied.\n' }
+          : { code: 0, output: '' }
+
+      await launchAndPrint()
+      await launchAndPrint()
+      installed = []
+      await launchAndPrint()
+
+      expect(overrideEvents().map((e) => [e.decision, e.reason, e.failures])).toEqual([
+        ['reverted', 'install_failed', null],
+        ['reverted', 'install_failed', null],
+        ['reverted', 'install_failed', 2],
+        ['reverted', 'previously_failed', null]
+      ])
+      expect(prefetchHarness.requests, 'no download can fix it').toEqual([])
+      expect(overrideState(), 'install failures, not agent start failures').toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 2,
+        startFailures: 0
+      })
+    })
+
+    it('stops retrying a version whose environment could not be listed twice', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.installed = 'error: no virtual environment found'
+
+      await launchAndPrint()
+      await launchAndPrint()
+      await launchAndPrint()
+
+      expect(overrideEvents().map((e) => [e.decision, e.reason])).toEqual([
+        ['refused', 'check_failed'],
+        ['refused', 'check_failed'],
+        ['reverted', 'check_failed'],
+        ['reverted', 'previously_failed']
+      ])
+    })
+
+    it("reports each deferral with uv's outcome, and never a latch", async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = (args) => ({
+        code: missesOverride(args) ? 2 : 0,
+        output: missesOverride(args) ? 'error: Failed to download `comfy-agent`\n' : ''
+      })
+
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        await launchAndPrint()
+        await launchAndPrint()
+      } finally {
+        vi.useRealTimers()
+      }
+
+      expect(overrideEvents(), 'a frozen clock leaves each network try the whole budget').toEqual(
+        Array(2).fill(
+          expect.objectContaining({
+            decision: 'deferred',
+            reason: 'not_cached',
+            failures: null,
+            install_outcome: 'exited',
+            exit_code: 2,
+            budget_ms: 20_000,
+            error_tail: 'error: Failed to download `comfy-agent`',
+            index: 'pypi'
+          })
+        )
+      )
+    })
+
+    it("stops the install's background download before its own uv, and hands the miss back after", async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      const order: string[] = []
+      pipHarness.respond = (args) => {
+        if (String(args[4]).startsWith('.agent-prefetch-')) {
+          const signal = args[6] as AbortSignal
+          if (signal.aborted) return { code: 1, output: '' }
+          return new Promise((resolve) =>
+            signal.addEventListener('abort', () => {
+              order.push('background stopped')
+              resolve({ code: 1, output: '' })
+            })
+          ) as never
+        }
+        order.push('launch uv')
+        return { code: missesOverride(args) ? 2 : 0, output: '' }
+      }
+      const accepted: boolean[] = []
+      prefetchHarness.onStart = (request) =>
+        accepted.push(prefetchAgentRequirements(request as PrefetchRequest, () => {}))
+      const background: PrefetchRequest = {
+        plan: {
+          reqPath: agentReqPath(),
+          uvPath: getUvPath(installDir),
+          pythonPath: getVenvPythonPath(installDir),
+          installPath: installDir
+        },
+        steps: [{ text: CORE_FILE }],
+        signature: 'core',
+        eager: true
+      }
+      try {
+        expect(prefetchAgentRequirements(background, () => {})).toBe(true)
+        await vi.waitFor(() => expect(pipHarness.calls).toHaveLength(1))
+
+        await launchAndPrint()
+
+        expect(order[0], 'the download lets go of the environment first').toBe('background stopped')
+        expect(order.slice(1).length, 'then the launch installs').toBeGreaterThan(0)
+        expect(
+          accepted,
+          "the miss is handed over once the launch's own hold is gone, so it is not dropped"
+        ).toEqual([true])
+      } finally {
+        stopAgentPrefetches()
+        ;(await holdAgentPrefetch(installDir))()
+        _resetAgentPrefetchesForTest()
+      }
+    })
+
+    it("starts the handed-back download only once the launch's frontend restore is done", async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.records!.set(ID, { id: ID, frontendVersionOverride: { version: '1.55.19' } })
+      fs.writeFileSync(
+        path.join(installDir, 'ComfyUI', 'requirements.txt'),
+        'comfyui-frontend-package==1.55.18\n'
+      )
+      const order: string[] = []
+      pipHarness.respond = (args) => {
+        if (String(args[4]).startsWith('.launch-frontend-restore-')) {
+          return new Promise((resolve) =>
+            setTimeout(() => {
+              order.push('frontend restored')
+              resolve({ code: 0, output: '' })
+            }, 0)
+          ) as never
+        }
+        return { code: missesOverride(args) ? 2 : 0, output: '' }
+      }
+      prefetchHarness.onStart = () => order.push('download started')
+
+      await launchAndPrint()
+
+      expect(
+        order,
+        "the background download's uv would contend with the restore for the environment"
+      ).toEqual(['frontend restored', 'download started'])
+    })
+
+    it('holds the background download off through a frontend restore on a launch without the agent', async () => {
+      launchHarness.records!.set(ID, { id: ID, frontendVersionOverride: { version: '1.55.19' } })
+      fs.writeFileSync(
+        path.join(installDir, 'ComfyUI', 'requirements.txt'),
+        'comfyui-frontend-package==1.55.18\n'
+      )
+      const order: string[] = []
+      let refusedDuringRestore: boolean | undefined
+      const background: PrefetchRequest = {
+        plan: {
+          reqPath: agentReqPath(),
+          uvPath: getUvPath(installDir),
+          pythonPath: getVenvPythonPath(installDir),
+          installPath: installDir
+        },
+        steps: [{ text: CORE_FILE }],
+        signature: 'core',
+        eager: true
+      }
+      pipHarness.respond = (args) => {
+        if (String(args[4]).startsWith('.agent-prefetch-')) {
+          const signal = args[6] as AbortSignal
+          if (signal.aborted) return { code: 1, output: '' }
+          return new Promise((resolve) =>
+            signal.addEventListener('abort', () => {
+              order.push('background stopped')
+              resolve({ code: 1, output: '' })
+            })
+          ) as never
+        }
+        if (String(args[4]).startsWith('.launch-frontend-restore-')) {
+          order.push('frontend restore')
+          refusedDuringRestore = !prefetchAgentRequirements(background, () => {})
+        }
+        return { code: 0, output: '' }
+      }
+      try {
+        expect(prefetchAgentRequirements(background, () => {})).toBe(true)
+        await vi.waitFor(() => expect(pipHarness.calls).toHaveLength(1))
+
+        await launchAndPrint()
+
+        expect(order, "the restore's uv works on the same environment").toEqual([
+          'background stopped',
+          'frontend restore'
+        ])
+        expect(refusedDuringRestore, 'and none starts while it runs').toBe(true)
+      } finally {
+        stopAgentPrefetches()
+        ;(await holdAgentPrefetch(installDir))()
+        _resetAgentPrefetchesForTest()
+      }
+    })
+
+    it('still hands a deferred override back when the launch is cancelled during core file', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.launchCommand = launchCommand()
+      let overrideMissed = false
+      pipHarness.respond = (args) => {
+        if (missesOverride(args)) {
+          overrideMissed ||= (args[8] as string[]).includes('--dry-run')
+          return { code: 2, output: '' }
+        }
+        if (overrideMissed) _operationAborts.get(ID)?.abort()
+        return { code: 0, output: '' }
+      }
+      const ctx = ctxFor(ID)
+      ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+
+      expect(await handleLaunch(ctx)).toEqual({ ok: false, cancelled: true })
+      expect(overrideMissed, 'the cancel came after the override was deferred').toBe(true)
+      expect(
+        prefetchHarness.requests,
+        'what the launch handed back is not dropped with it'
+      ).toEqual([
+        {
+          installationId: ID,
+          request: expect.objectContaining({ signature: 'comfy-agent==0.2.3' })
+        }
+      ])
+    })
+
+    it('still hands the download back when the launch is cancelled during the frontend restore', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.launchCommand = launchCommand()
+      launchHarness.records!.set(ID, { id: ID, frontendVersionOverride: { version: '1.55.19' } })
+      fs.writeFileSync(
+        path.join(installDir, 'ComfyUI', 'requirements.txt'),
+        'comfyui-frontend-package==1.55.18\n'
+      )
+      pipHarness.respond = (args) => {
+        if (String(args[4]).startsWith('.launch-frontend-restore-')) {
+          _operationAborts.get(ID)?.abort()
+          return { code: 1, output: '' }
+        }
+        return { code: missesOverride(args) ? 2 : 0, output: '' }
+      }
+      const ctx = ctxFor(ID)
+      ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+
+      expect(await handleLaunch(ctx)).toEqual({ ok: false, cancelled: true })
+      expect(
+        prefetchHarness.requests,
+        'what the launch handed back is not dropped with it'
+      ).toEqual([
+        {
+          installationId: ID,
+          request: expect.objectContaining({ signature: 'comfy-agent==0.2.3' })
+        }
+      ])
+    })
+
+    it.skipIf(process.platform === 'win32')(
+      'clears what a killed Desktop left running in this install before its own install',
+      async () => {
+        serveCampaign({ 'comfy-agent': '0.2.3' })
+        const record = path.join(installDir, `.agent-uv-${2 ** 22 + 1}.json`)
+        fs.writeFileSync(record, JSON.stringify({ pid: 2 ** 22 + 1, startedAt: Date.now() }))
+        const seenAtInstall: boolean[] = []
+        pipHarness.respond = () => {
+          seenAtInstall.push(fs.existsSync(record))
+          return { code: 0, output: '' }
+        }
+
+        await launchAndPrint()
+
+        expect(
+          seenAtInstall[0],
+          'the reaper ran first: an orphan would hold the lock this install waits on'
+        ).toBe(false)
+      }
+    )
+
+    it('watches no agent start for an override that is not cached', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      pipHarness.respond = (args) => ({ code: missesOverride(args) ? 2 : 0, output: '' })
+
+      await launchAndPrint({ lines: ['[agent-event] agent_error reason=crashed'] })
+
+      expect(overrideState(), "core's own agent failing is not the override's").toBeUndefined()
+    })
+
+    it('leaves the latch alone when the launch is cancelled during the override', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.launchCommand = launchCommand()
+      pipHarness.duringInstall = () => _operationAborts.get(ID)?.abort()
+      pipHarness.respond = () => ({ code: 1, output: '' })
+      const ctx = ctxFor(ID)
+      ctx.inst = { ...harnessInstall(), ...launchHarness.records!.get(ID), id: ID } as never
+
+      expect(await handleLaunch(ctx)).toEqual({ ok: false, cancelled: true })
+      await settle()
+      expect(overrideState(), 'a cancel is not a failed install').toBeUndefined()
+      expect(overrideEvents(), 'a cancelled launch reports no decision').toEqual([])
+    })
+
+    it('still launches when the outcome cannot be recorded', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+      launchHarness.recordsUpdateThrows = true
+      const warn = vi.spyOn(console, 'warn')
+
+      await launchAndPrint({ lines: ['[agent-event] agent_error reason=crashed'] })
+
+      expect(warn).toHaveBeenCalledWith(
+        'agent requirements override: could not record the outcome:',
+        expect.any(Error)
+      )
+    })
+
+    it('reads the agent lines core logs to stdout too', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint({
+        lines: ['[agent-event] health_check_failed reason=crashed'],
+        stream: 'stdout'
+      })
+
+      expect(overrideState()).toEqual({
+        signature: 'comfy-agent==0.2.3',
+        failures: 1,
+        startFailures: 1
+      })
+    })
+
+    it('does not count an agent that exits during a slow start', async () => {
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      for (let i = 0; i < 3; i++) {
+        await launchAndPrint({
+          lines: [
+            '[agent-event] agent_starting agent_version=0.2.3',
+            '[agent-event] agent_waiting duration_ms=60000',
+            '[agent-event] agent_exited code=0'
+          ]
+        })
+      }
+
+      expect(overrideState()).toBeUndefined()
+      expect(installed.at(-1)).toBe(OVERRIDDEN)
+    })
+
+    it('counts no start failure against an override that did not go in', async () => {
+      fs.writeFileSync(agentReqPath(), 'comfy-agent>=0.1\ncomfy-cli==1.21.0\n')
+      serveCampaign({ 'comfy-agent': '0.2.3' })
+
+      await launchAndPrint({ lines: ['[agent-event] agent_error reason=spawn_failed'] })
+
+      expect(overrideEvents()).toEqual([
+        expect.objectContaining({ decision: 'refused', reason: 'unsupported_line' })
+      ])
+      expect(overrideState()).toBeUndefined()
+    })
+
+    describe("with a frontend the last override put in, and core's placeholder agent", () => {
+      const recordedFrontend = (): unknown =>
+        (launchHarness.records!.get(ID) as { frontendVersionOverride?: unknown })
+          .frontendVersionOverride
+
+      beforeEach(() => {
+        fs.writeFileSync(agentReqPath(), 'comfy-agent==0.0.0.dev0\ncomfy-cli==1.21.0\n')
+        fs.writeFileSync(
+          path.join(installDir, 'ComfyUI', 'requirements.txt'),
+          'comfyui-frontend-package==1.57.4\n'
+        )
+        launchHarness.records!.set(ID, { id: ID, frontendVersionOverride: { version: '1.60.2' } })
+        pipHarness.installed = JSON.stringify([
+          { name: 'comfy-agent', version: '0.1.0rc5' },
+          { name: 'comfy-cli', version: '1.21.0' },
+          { name: 'comfyui-frontend-package', version: '1.60.2' }
+        ])
+      })
+
+      it.each([
+        [
+          'fails to install',
+          { 'comfy-agent': '0.2.3' },
+          'install_failed',
+          () =>
+            (pipHarness.respond = (args) =>
+              missesOverride(args)
+                ? { code: 1, output: 'error: failed to remove file `x.pyd`: Access is denied.\n' }
+                : { code: 0, output: '' })
+        ],
+        ['is refused', { 'not-an-agent-package': '1.0.0' }, 'unknown_package', () => {}],
+        [
+          'is not downloaded yet',
+          { 'comfy-agent': '0.2.3' },
+          'not_cached',
+          () =>
+            (pipHarness.respond = (args) => ({ code: missesOverride(args) ? 2 : 0, output: '' }))
+        ]
+      ])(
+        'keeps the installed frontend with the kept agent when the override %s',
+        async (_label, override, reason, arrange) => {
+          serveCampaign(override)
+          arrange()
+
+          await launchAndPrint()
+
+          expect(spawnArgs).toContain('--enable-agent')
+          expect(overrideEvents()).toEqual([
+            expect.objectContaining({ reason, kept_agent: 'comfy-agent==0.1.0rc5' })
+          ])
+          expect(frontendRestores(), "core's 1.57.4 is not put back").toEqual([])
+          expect(
+            recordedFrontend(),
+            'so a later launch without the agent still restores it'
+          ).toEqual({ version: '1.60.2' })
+          expect(sent.join('')).toContain(
+            'Keeping the installed comfyui-frontend-package with the agent'
+          )
+        }
+      )
+
+      it("keeps it even when it is older than core's own pin", async () => {
+        launchHarness.records!.set(ID, { id: ID, frontendVersionOverride: { version: '1.55.0' } })
+        pipHarness.installed = JSON.stringify([
+          { name: 'comfy-agent', version: '0.1.0rc5' },
+          { name: 'comfyui-frontend-package', version: '1.55.0' }
+        ])
+        serveCampaign({ 'not-an-agent-package': '1.0.0' })
+
+        await launchAndPrint()
+
+        expect(frontendRestores(), 'it is the frontend the kept agent was shipped with').toEqual([])
+        expect(recordedFrontend()).toEqual({ version: '1.55.0' })
+      })
+
+      it("puts core's frontend back when no real agent was ever installed", async () => {
+        serveCampaign({ 'not-an-agent-package': '1.0.0' })
+        pipHarness.installed = JSON.stringify([
+          { name: 'comfy-agent', version: '0.0.0.dev0' },
+          { name: 'comfyui-frontend-package', version: '1.60.2' }
+        ])
+
+        await launchAndPrint()
+
+        expect(overrideEvents()).toEqual([expect.objectContaining({ kept_agent: null })])
+        expect(frontendRestores()).toHaveLength(1)
+        expect(recordedFrontend()).toBeUndefined()
+      })
+
+      it('installs no frontend when no override ever moved it', async () => {
+        launchHarness.records!.set(ID, { id: ID })
+        serveCampaign({ 'not-an-agent-package': '1.0.0' })
+
+        await launchAndPrint()
+
+        expect(overrideEvents()).toEqual([
+          expect.objectContaining({ kept_agent: 'comfy-agent==0.1.0rc5' })
+        ])
+        expect(frontendRestores()).toEqual([])
+        expect(sent.join('')).not.toContain('Keeping the installed comfyui-frontend-package')
+      })
+    })
+  })
+  describe("a member whose campaign flag didn't answer in time", () => {
+    const KEY = 'desktop_core_beta_agent'
+    const member = { [KEY]: { '--enable-agent': { epoch: 1, enrolledAt: 1 } } }
+    const keptEvents = (): unknown[] =>
+      vi
+        .mocked(telemetry.emit)
+        .mock.calls.filter(
+          ([name, props]) =>
+            name === 'comfy.desktop.agent_requirements_override' &&
+            (props as Record<string, unknown>).decision === 'kept_installed'
+        )
+        .map(([, props]) => props)
+
+    beforeEach(() => {
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen'],
+        cwd: installDir,
+        skipPortWait: true
+      }
+      fs.writeFileSync(agentReqPath(), 'comfy-agent==0.0.0.dev0\n')
+      launchHarness.campaigns = {
+        registry: [{ key: KEY, args: ['--enable-agent'] }],
+        answers: new Map()
+      }
+      launchHarness.campaignRecords = member
+      pipHarness.installed = JSON.stringify([{ name: 'comfy-agent', version: '0.1.0rc5' }])
+    })
+
+    afterEach(() => {
+      launchHarness.campaigns = { registry: [], answers: new Map() }
+      launchHarness.campaignRecords = {}
+      pipHarness.installed = '[]'
+    })
+
+    it('keeps the installed agent on, installing nothing', async () => {
+      const res = await handleLaunch(ctxFor('agent-no-answer-kept'))
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs).toContain('--enable-agent')
+      expect(pipHarness.calls, "neither core's placeholder nor anything else").toEqual([])
+      expect(keptEvents()).toEqual([
+        expect.objectContaining({
+          reason: 'no_answer',
+          pins: null,
+          kept_agent: 'comfy-agent==0.1.0rc5'
+        })
+      ])
+      expect(sent.join('')).toContain('keeping the installed agent comfy-agent==0.1.0rc5')
+    })
+
+    it('leaves the agent off on a core whose schema has no --enable-agent', async () => {
+      launchHarness.schemaNames = ['listen', 'feature-flag']
+
+      await handleLaunch(ctxFor('agent-no-answer-old-core'))
+
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(keptEvents()).toEqual([])
+    })
+
+    it('installs as before when the user typed --enable-agent themselves', async () => {
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--enable-agent', '--listen'],
+        cwd: installDir,
+        skipPortWait: true
+      }
+
+      await handleLaunch(ctxFor('agent-no-answer-hand-typed'))
+
+      expect(spawnArgs.filter((arg) => arg === '--enable-agent')).toHaveLength(1)
+      expect(keptEvents(), 'the install step decides, not the no-answer path').toEqual([])
+      expect(pipHarness.calls).toHaveLength(1)
+    })
+
+    it('leaves the agent off when the installed version is one that failed to start', async () => {
+      const ctx = ctxFor('agent-no-answer-start-failed')
+      ctx.inst = {
+        ...ctx.inst,
+        agentRequirementsOverride: {
+          signature: 'comfy-agent==0.1.0rc5',
+          failures: 2,
+          startFailures: 2
+        }
+      } as InstallationRecord
+
+      await handleLaunch(ctx)
+
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(keptEvents()).toEqual([])
+    })
+
+    it('leaves the agent off when only the placeholder is installed', async () => {
+      pipHarness.installed = JSON.stringify([{ name: 'comfy-agent', version: '0.0.0.dev0' }])
+
+      await handleLaunch(ctxFor('agent-no-answer-placeholder'))
+
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(keptEvents()).toEqual([])
+    })
+
+    it.each([
+      ['the campaign is unlisted', () => (launchHarness.campaigns.registry = [])],
+      [
+        'the campaign serves false',
+        () => launchHarness.campaigns.answers.set(KEY, parseCampaignAnswer(false, null, Date.now()))
+      ]
+    ])('leaves the agent off when %s, which is a revoke', async (_label, revoke) => {
+      revoke()
+
+      await handleLaunch(ctxFor('agent-no-answer-revoked'))
+
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(keptEvents()).toEqual([])
+    })
+
+    it("leaves the agent off when the user opted out, even with a flag this core doesn't list", async () => {
+      launchHarness.launchCommand = {
+        cmd: process.execPath,
+        args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen', '--disable-agent'],
+        cwd: installDir,
+        skipPortWait: true
+      }
+      await handleLaunch(ctxFor('agent-no-answer-opted-out'))
+
+      expect(spawnArgs).not.toContain('--enable-agent')
+      expect(keptEvents()).toEqual([])
+    })
+
+    describe('with a frontend a previous override put in', () => {
+      const withFrontend = (id: string): ActionContext => {
+        const ctx = ctxFor(id)
+        ctx.inst = { ...ctx.inst, frontendVersionOverride: { version: '1.60.2' } } as never
+        return ctx
+      }
+
+      beforeEach(() => {
+        fs.writeFileSync(
+          path.join(installDir, 'ComfyUI', 'requirements.txt'),
+          'comfyui-frontend-package==1.57.4\n'
+        )
+      })
+
+      it('keeps that frontend with the kept agent', async () => {
+        await handleLaunch(withFrontend('agent-no-answer-kept-frontend'))
+
+        expect(spawnArgs).toContain('--enable-agent')
+        expect(frontendRestores()).toEqual([])
+        expect(sent.join('')).toContain(
+          'Keeping the installed comfyui-frontend-package with the agent'
+        )
+      })
+
+      it("puts core's frontend back when the user opted out of the agent", async () => {
+        launchHarness.launchCommand = {
+          cmd: process.execPath,
+          args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen', '--disable-agent'],
+          cwd: installDir,
+          skipPortWait: true
+        }
+
+        await handleLaunch(withFrontend('agent-no-answer-opted-out-frontend'))
+
+        expect(spawnArgs).not.toContain('--enable-agent')
+        expect(frontendRestores()).toHaveLength(1)
+      })
+    })
+  })
+})
+
+describe('agent install status strings', () => {
+  const strings = (en as { launch: { agentRequirements?: Record<string, string> } }).launch
+    .agentRequirements
+
+  it('defines every key the mapper asks for', () => {
+    expect(Object.keys(strings ?? {}).sort()).toEqual(['deferred', 'deferredUpdate', 'failed'])
+  })
+})
+
+describe('launchedCoreCommit', () => {
+  const RECORDED = '61E5E3B5A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4'
+  const LIVE = 'AB'.repeat(20)
+  const inst = { comfyVersion: { commit: RECORDED } } as unknown as InstallationRecord
+
+  it('names the live HEAD over the record', () => {
+    expect(launchedCoreCommit(inst, { kind: 'head', commit: LIVE })).toBe(LIVE.toLowerCase())
+  })
+
+  it("falls back to the record's commit on a not-git install", () => {
+    expect(launchedCoreCommit(inst, { kind: 'not-git' })).toBe(RECORDED.toLowerCase())
+    expect(launchedCoreCommit({} as InstallationRecord, { kind: 'not-git' })).toBeNull()
+  })
+
+  it.each([
+    ['a short ref', 'abc123'],
+    ['a symbolic ref', 'ref: refs/heads/master'],
+    ['oversized garbage', 'f'.repeat(4096)]
+  ])('names nothing for a HEAD holding %s rather than a full SHA', (_label, commit) => {
+    expect(launchedCoreCommit(inst, { kind: 'head', commit })).toBeNull()
+  })
+
+  it('names nothing for a git checkout whose HEAD would not read', () => {
+    expect(
+      launchedCoreCommit(inst, { kind: 'unreadable' }),
+      'the record may be what went stale'
+    ).toBeNull()
+  })
+})
+
+describe('prior ComfyUI process handling at launch', () => {
+  const PORT = 48300
+  let installDir = ''
+  let events: { event: string; properties?: Record<string, unknown> }[] = []
+  let children: FakeChild[] = []
+
+  const install = (): InstallationRecord =>
+    ({
+      id: 'prior-inst',
+      name: 'Prior',
+      sourceId: 'harness-source',
+      installPath: installDir,
+      version: '0.3.81',
+      comfyVersion: {
+        commit: '61e5e3b5a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
+        baseTag: 'v0.3.81',
+        commitsAhead: 0,
+        baseTagVerified: true
+      }
+    }) as unknown as InstallationRecord
+
+  const ctxFor = (
+    installationId: string,
+    actionData: Record<string, unknown> = {}
+  ): ActionContext => ({
+    event: {
+      sender: { isDestroyed: () => false, send: () => {} }
+    } as unknown as Electron.IpcMainInvokeEvent,
+    installationId,
+    inst: install(),
+    actionData
+  })
+
+  function fakeChild(): FakeChild {
+    const proc = new EventEmitter() as FakeChild
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.pid = 4343
+    proc.killed = false
+    proc.kill = () => true
+    return proc
+  }
+
+  const setArgs = (...extra: string[]): void => {
+    launchHarness.launchCommand = {
+      cmd: process.execPath,
+      args: ['-s', path.join(installDir, 'ComfyUI', 'main.py'), '--listen', ...extra],
+      cwd: installDir,
+      skipPortWait: false,
+      port: PORT
+    }
+  }
+
+  const eventsNamed = (name: string): Array<Record<string, unknown> | undefined> =>
+    events.filter((e) => e.event === name).map((e) => e.properties)
+
+  beforeEach(() => {
+    installDir = fs.mkdtempSync(path.join(os.tmpdir(), 'prior-process-launch-'))
+    fs.mkdirSync(path.join(installDir, 'ComfyUI'), { recursive: true })
+    events = []
+    children = []
+    launchHarness.schemaThrows = false
+    launchHarness.registryThrows = false
+    launchHarness.betaEnabled = false
+    launchHarness.betaEnabledThrows = false
+    launchHarness.readSettled = null
+    launchHarness.schemaNames = ['enable-assets', 'listen', 'port']
+    launchHarness.grants = []
+    launchHarness.duringResourceAcquire = null
+    launchHarness.busyPorts = []
+    launchHarness.busyPids = [31337]
+    launchHarness.portLockPid = null
+    launchHarness.portFreeWaits = []
+    launchHarness.killExits = true
+    launchHarness.waitForPort = async () => {}
+    launchHarness.spawn = () => {
+      const child = fakeChild()
+      children.push(child)
+      return child
+    }
+    ownership.prior = null
+    ownership.priorCalls = []
+    ownership.priorThrows = false
+    ownership.onResolve = null
+    ownership.holderIsInstall = false
+    ownership.tracked = []
+    setArgs('--enable-assets')
+    const record = ((event: string, properties?: Record<string, unknown>) => {
+      events.push({ event, properties })
+    }) as unknown
+    vi.spyOn(telemetry, 'emit').mockImplementation(record as typeof telemetry.emit)
+    vi.spyOn(telemetry, 'capture').mockImplementation(record as typeof telemetry.capture)
+  })
+
+  afterEach(() => {
+    for (const id of [..._runningSessions.keys()]) _runningSessions.delete(id)
+    _pendingPorts.clear()
+    launchHarness.busyPorts = null
+    launchHarness.killExits = true
+    vi.restoreAllMocks()
+    fs.rmSync(installDir, { recursive: true, force: true })
+  })
+
+  const terminated = {
+    action: 'terminated',
+    proof: 'desktop_record',
+    pid: 777,
+    port: PORT,
+    ageMs: 60_000,
+    waitMs: 40,
+    exitedInTime: true,
+    blocked: null
+  }
+
+  it('records every spawn under the session key, joined to the boot id', async () => {
+    const res = await handleLaunch(ctxFor('prior-records'))
+
+    expect(res.ok).toBe(true)
+    expect(ownership.priorCalls).toEqual([
+      { sessionKey: 'prior-records', opts: expect.objectContaining({ stopBusy: false }) }
+    ])
+    expect(ownership.tracked).toHaveLength(1)
+    const [started] = eventsNamed('comfy.desktop.comfyui.boot_started')
+    expect(ownership.tracked[0]).toMatchObject({
+      sessionKey: 'prior-records',
+      installationId: 'prior-records',
+      installPath: installDir,
+      port: PORT,
+      bootId: started?.boot_id
+    })
+    expect(started?.port_bumped_from).toBeNull()
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')).toHaveLength(0)
+  })
+
+  it('reports a terminated orphan and launches on the port it freed', async () => {
+    ownership.prior = terminated
+
+    const res = await handleLaunch(ctxFor('prior-terminated'))
+
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(PORT)
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')).toEqual([
+      {
+        installation_id: 'prior-terminated',
+        action: 'terminated',
+        proof: 'desktop_record',
+        age_ms: 60_000,
+        wait_ms: 40,
+        exited_in_time: true,
+        busy_override: false,
+        lingering_count: 0,
+        queue_unknown: false
+      }
+    ])
+  })
+
+  it('waits for a stopped orphan to release its port instead of moving to the next one', async () => {
+    ownership.prior = terminated
+    launchHarness.busyPorts = [PORT]
+
+    const res = await handleLaunch(ctxFor('prior-port-lingers'))
+
+    expect(launchHarness.portFreeWaits).toEqual([PORT])
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(PORT)
+    const [started] = eventsNamed('comfy.desktop.comfyui.boot_started')
+    expect(started).toMatchObject({ port: PORT, port_bumped_from: null })
+  })
+
+  it('does not wait on the port of a process that is still there', async () => {
+    ownership.prior = { ...terminated, action: 'left', exitedInTime: false }
+
+    await handleLaunch(ctxFor('prior-left-no-wait'))
+
+    expect(launchHarness.portFreeWaits).toEqual([])
+  })
+
+  it('names the process holding the port, not only the recorded launcher, when refusing', async () => {
+    ownership.prior = { ...terminated, pid: 11944, exitedInTime: false, blocked: 'stuck' }
+    launchHarness.busyPorts = [PORT]
+    launchHarness.busyPids = [17348]
+    const t = vi.spyOn(i18nModule, 't')
+
+    await handleLaunch(ctxFor('prior-stuck-holder'))
+
+    expect(t).toHaveBeenCalledWith('errors.priorProcessStuck', { pid: '11944, 17348' })
+  })
+
+  it('leaves a busy orphan alone and hands the choice to the user without spawning', async () => {
+    ownership.prior = {
+      ...terminated,
+      action: 'busy_left',
+      exitedInTime: false,
+      blocked: 'busy',
+      queue: { running: 1, pending: 2 }
+    }
+
+    const res = await handleLaunch(ctxFor('prior-busy'))
+
+    expect(res.ok).toBe(false)
+    expect(res.portConflict).toEqual({ port: PORT, pids: [777], isComfy: true, priorBusy: true })
+    expect(children).toHaveLength(0)
+    expect(_operationAborts.has('prior-busy')).toBe(false)
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')[0]).toMatchObject({
+      action: 'busy_left'
+    })
+  })
+
+  it('asks the user about an orphan that never answered, with its own message', async () => {
+    ownership.prior = {
+      ...terminated,
+      action: 'busy_left',
+      exitedInTime: false,
+      blocked: 'busy',
+      queueUnknown: true
+    }
+
+    const res = await handleLaunch(ctxFor('prior-unknown'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.priorProcessUnresponsive')
+    expect(res.portConflict).toEqual({
+      port: PORT,
+      pids: [777],
+      isComfy: true,
+      priorBusy: true,
+      priorUnknown: true
+    })
+    expect(children).toHaveLength(0)
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')[0]).toMatchObject({
+      action: 'busy_left',
+      queue_unknown: true
+    })
+  })
+
+  it('reports a cancel during the busy check as cancelled, whatever the check found', async () => {
+    ownership.prior = { ...terminated, action: 'busy_left', exitedInTime: false, blocked: 'busy' }
+    ownership.onResolve = () => _operationAborts.get('prior-cancel-during-probe')?.abort()
+    const res = await handleLaunch(ctxFor('prior-cancel-during-probe'))
+
+    expect(res).toMatchObject({ ok: false, cancelled: true })
+    expect(children).toHaveLength(0)
+  })
+
+  it('names the survivors when they serve no port, with their own prompt', async () => {
+    ownership.prior = {
+      ...terminated,
+      action: 'busy_left',
+      exitedInTime: false,
+      blocked: 'busy',
+      queueUnknown: true,
+      survivorPids: [555, 556]
+    }
+
+    const res = await handleLaunch(ctxFor('prior-survivors'))
+
+    expect(res.message).toBe('errors.priorSurvivorsRunning')
+    expect(res.portConflict).toEqual({
+      port: PORT,
+      pids: [555, 556],
+      isComfy: true,
+      priorBusy: true,
+      priorUnknown: true,
+      priorSurvivors: true
+    })
+  })
+
+  it('passes the user choice to stop a busy orphan through to the check', async () => {
+    await handleLaunch(ctxFor('prior-stop-busy', { stopBusyPriorProcess: true }))
+
+    expect(ownership.priorCalls[0]?.opts).toMatchObject({ stopBusy: true })
+  })
+
+  it('refuses to launch beside an orphan that outlived the kill', async () => {
+    ownership.prior = { ...terminated, exitedInTime: false, blocked: 'stuck' }
+
+    const res = await handleLaunch(ctxFor('prior-stuck'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.priorProcessStuck')
+    expect(res.portConflict).toBeUndefined()
+    expect(children).toHaveLength(0)
+  })
+
+  it('refuses to launch beside an orphan it could not re-verify', async () => {
+    ownership.prior = { ...terminated, action: 'left', exitedInTime: false, blocked: 'unverified' }
+
+    const res = await handleLaunch(ctxFor('prior-unverified'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.priorProcessUnverified')
+    expect(children).toHaveLength(0)
+  })
+
+  it('names only the port holder when an owed exit scan blocks the launch', async () => {
+    ownership.prior = {
+      ...terminated,
+      action: 'left',
+      exitedInTime: false,
+      blocked: 'unverified',
+      scanOwed: true
+    }
+
+    const res = await handleLaunch(ctxFor('prior-scan-owed'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toMatch(/^errors\.priorScanUnavailable(Pid)?$/)
+    expect(children).toHaveLength(0)
+  })
+
+  it('says to try again later when an owed scan blocks right after the exit', async () => {
+    ownership.prior = {
+      ...terminated,
+      action: 'left',
+      exitedInTime: false,
+      blocked: 'unverified',
+      scanOwed: true,
+      scanRecent: true
+    }
+
+    const res = await handleLaunch(ctxFor('prior-scan-recent'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.priorScanRecent')
+    expect(children).toHaveLength(0)
+  })
+
+  it('reports a left process once, even when it is also the port holder', async () => {
+    ownership.prior = { ...terminated, action: 'left', exitedInTime: false, blocked: null }
+    launchHarness.busyPorts = [PORT]
+    ownership.holderIsInstall = true
+
+    const res = await handleLaunch(ctxFor('prior-left-holder'))
+
+    expect(res.portConflict).toEqual({ port: PORT, pids: [31337], isComfy: true })
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')).toHaveLength(1)
+  })
+
+  it('launches as before when the check itself fails', async () => {
+    ownership.priorThrows = true
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const res = await handleLaunch(ctxFor('prior-throws'))
+
+    expect(res.ok).toBe(true)
+    expect(children).toHaveLength(1)
+  })
+
+  it('does not bump past its own install when assets make a second copy fatal', async () => {
+    launchHarness.busyPorts = [PORT]
+    ownership.holderIsInstall = true
+
+    const res = await handleLaunch(ctxFor('prior-same-install'))
+
+    expect(res.ok).toBe(false)
+    expect(res.portConflict).toEqual({ port: PORT, pids: [31337], isComfy: true })
+    expect(res.message).toBe('errors.portConflictSameInstall')
+    expect(children).toHaveLength(0)
+    expect(eventsNamed('comfy.desktop.comfyui.prior_process_found')).toEqual([
+      expect.objectContaining({ action: 'left', proof: 'none', age_ms: null })
+    ])
+  })
+
+  it("recognises this install's ComfyUI from a port lock when no listener can be listed", async () => {
+    launchHarness.busyPorts = [PORT]
+    launchHarness.busyPids = []
+    launchHarness.portLockPid = 40003
+    ownership.holderIsInstall = (pid) => pid === 40003
+
+    const res = await handleLaunch(ctxFor('prior-port-lock'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.portConflictSameInstall')
+    expect(res.portConflict).not.toHaveProperty('nextPort')
+    expect(children).toHaveLength(0)
+  })
+
+  it("finds this install's ComfyUI among several listeners on the port", async () => {
+    launchHarness.busyPorts = [PORT]
+    launchHarness.busyPids = [40001, 40002]
+    ownership.holderIsInstall = (pid) => pid === 40002
+
+    const res = await handleLaunch(ctxFor('prior-second-listener'))
+
+    expect(res.ok).toBe(false)
+    expect(res.portConflict).toEqual({ port: PORT, pids: [40001, 40002], isComfy: true })
+    expect(children).toHaveLength(0)
+  })
+
+  it('does not offer the next port with an explicit --port when the holder is this install', async () => {
+    setArgs('--enable-assets', '--port', String(PORT))
+    launchHarness.launchCommand = { ...launchHarness.launchCommand!, port: PORT }
+    launchHarness.busyPorts = [PORT]
+    ownership.holderIsInstall = true
+
+    const res = await handleLaunch({
+      ...ctxFor('prior-explicit-port'),
+      inst: { ...install(), launchArgs: `--enable-assets --port ${PORT}` } as InstallationRecord
+    })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.portConflictSameInstall')
+    expect(res.portConflict).toEqual({ port: PORT, pids: [31337], isComfy: true })
+    expect(children).toHaveLength(0)
+  })
+
+  it.each([
+    ['assets are off', [], {}, true],
+    ['the holder is not this install', ['--enable-assets'], {}, false],
+    ['the caller asked for a bump', ['--enable-assets'], { autoPortOnConflict: true }, true]
+  ] as const)('bumps as before when %s', async (_why, extra, actionData, sameInstall) => {
+    setArgs(...extra)
+    launchHarness.busyPorts = [PORT]
+    ownership.holderIsInstall = sameInstall
+
+    const res = await handleLaunch(ctxFor('prior-bump', { ...actionData }))
+
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(launchHarness.nextPort)
+    const [started] = eventsNamed('comfy.desktop.comfyui.boot_started')
+    expect(started?.port_bumped_from).toBe(PORT)
+  })
+
+  const neighbourOn = (port: number, proc: ChildProcess | null): void => {
+    _runningSessions.set('neighbour', {
+      proc,
+      port,
+      mode: 'window',
+      installationName: 'Studio',
+      startedAt: Date.now()
+    })
+  }
+
+  it('starts on the next port while the build that owns this one is restarting', async () => {
+    neighbourOn(PORT, fakeChild() as unknown as ChildProcess)
+
+    const res = await handleLaunch(ctxFor('port-of-restarting-neighbour'))
+
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(launchHarness.nextPort)
+    const [started] = eventsNamed('comfy.desktop.comfyui.boot_started')
+    expect(started?.port_bumped_from).toBe(PORT)
+  })
+
+  it('names the restarting build when the installation asks before changing port', async () => {
+    neighbourOn(PORT, fakeChild() as unknown as ChildProcess)
+
+    const res = await handleLaunch({
+      ...ctxFor('port-of-restarting-neighbour-ask'),
+      inst: { ...install(), portConflict: 'ask' } as InstallationRecord
+    })
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.portConflictLauncher')
+    expect(res.portConflict).toEqual({
+      port: PORT,
+      pids: [],
+      isComfy: true,
+      nextPort: launchHarness.nextPort
+    })
+    expect(children).toHaveLength(0)
+  })
+
+  it('does not hold a port for a session that connects to a server Desktop did not start', async () => {
+    neighbourOn(PORT, null)
+
+    const res = await handleLaunch(ctxFor('port-of-remote-neighbour'))
+
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(PORT)
+  })
+
+  it('moves to the next port when an older core on Windows cannot bind', async () => {
+    let attempt = 0
+    launchHarness.waitForPort = async () => {
+      attempt++
+      if (attempt > 1) return
+      const first = children[0]!
+      first.stderr.emit(
+        'data',
+        Buffer.from(
+          `OSError: [Errno 10048] error while attempting to bind on address ('127.0.0.1', ${PORT}): ` +
+            'only one usage of each socket address (protocol/network address/port) is normally permitted\n'
+        )
+      )
+      first.emit('close', 1, null)
+      return new Promise<void>(() => {})
+    }
+
+    const res = await handleLaunch(ctxFor('port-taken-older-windows-core'))
+
+    expect(res.ok).toBe(true)
+    expect(res.port).toBe(launchHarness.nextPort)
+    expect(children).toHaveLength(2)
+  })
+
+  it('waits on the boot with the quiet window and the spawned ComfyUI output clock', async () => {
+    let options: WaitForPortOptions | undefined
+    const stamps: number[] = []
+    launchHarness.waitForPort = async (...args) => {
+      if (options) return
+      options = args[2] as WaitForPortOptions
+      const now = vi.spyOn(Date, 'now').mockReturnValue(5_000_000)
+      children[0]!.stderr.emit('data', Buffer.from('Loading custom node 37 of 120\n'))
+      stamps.push(options?.lastOutputAt?.() ?? -1)
+      now.mockReturnValue(5_060_000)
+      children[0]!.stdout.emit('data', Buffer.from('still importing\n'))
+      stamps.push(options?.lastOutputAt?.() ?? -1)
+      now.mockRestore()
+    }
+
+    const res = await handleLaunch(ctxFor('prior-quiet-window'))
+
+    expect(res.ok).toBe(true)
+    expect(options).toMatchObject({
+      timeoutMs: COMFY_BOOT_TIMEOUT_MS,
+      quietMs: COMFY_BOOT_QUIET_MS
+    })
+    expect(stamps).toEqual([5_000_000, 5_060_000])
+  })
+
+  it('does not retry on top of a failed boot whose process outlived the kill', async () => {
+    launchHarness.killExits = false
+    launchHarness.waitForPort = async () => {
+      const first = children[0]!
+      first.stderr.emit('data', Buffer.from('OSError: [Errno 98] Address already in use\n'))
+      first.emit('close', 1, null)
+      return new Promise<void>(() => {})
+    }
+
+    const res = await handleLaunch(ctxFor('prior-kill-timeout'))
+
+    expect(res.ok).toBe(false)
+    expect(children).toHaveLength(1)
+    expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toHaveLength(1)
+  })
+
+  it('does not blame the database lock when assets are off (ComfyUI only logs it then)', async () => {
+    setArgs()
+    launchHarness.waitForPort = async () => {
+      const first = children[0]!
+      first.stderr.emit(
+        'data',
+        Buffer.from(
+          'Database is locked. Another ComfyUI process is already using this database.\n' +
+            'Traceback (most recent call last):\nRuntimeError: CUDA error\n'
+        )
+      )
+      first.emit('close', 1, null)
+      return new Promise<void>(() => {})
+    }
+
+    const res = await handleLaunch(ctxFor('prior-lock-no-assets'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).not.toBe('errors.comfyDbLocked')
+    const [failed] = eventsNamed('comfy.desktop.comfyui.boot_failed')
+    expect(failed?.error_class).not.toBe('comfyui_db_locked')
+  })
+
+  it('classifies a database-lock boot failure regardless of the last traceback', async () => {
+    launchHarness.waitForPort = async () => {
+      const first = children[0]!
+      first.stderr.emit(
+        'data',
+        Buffer.from(
+          'Database is locked. Another ComfyUI process is already using this database.\n' +
+            'Traceback (most recent call last):\nImportError: custom node noise\n'
+        )
+      )
+      first.emit('close', 1, null)
+      return new Promise<void>(() => {})
+    }
+
+    const res = await handleLaunch(ctxFor('prior-db-locked'))
+
+    expect(res.ok).toBe(false)
+    expect(res.message).toBe('errors.comfyDbLocked')
+    await vi.waitFor(() =>
+      expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toEqual([
+        expect.objectContaining({
+          error_class: 'comfyui_db_locked',
+          lock_holder_pid: null,
+          lock_holder_source: 'unknown',
+          lock_holder_same_install: null,
+          lock_holder_name: null,
+          lock_holder_runs_main_py: null,
+          lock_holder_age_s: null
+        })
+      ])
+    )
+  })
+
+  const failBootWith = (stderr: string, exitCode = 1): void => {
+    launchHarness.waitForPort = async () => {
+      const first = children[0]!
+      first.stderr.emit('data', Buffer.from(stderr))
+      first.emit('close', exitCode, null)
+      return new Promise<void>(() => {})
+    }
+  }
+  const coreRefusal = (kind: string, ...message: string[]): string =>
+    `INFO  [alembic.runtime.migration] Context impl SQLiteImpl.\n` +
+    `\u001b[1m\u001b[31m[ERROR]\u001b[0m ASSETS_STARTUP_FAILED: ${kind}\n` +
+    `${[...message, 'Or start ComfyUI without the assets system: --disable-assets'].join('\n')}\n`
+
+  it('treats an assets-on-by-default core reporting the lock as the lock, without --enable-assets', async () => {
+    setArgs()
+    failBootWith(
+      coreRefusal(
+        'in_use',
+        "Another ComfyUI is already using this database: '/x/user/comfyui.db'.",
+        'Close the other ComfyUI and start this one again.'
+      )
+    )
+
+    const res = await handleLaunch(ctxFor('assets-default-in-use'))
+
+    expect(res.message).toBe('errors.comfyDbLocked')
+    await vi.waitFor(() =>
+      expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toEqual([
+        expect.objectContaining({
+          error_class: 'comfyui_db_locked',
+          assets_startup_failure: 'in_use',
+          lock_holder_source: 'unknown'
+        })
+      ])
+    )
+  })
+
+  it.each([
+    ['corrupt', "The asset database '/x/user/comfyui.db' is corrupt (file is not a database)."],
+    ['locked', "The asset database '/x/user/comfyui.db' is locked by another program."]
+  ])("shows the core's own message for %s instead of the exit code", async (kind, what) => {
+    setArgs()
+    failBootWith(coreRefusal(kind, what, 'Move that file aside and start again.'))
+
+    const res = await handleLaunch(ctxFor(`assets-default-${kind}`))
+
+    expect(res.message).toBe(
+      `${what}\nMove that file aside and start again.\n` +
+        'Or start ComfyUI without the assets system: --disable-assets'
+    )
+    const [failed] = eventsNamed('comfy.desktop.comfyui.boot_failed')
+    expect(failed).toMatchObject({ assets_startup_failure: kind })
+    expect(failed?.error_class).not.toBe('comfyui_db_locked')
+  })
+
+  it('keeps the exit code and stderr for a core that prints no marker', async () => {
+    setArgs()
+    failBootWith('Traceback (most recent call last):\nRuntimeError: CUDA error\n')
+
+    const res = await handleLaunch(ctxFor('assets-no-marker'))
+
+    expect(res.message).toBe(
+      'Process exited with code 1\n\nTraceback (most recent call last):\nRuntimeError: CUDA error'
+    )
+    const [failed] = eventsNamed('comfy.desktop.comfyui.boot_failed')
+    expect(failed).toMatchObject({ assets_startup_failure: null })
+  })
+
+  describe('a DLL that fails to load at start', () => {
+    const C10_NOT_FOUND =
+      'OSError: [WinError 126] The specified module could not be found. Error loading ' +
+      '"C:\\ComfyUI\\.venv\\Lib\\site-packages\\torch\\lib\\c10.dll" or one of its dependencies.\n'
+    const HINT =
+      '. The Microsoft Visual C++ Redistributable runtime files appear to be missing; ' +
+      'installing the latest redistributable may fix this'
+
+    afterEach(() => {
+      vcRuntime.missing = []
+      vcRuntime.auditThrows = false
+    })
+
+    it.each([
+      [
+        'torch c10.dll after a traceback',
+        'Traceback (most recent call last):\n' +
+          '  File "C:\\ComfyUI\\main.py", line 266, in <module>\n' +
+          '    import torch\n' +
+          C10_NOT_FOUND
+      ],
+      [
+        'a localized DLL init failure',
+        'OSError: [WinError 1114] 动态链接库(DLL)初始化例程失败。 Error loading "c10.dll".\n'
+      ],
+      ['an extension module', 'ImportError: DLL load failed while importing _C: not found\n'],
+      [
+        'a library loaded through ctypes',
+        "FileNotFoundError: Could not find module 'aimdo.dll' (or one of its dependencies).\n"
+      ]
+    ])('adds the VC++ runtime hint for %s when the runtime is missing', async (_name, stderr) => {
+      setArgs()
+      vcRuntime.missing = ['vcruntime140_1.dll']
+      failBootWith(stderr)
+
+      const res = await handleLaunch(ctxFor('dll-runtime-missing'))
+
+      expect(res.message).toBe(`Process exited with code 1${HINT}\n\n${stderr.trim()}`)
+    })
+
+    it('leaves the message alone when the runtime is present', async () => {
+      setArgs()
+      failBootWith(C10_NOT_FOUND)
+
+      const res = await handleLaunch(ctxFor('dll-runtime-present'))
+
+      expect(res.message).toBe(`Process exited with code 1\n\n${C10_NOT_FOUND.trim()}`)
+    })
+
+    it('leaves a failure that names no DLL alone even when the runtime is missing', async () => {
+      setArgs()
+      vcRuntime.missing = ['msvcp140.dll']
+      failBootWith('Traceback (most recent call last):\nRuntimeError: CUDA error\n')
+
+      const res = await handleLaunch(ctxFor('dll-other-failure'))
+
+      expect(res.message).toBe(
+        'Process exited with code 1\n\nTraceback (most recent call last):\nRuntimeError: CUDA error'
+      )
+    })
+
+    it('adds no hint when the DLL message is not on an exception line', async () => {
+      setArgs()
+      vcRuntime.missing = ['msvcp140.dll']
+      const stderr = "Could not find module 'aimdo.dll' (or one of its dependencies).\n"
+      failBootWith(stderr)
+
+      const res = await handleLaunch(ctxFor('dll-unprefixed'))
+
+      expect(res.message).toBe(`Process exited with code 1\n\n${stderr.trim()}`)
+    })
+
+    it('ignores a DLL failure the start survived when another error ends it', async () => {
+      setArgs()
+      vcRuntime.missing = ['msvcp140.dll']
+      const stderr =
+        'ImportError: DLL load failed while importing _ext: module not found.\n' +
+        'Cannot import custom_nodes/some_node module for custom nodes\n' +
+        'Traceback (most recent call last):\nRuntimeError: CUDA error\n'
+      failBootWith(stderr)
+
+      const res = await handleLaunch(ctxFor('dll-survived'))
+
+      expect(res.message).toBe(`Process exited with code 1\n\n${stderr.trim()}`)
+    })
+
+    it('leaves the message alone when the runtime check fails', async () => {
+      setArgs()
+      vcRuntime.auditThrows = true
+      failBootWith(C10_NOT_FOUND)
+
+      const res = await handleLaunch(ctxFor('dll-audit-throws'))
+
+      expect(res.message).toBe(`Process exited with code 1\n\n${C10_NOT_FOUND.trim()}`)
+    })
+
+    it('keeps the hint on an access-violation exit', async () => {
+      setArgs()
+      vcRuntime.missing = ['vcruntime140.dll']
+      failBootWith('Fatal Python error: Segmentation fault\n', 0xc0000005)
+
+      const res = await handleLaunch(ctxFor('dll-access-violation'))
+
+      expect(res.message).toBe(
+        'Process exited with code 3221225477 / 0xC0000005 (memory access violation — usually a ' +
+          `faulty or missing native library)${HINT}\n\nFatal Python error: Segmentation fault`
+      )
+    })
+
+    it('adds no DLL hint to a native crash code that is not an access violation', async () => {
+      setArgs()
+      vcRuntime.missing = ['vcruntime140.dll']
+      failBootWith(C10_NOT_FOUND, 0xc0000409)
+
+      const res = await handleLaunch(ctxFor('dll-stack-overrun'))
+
+      expect(res.message).toBe(
+        `Process exited with code 3221226505 / 0xC0000409\n\n${C10_NOT_FOUND.trim()}`
+      )
+    })
+  })
+
+  describe('an asset database from a newer ComfyUI', () => {
+    const NEWER_DB =
+      'INFO  [alembic.runtime.migration] Context impl SQLiteImpl.\n' +
+      "Failed to initialize database: Can't locate revision identified by '0009_created_at_from_mtime'\n" +
+      'The --enable-assets flag requires a working database connection.\n'
+    let spawnArgs: string[][] = []
+
+    beforeEach(() => {
+      setArgs()
+      launchHarness.commits = {
+        head: 'e'.repeat(40),
+        ancestry: new Map([[ASSETS_MIN_CORE_COMMIT, true]])
+      }
+      spawnArgs = []
+      launchHarness.spawn = (_cmd, args) => {
+        spawnArgs.push([...(args as string[])])
+        const child = fakeChild()
+        children.push(child)
+        return child
+      }
+    })
+
+    afterEach(() => {
+      launchHarness.commits = null
+    })
+
+    const attempts = (...stderr: string[]): void => {
+      let attempt = 0
+      launchHarness.waitForPort = async () => {
+        const text = stderr[attempt++]
+        if (text === undefined) return
+        const child = children.at(-1)!
+        child.stderr.emit('data', Buffer.from(text))
+        child.emit('close', 1, null)
+        return new Promise<void>(() => {})
+      }
+    }
+
+    it("starts without Desktop's --enable-assets and says why", async () => {
+      attempts(NEWER_DB)
+      const id = 'assets-newer-db'
+
+      const output: string[] = []
+      const send = (channel: string, data: { text?: string }): void => {
+        if (channel === 'comfy-output') output.push(data.text ?? '')
+      }
+
+      const res = await handleLaunch({
+        ...ctxFor(id),
+        event: {
+          sender: { isDestroyed: () => false, send }
+        } as unknown as Electron.IpcMainInvokeEvent
+      })
+
+      expect(res.ok).toBe(true)
+      expect(spawnArgs.map((args) => args.includes('--enable-assets'))).toEqual([true, false])
+      expect(output.join('')).toContain(
+        '[assets] --enable-assets withheld: the asset database is from a newer ComfyUI\n'
+      )
+      expect(eventsNamed('comfy.desktop.comfyui.boot_started')).toEqual([
+        expect.objectContaining({ assets_enabled: true, assets_retry_count: 0 }),
+        expect.objectContaining({ assets_enabled: false, assets_retry_count: 1 })
+      ])
+      expect(eventsNamed('comfy.desktop.comfyui.boot_completed')).toEqual([
+        expect.objectContaining({ assets_enabled: false, assets_retry_count: 1 })
+      ])
+      expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toEqual([])
+      const bootIds = [
+        ...eventsNamed('comfy.desktop.comfyui.boot_started'),
+        ...eventsNamed('comfy.desktop.comfyui.boot_completed')
+      ].map((props) => props?.boot_id)
+      expect(new Set(bootIds).size).toBe(1)
+      expect(bootIds[0]).toEqual(expect.any(String))
+    })
+
+    it('retries once only', async () => {
+      attempts(NEWER_DB, NEWER_DB)
+
+      const res = await handleLaunch(ctxFor('assets-newer-db-twice'))
+
+      expect(res.ok).toBe(false)
+      expect(children).toHaveLength(2)
+      expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toEqual([
+        expect.objectContaining({ retry_count: 1, assets_retry_count: 1 })
+      ])
+    })
+
+    it("keeps the user's own --enable-assets and fails as before", async () => {
+      setArgs('--enable-assets')
+      attempts(NEWER_DB)
+
+      const res = await handleLaunch(ctxFor('assets-newer-db-user-flag'))
+
+      expect(res.ok).toBe(false)
+      expect(children).toHaveLength(1)
+      expect(res.message).toContain("Can't locate revision identified by")
+    })
+
+    it('does not retry on any other startup failure', async () => {
+      attempts('Traceback (most recent call last):\nRuntimeError: CUDA error\n')
+
+      const res = await handleLaunch(ctxFor('assets-newer-db-other-error'))
+
+      expect(res.ok).toBe(false)
+      expect(children).toHaveLength(1)
+      expect(eventsNamed('comfy.desktop.comfyui.boot_failed')).toEqual([
+        expect.objectContaining({ assets_enabled: true, assets_retry_count: 0 })
+      ])
+    })
+
+    it('does not retry while the failed process is still alive', async () => {
+      launchHarness.killExits = false
+      attempts(NEWER_DB)
+
+      const res = await handleLaunch(ctxFor('assets-newer-db-kill-timeout'))
+
+      expect(res.ok).toBe(false)
+      expect(children).toHaveLength(1)
+    })
+
+    it('does not retry a boot that timed out without exiting', async () => {
+      launchHarness.waitForPort = async () => {
+        children.at(-1)!.stderr.emit('data', Buffer.from(NEWER_DB))
+        throw new Error('Timed out waiting for port')
+      }
+
+      const res = await handleLaunch(ctxFor('assets-newer-db-timeout'))
+
+      expect(res.ok).toBe(false)
+      expect(children).toHaveLength(1)
+    })
+  })
+
+  describe('stopped while it restarts for model folders a custom node added', () => {
+    let modelsDir = ''
+
+    beforeEach(() => {
+      modelsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-folder-restart-'))
+      fs.mkdirSync(path.join(installDir, 'ComfyUI', 'models'), { recursive: true })
+      launchHarness.waitForPort = async () => {
+        fs.mkdirSync(path.join(installDir, 'ComfyUI', 'models', 'node_added_models'), {
+          recursive: true
+        })
+      }
+      launchHarness.spawn = () => {
+        const child = fakeChild()
+        child.pid = 0
+        children.push(child)
+        return child
+      }
+    })
+
+    afterEach(() => {
+      launchHarness.killGate = null
+      fs.rmSync(modelsDir, { recursive: true, force: true })
+    })
+
+    it.each([
+      {
+        by: "Home's Cancel",
+        id: 'model-restart-home-cancel',
+        stop: (id: string): Promise<void> => {
+          _operationAborts.get(id)?.abort()
+          return stopRunning(id)
+        }
+      },
+      {
+        by: 'quitting Desktop',
+        id: 'model-restart-quit',
+        stop: async (): Promise<void> => cancelAll()
+      }
+    ])(
+      'leaves no ComfyUI running untracked when $by arrives while the first process stops',
+      async ({ id, stop }) => {
+        const killed: unknown[] = []
+        let releaseFirstKill = (): void => {}
+        let firstKillHeld = (): void => {}
+        const firstKillStarted = new Promise<void>((resolve) => (firstKillHeld = resolve))
+        let firstKillGated = false
+        launchHarness.killGate = (proc) => {
+          killed.push(proc)
+          if (proc !== children[0] || firstKillGated) return Promise.resolve()
+          firstKillGated = true
+          firstKillHeld()
+          return new Promise<void>((resolve) => (releaseFirstKill = resolve))
+        }
+        const inst = {
+          ...install(),
+          useSharedModels: false,
+          modelDirs: [modelsDir]
+        } as unknown as InstallationRecord
+
+        const launching = handleLaunch({ ...ctxFor(id), inst })
+        await firstKillStarted
+        await stop(id)
+        releaseFirstKill()
+        const res = await launching
+
+        expect(
+          children.filter((child) => !killed.includes(child)),
+          'ComfyUI processes still running with nothing tracking them'
+        ).toHaveLength(0)
+        expect(_runningSessions.has(id)).toBe(false)
+        expect(res).toMatchObject({ ok: false, cancelled: true })
+      }
+    )
+  })
+})
+
+describe('isPortInUseOutput', () => {
+  it.each([
+    [
+      'a current core',
+      'Port 8188 is already in use on address 127.0.0.1. Please close the other application or use a different port with --port.'
+    ],
+    [
+      'an older core on macOS or Linux',
+      "OSError: [Errno 48] error while attempting to bind on address ('127.0.0.1', 8188): address already in use"
+    ],
+    [
+      'an older core on Windows',
+      "OSError: [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8188): only one usage of each socket address (protocol/network address/port) is normally permitted"
+    ],
+    ['a Node server', 'Error: listen EADDRINUSE: 127.0.0.1:8188']
+  ])('recognises the bind failure of %s', (_server, output) => {
+    expect(isPortInUseOutput(output)).toBe(true)
+  })
+
+  it.each([
+    ['a crash that mentions imports and memory in use', 'ImportError: viewport\nVRAM in use: 4 GB'],
+    ['a normal start', 'To see the GUI go to: http://127.0.0.1:8188']
+  ])('does not read %s as a taken port', (_case, output) => {
+    expect(isPortInUseOutput(output)).toBe(false)
+  })
+})
+
+describe('describePriorOutcome', () => {
+  const base = {
+    proof: 'desktop_record' as const,
+    pid: 11944,
+    port: 8188,
+    ageMs: 1,
+    waitMs: 1,
+    blocked: null
+  }
+  it('names the survivors, not the dead child, in the log', () => {
+    expect(
+      describePriorOutcome({
+        ...base,
+        action: 'busy_left',
+        exitedInTime: false,
+        blocked: 'busy',
+        queueUnknown: true,
+        survivorPids: [555, 556]
+      })
+    ).toBe(
+      "processes left by an earlier ComfyUI (pids 555, 556, proof desktop_record): left running: they do not answer on this installation's port, so whether they are working cannot be asked; launch refused (unknown)"
+    )
+    expect(
+      describePriorOutcome({
+        ...base,
+        action: 'terminated',
+        exitedInTime: true,
+        lingering: 2,
+        survivorPids: [555, 556]
+      })
+    ).toBe(
+      'processes left by an earlier ComfyUI (pids 555, 556, proof desktop_record): stopped, and they exited'
+    )
+  })
+
+  it.each([
+    [{ action: 'terminated', exitedInTime: true }, 'stopped, and it exited'],
+    [
+      { action: 'terminated', exitedInTime: false, blocked: 'stuck' },
+      'stopped, but it did not exit; launch refused (stuck)'
+    ],
+    [
+      { action: 'left', exitedInTime: false, blocked: 'unverified' },
+      'left running: not proven to be ours; launch refused (unverified)'
+    ],
+    [{ action: 'waited', exitedInTime: true }, 'it exited on its own'],
+    [
+      { action: 'busy_left', exitedInTime: false, blocked: 'busy', queueUnknown: true },
+      'left running: it did not answer whether it is working on a prompt; launch refused (unknown)'
+    ],
+    [
+      { action: 'terminated', exitedInTime: true, lingering: 2 },
+      'stopped, and it exited; 2 surviving subprocess(es) stopped'
+    ]
+  ] as const)('%o', (outcome, text) => {
+    expect(describePriorOutcome({ ...base, ...outcome })).toBe(
+      `earlier ComfyUI (pid 11944, port 8188, proof desktop_record): ${text}`
+    )
+  })
+})
+
+describe('describeLockHolder', () => {
+  it('names what the probe found', () => {
+    expect(
+      describeLockHolder({
+        pid: 13708,
+        source: 'restart_manager',
+        sameInstall: true,
+        name: 'python',
+        runsMainPy: true,
+        ageS: 192
+      })
+    ).toBe(
+      'holder pid 13708, source restart_manager, same install true, name python, runs main.py true, running 192s'
+    )
+  })
+
+  it('says so when nothing was found', () => {
+    expect(describeLockHolder(null)).toBe('holder not identified')
   })
 })

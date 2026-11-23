@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import path from 'path'
 
-// The module applies its result on import; a packaged app makes that a no-op here.
 vi.mock('electron', () => ({
   app: { isPackaged: true, getPath: () => '/appdata', setPath: vi.fn() }
 }))

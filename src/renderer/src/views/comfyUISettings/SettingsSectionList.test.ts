@@ -1,38 +1,29 @@
 import { describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
-import { createI18n } from 'vue-i18n'
 
-import { en } from '../../lib/i18nMessages.ts'
 import SettingsSectionList from './SettingsSectionList.vue'
 import BooleanToggle from './BooleanToggle.vue'
 import type { DetailField, DetailSection } from '../../types/ipc'
 
-function makeI18n() {
-  return createI18n({ legacy: false, locale: 'en', messages: { en } })
-}
-
 function mountList(fields: DetailField[]) {
   return mount(SettingsSectionList, {
-    props: { sections: [{ fields }] },
-    global: { plugins: [makeI18n()] }
+    props: { sections: [{ fields }] }
   })
 }
 
 function mountReadonly(fields: DetailField[]) {
   return mount(SettingsSectionList, {
-    props: { sections: [{ fields }], readonly: true },
-    global: { plugins: [makeI18n()] }
+    props: { sections: [{ fields }], readonly: true }
   })
 }
 
 describe('SettingsSectionList', () => {
-  // When main attaches a field `description`, the renderer must surface it under the control.
   describe('field descriptions', () => {
     it('renders the description below the control when one is attached', () => {
       const wrapper = mountList([
         {
           id: 'useChineseMirrors',
-          label: 'Use Chinese Mirrors (Git & PyPI)',
+          label: 'Use Chinese mirrors (Git & PyPI)',
           value: true,
           editable: true,
           editType: 'boolean',
@@ -44,11 +35,29 @@ describe('SettingsSectionList', () => {
       expect(desc.text()).toContain('gitcode.com')
     })
 
+    it('renders the description as plain muted text with no coloured icon', () => {
+      const wrapper = mountList([
+        {
+          id: 'hardwareAcceleration',
+          label: 'Use hardware acceleration',
+          value: true,
+          editable: true,
+          editType: 'boolean',
+          description:
+            'Uses the GPU to render Comfy Desktop. Restart Comfy Desktop for changes to take effect.'
+        }
+      ])
+      const desc = wrapper.find('.settings-v2-field-description')
+      expect(desc.classes()).toContain('text-text-muted')
+      expect(desc.find('svg').exists()).toBe(false)
+      expect(desc.html()).not.toMatch(/--info|blue/)
+    })
+
     it('does not render the description block when none is attached', () => {
       const wrapper = mountList([
         {
           id: 'useChineseMirrors',
-          label: 'Use Chinese Mirrors (Git & PyPI)',
+          label: 'Use Chinese mirrors (Git & PyPI)',
           value: false,
           editable: true,
           editType: 'boolean'
@@ -61,7 +70,7 @@ describe('SettingsSectionList', () => {
       const wrapper = mountList([
         {
           id: 'pypiMirror',
-          label: 'PyPI Mirror URL',
+          label: 'PyPI mirror URL',
           value: '',
           editable: true,
           editType: 'text',
@@ -78,7 +87,7 @@ describe('SettingsSectionList', () => {
       const wrapper = mountList([
         {
           id: 'useChineseMirrors',
-          label: 'Use Chinese Mirrors (Git & PyPI)',
+          label: 'Use Chinese mirrors (Git & PyPI)',
           value: false,
           editable: true,
           editType: 'boolean',
@@ -91,8 +100,6 @@ describe('SettingsSectionList', () => {
     })
   })
 
-  // Fields sharing a rowGroup render side-by-side inside one paired row;
-  // everything else keeps its own full-width (layout-transparent) row.
   describe('rowGroup pairing', () => {
     const select = (id: string, rowGroup?: string): DetailField => ({
       id,
@@ -133,16 +140,19 @@ describe('SettingsSectionList', () => {
     })
   })
 
-  // Readonly path values render as a clickable open-folder button, keeping the
-  // copy button, and only fire `open-path` for real filesystem paths.
   describe('readonly path rows', () => {
-    it('renders a clickable button that emits open-path for a path value', async () => {
+    it('shows a path value as plain text with a reveal button that emits open-path', async () => {
       const wrapper = mountReadonly([
         { id: 'location', label: 'Location', value: '/home/user/ComfyUI', editType: 'path' }
       ])
+      const text = wrapper.find('.settings-v2-field-readonly-path')
+      expect(text.element.tagName).not.toBe('BUTTON')
+      expect(text.text()).toBe('/home/user/ComfyUI')
+      expect(text.attributes('title')).toBe('/home/user/ComfyUI')
       const btn = wrapper.find('button.settings-v2-field-readonly-open')
       expect(btn.exists()).toBe(true)
-      expect(btn.text()).toBe('/home/user/ComfyUI')
+      expect(btn.classes()).toContain('reveal-folder-button')
+      expect(btn.attributes('aria-label')).toContain('/home/user/ComfyUI')
       await btn.trigger('click')
       expect(wrapper.emitted('open-path')?.[0]).toEqual(['/home/user/ComfyUI'])
     })
@@ -152,7 +162,6 @@ describe('SettingsSectionList', () => {
         { id: 'location', label: 'Location', value: '/home/user/ComfyUI', editType: 'path' }
       ])
       expect(wrapper.find('.settings-v2-readonly-path').exists()).toBe(true)
-      // BaseCopyButton renders a button; together with the open button there are two.
       expect(wrapper.findAll('.settings-v2-readonly-path button').length).toBe(2)
     })
 
@@ -169,9 +178,30 @@ describe('SettingsSectionList', () => {
     })
   })
 
-  // The Update tab's version table renders the section's actions itself, so the
-  // generic footer must stand down (or the button appears twice), and the button
-  // is the only place the update action can be fired.
+  describe('a danger section action', () => {
+    function dangerButton() {
+      const wrapper = mount(SettingsSectionList, {
+        props: {
+          sections: [
+            {
+              title: 'Danger zone',
+              actions: [{ id: 'delete', label: 'Uninstall', style: 'danger' }]
+            }
+          ]
+        }
+      })
+      return wrapper.findAll('button').find((button) => button.text() === 'Uninstall')!
+    }
+
+    it('is red text that only tints on hover, never a filled red button', () => {
+      const classes = dangerButton().classes()
+      expect(classes).toContain('text-danger')
+      expect(classes).toContain('hover:bg-destructive/12')
+      expect(classes.some((name) => /^hover:bg-\[var\(--danger\)\]$/.test(name))).toBe(false)
+      expect(classes.some((name) => name.startsWith('hover:text-'))).toBe(false)
+    })
+  })
+
   describe('version-stats section', () => {
     const vsSection = (enabled: boolean): DetailSection => ({
       fields: [
@@ -188,8 +218,7 @@ describe('SettingsSectionList', () => {
 
     function mountSection(enabled: boolean) {
       return mount(SettingsSectionList, {
-        props: { sections: [vsSection(enabled)] },
-        global: { plugins: [makeI18n()] }
+        props: { sections: [vsSection(enabled)] }
       })
     }
 
@@ -209,8 +238,7 @@ describe('SettingsSectionList', () => {
       const section = vsSection(false)
       section.actions![0]!.disabledMessage = 'Finish the current update first.'
       const wrapper = mount(SettingsSectionList, {
-        props: { sections: [section] },
-        global: { plugins: [makeI18n()] }
+        props: { sections: [section] }
       })
       expect(wrapper.find('.version-stat-action').attributes('disabled')).toBeDefined()
       const tooltip = wrapper.find('.version-stat-action-tooltip')
@@ -223,7 +251,7 @@ describe('SettingsSectionList', () => {
     function betaField(value: boolean, turnOnDisabled: boolean): DetailField {
       return {
         id: 'betaFeaturesEnabled',
-        label: 'Opt in to beta features',
+        label: 'Opt-in to beta features',
         value,
         editable: true,
         editType: 'boolean',
@@ -243,7 +271,9 @@ describe('SettingsSectionList', () => {
       const wrapper = mountList([betaField(false, true)])
       const button = wrapper.find('button[role="switch"]')
       expect(button.attributes('aria-disabled')).toBe('true')
-      expect(button.attributes('title')).toBe(en.tooltips.betaFeaturesNeedTelemetry)
+      expect(button.attributes('title')).toBe(
+        'Beta features require confirming data sharing in Settings, even if telemetry is currently on.'
+      )
       expect(button.attributes('title')).not.toBe('tooltips.betaFeaturesNeedTelemetry')
 
       await button.trigger('click')
@@ -251,10 +281,6 @@ describe('SettingsSectionList', () => {
       expect(button.attributes('aria-checked')).toBe('false')
     })
 
-    // A blocked switch must stay REACHABLE. `disabled` removes it from the tab order, so a
-    // keyboard or screen-reader user cannot land on it to discover why it is blocked — the
-    // explanation only exists as a mouse-only `title`. `aria-disabled` announces the state
-    // while keeping the control focusable; `handleClick` remains the functional block.
     it('keeps a blocked switch in the tab order', () => {
       const wrapper = mountList([betaField(false, true)])
       const button = wrapper.find('button[role="switch"]')
@@ -267,7 +293,6 @@ describe('SettingsSectionList', () => {
       const button = wrapper.find('button[role="switch"]')
       expect(button.attributes('aria-disabled')).toBe('true')
 
-      // Still inert: reachable is not the same as operable.
       await button.trigger('click')
       expect(wrapper.emitted('update-field')).toBeFalsy()
       expect(button.attributes('aria-checked')).toBe('false')
@@ -281,12 +306,12 @@ describe('SettingsSectionList', () => {
 
       const description = wrapper.find(`#${describedBy}`)
       expect(description.exists()).toBe(true)
-      expect(description.text()).toBe(en.tooltips.betaFeaturesNeedTelemetry)
+      expect(description.text()).toBe(
+        'Beta features require confirming data sharing in Settings, even if telemetry is currently on.'
+      )
     })
 
     it('keeps the blocked styling hook after dropping the disabled attribute', () => {
-      // `.bt-switch:disabled` stops matching once the attribute is gone, so the dim/cursor
-      // styling has to key on the new state or the block becomes visually invisible.
       const wrapper = mountList([betaField(false, true)])
       expect(wrapper.find('button[role="switch"][aria-disabled="true"]').exists()).toBe(true)
     })
@@ -299,8 +324,6 @@ describe('SettingsSectionList', () => {
 
       expect(ids).toHaveLength(2)
       expect(ids[0]).toBeTruthy()
-      // A fixed literal id would make both toggles describe the same element, so the second
-      // switch would announce the first one's reason.
       expect(ids[0]).not.toBe(ids[1])
     })
 
@@ -323,6 +346,92 @@ describe('SettingsSectionList', () => {
       expect(button.attributes('disabled')).toBeUndefined()
       await button.trigger('click')
       expect(wrapper.emitted('update-field')![0]![1]).toBe(true)
+    })
+  })
+
+  describe('stacked layout', () => {
+    const launchField: DetailField = {
+      id: 'launchArgs',
+      label: 'Startup arguments',
+      value: '--listen',
+      editable: true,
+      editType: 'text'
+    }
+    const pairedFields: DetailField[] = [
+      { ...launchField, id: 'launchMode', label: 'Launch mode', rowGroup: 'launch-window' },
+      { ...launchField, id: 'browserPartition', label: 'Browser cache', rowGroup: 'launch-window' }
+    ]
+
+    function mountSections(sections: DetailSection[], stacked: boolean) {
+      return mount(SettingsSectionList, { props: { sections, stacked } })
+    }
+
+    it('puts a titled section heading above its fields as an uppercase label', () => {
+      const wrapper = mountSections(
+        [{ title: 'Launch settings', description: 'How the build starts.', fields: [launchField] }],
+        true
+      )
+      const heading = wrapper.find('h3')
+      expect(heading.text()).toBe('Launch settings')
+      expect(heading.classes()).toContain('uppercase')
+      expect(wrapper.find('.settings-v2-section').classes()).not.toContain('grid')
+      expect(wrapper.find('.settings-v2-section-body').classes()).toContain('flex-col')
+      expect(wrapper.find('.settings-v2-section-body').text()).toContain('Startup arguments')
+    })
+
+    it('shows the section description once, under the heading', () => {
+      const wrapper = mountSections(
+        [{ title: 'Launch settings', description: 'How the build starts.', fields: [launchField] }],
+        true
+      )
+      const descriptions = wrapper.findAll('.settings-v2-section-desc')
+      expect(descriptions).toHaveLength(1)
+      expect(descriptions[0]!.element.closest('header')).not.toBeNull()
+    })
+
+    it('pairs grouped fields in two columns 16px apart, and 24px apart when they wrap', () => {
+      const wrapper = mountSections([{ title: 'Launch settings', fields: pairedFields }], true)
+      const paired = wrapper.findAll('.settings-v2-field-row.is-paired')
+      expect(paired).toHaveLength(1)
+      expect(paired[0]!.classes()).toEqual(expect.arrayContaining(['gap-x-4', 'gap-y-6']))
+    })
+
+    it('pairs grouped fields when the layout is not stacked', () => {
+      const wrapper = mountSections([{ title: 'Launch settings', fields: pairedFields }], false)
+      expect(wrapper.findAll('.settings-v2-field-row.is-paired')).toHaveLength(1)
+    })
+
+    it('leaves the layout unchanged when stacked is off', () => {
+      const wrapper = mountSections(
+        [{ title: 'Launch settings', description: 'How the build starts.', fields: [launchField] }],
+        false
+      )
+      expect(wrapper.find('h3').exists()).toBe(false)
+      expect(wrapper.find('.settings-v2-section-body').classes()).toContain('contents')
+      expect(wrapper.find('.settings-v2-section-desc').text()).toBe('How the build starts.')
+    })
+
+    it('keeps an untitled section without a heading', () => {
+      const wrapper = mountSections([{ fields: [launchField, { ...launchField, id: 'b' }] }], true)
+      expect(wrapper.find('h3').exists()).toBe(false)
+      expect(wrapper.find('.settings-v2-section-body').classes()).toContain('contents')
+    })
+
+    it('keeps a collapsible section with its toggle and description', () => {
+      const wrapper = mountSections(
+        [
+          {
+            title: 'Advanced',
+            description: 'Rarely needed flags.',
+            collapsed: false,
+            fields: [launchField]
+          }
+        ],
+        true
+      )
+      expect(wrapper.find('h3').exists()).toBe(false)
+      expect(wrapper.find('button[aria-expanded]').text()).toContain('Advanced')
+      expect(wrapper.find('.settings-v2-section-desc').text()).toBe('Rarely needed flags.')
     })
   })
 })

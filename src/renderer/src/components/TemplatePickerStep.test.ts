@@ -1,14 +1,13 @@
-import { mount } from '@vue/test-utils'
-import { describe, expect, it } from 'vitest'
-import { createI18n } from 'vue-i18n'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { nextTick } from 'vue'
 
-import { en } from '../lib/i18nMessages'
+import '../assets/main.css'
+
 import type { DiskSpaceInfo, FieldOption } from '../types/ipc'
 import TemplatePickerStep from './TemplatePickerStep.vue'
 
 const GB = 1024 ** 3
-
-const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
 
 const NONE: FieldOption = { value: 'none', label: 'Blank canvas' }
 
@@ -39,6 +38,7 @@ function mountPicker(
     selectedValue: string | null
     diskSpace: DiskSpaceInfo | null
     diskSpaceLoading: boolean
+    compact: boolean
   }> = {}
 ) {
   return mount(TemplatePickerStep, {
@@ -49,22 +49,24 @@ function mountPicker(
       diskSpace: null,
       diskSpaceLoading: false,
       ...props
-    },
-    global: { plugins: [i18n] }
+    }
   })
 }
 
 describe('TemplatePickerStep', () => {
   it('renders one tab per populated modality, excluding the none sentinel', () => {
     const tabs = mountPicker().findAll('[role="tab"]')
-    expect(tabs).toHaveLength(2) // Video + Image
+    expect(tabs).toHaveLength(2)
     expect(tabs[0]!.text()).toContain('Video')
     expect(tabs[1]!.text()).toContain('Image')
   })
 
+  it('uses the bounded card grid when embedded in a compact picker', () => {
+    expect(mountPicker({ compact: true }).get('.tps').classes()).toContain('tps--compact')
+  })
+
   it("shows only the active tab's templates and never the none sentinel", () => {
     const rows = mountPicker().findAll('button[role="radio"]')
-    // Active tab follows the selected (recommended image) → both image rows show.
     expect(rows).toHaveLength(2)
     expect(rows[0]!.text()).toContain('SDXL Turbo')
     expect(rows[1]!.text()).toContain('Flux Schnell')
@@ -72,14 +74,13 @@ describe('TemplatePickerStep', () => {
 
   it('switches visible templates when another tab is clicked', async () => {
     const wrapper = mountPicker()
-    await wrapper.findAll('[role="tab"]')[0]!.trigger('click') // Video
+    await wrapper.findAll('[role="tab"]')[0]!.trigger('click')
     const rows = wrapper.findAll('button[role="radio"]')
     expect(rows).toHaveLength(1)
     expect(rows[0]!.text()).toContain('Wan Video')
   })
 
   it('shows the recommended badge only on the recommended card', () => {
-    // Select the non-recommended alt, so only one card can carry the badge.
     const wrapper = mountPicker({ selectedValue: IMAGE_ALT.value })
     const tags = wrapper.findAll('.tps__recommended')
     expect(tags).toHaveLength(1)
@@ -243,7 +244,6 @@ describe('TemplatePickerStep', () => {
     expect(card.find('.tps__card-title').text()).toBe('SDXL Turbo')
   })
 
-  // A single populated modality needs no tab strip.
   it('hides the tab strip when only one modality has templates', () => {
     const wrapper = mountPicker({
       options: [NONE, IMAGE_REC, IMAGE_ALT],
@@ -253,8 +253,6 @@ describe('TemplatePickerStep', () => {
     expect(wrapper.findAll('button[role="radio"]')).toHaveLength(2)
   })
 
-  // The picker exposes the alert message (shownDiskError); the host wizard
-  // renders it above the card and owns the blocked-Install shake.
   type PickerVm = {
     shownDiskError: string | null
   }
@@ -263,7 +261,7 @@ describe('TemplatePickerStep', () => {
   describe('disk hard-block', () => {
     it('exposes the block message when free space is below model + headroom', () => {
       const wrapper = mountPicker({
-        selectedValue: VIDEO.value, // 16GB model
+        selectedValue: VIDEO.value,
         diskSpace: { free: 1 * GB, total: 500 * GB }
       })
       expect(vmOf(wrapper).shownDiskError).toBeTruthy()
@@ -286,6 +284,16 @@ describe('TemplatePickerStep', () => {
       expect(vmOf(wrapper).shownDiskError).toBeNull()
     })
 
+    it('never blocks a template whose models are all downloaded already', () => {
+      const downloaded: FieldOption = { ...VIDEO, data: { ...VIDEO.data, modelsPresent: true } }
+      const wrapper = mountPicker({
+        options: [NONE, downloaded],
+        selectedValue: downloaded.value,
+        diskSpace: { free: 1 * GB, total: 500 * GB }
+      })
+      expect(vmOf(wrapper).shownDiskError).toBeNull()
+    })
+
     it('never blocks the model-free none sentinel even on a full disk', () => {
       const wrapper = mountPicker({
         selectedValue: NONE.value,
@@ -300,12 +308,11 @@ describe('TemplatePickerStep', () => {
     const media = wrapper.findAll('.tps__card-media')[0]!
     expect(media.find('img').exists()).toBe(true)
     await media.find('img').trigger('error')
-    expect(media.find('img').exists()).toBe(false) // swapped for the logo tile
+    expect(media.find('img').exists()).toBe(false)
     expect(media.find('.tps__card-fallback svg').exists()).toBe(true)
   })
 
   it('shows the ComfyC fallback tile for templates with no thumbnail (audio)', () => {
-    // VIDEO fixture carries no thumbnailUrl → branded tile, not a broken image.
     const wrapper = mountPicker({ options: [NONE, VIDEO], selectedValue: VIDEO.value })
     const media = wrapper.findAll('.tps__card-media')[0]!
     expect(media.find('img').exists()).toBe(false)
@@ -323,5 +330,91 @@ describe('TemplatePickerStep', () => {
     expect(img.classes()).not.toContain('tps__card-img--ready')
     await img.trigger('load')
     expect(img.classes()).toContain('tps__card-img--ready')
+  })
+})
+
+describe('TemplatePickerStep tab pill', () => {
+  const attached: VueWrapper[] = []
+
+  beforeEach(() => {
+    document.documentElement.dataset.theme = 'dark'
+  })
+
+  afterEach(() => {
+    while (attached.length) attached.pop()?.unmount()
+    delete document.documentElement.dataset.theme
+  })
+
+  function mountAttached() {
+    const wrapper = mount(TemplatePickerStep, {
+      props: {
+        options: [NONE, IMAGE_REC, IMAGE_ALT, VIDEO],
+        noneValue: 'none',
+        selectedValue: IMAGE_REC.value,
+        diskSpace: null,
+        diskSpaceLoading: false
+      },
+      attachTo: document.body
+    })
+    attached.push(wrapper)
+    return wrapper
+  }
+
+  function nextFrame(): Promise<void> {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+  }
+
+  async function settle() {
+    await flushPromises()
+    await nextTick()
+    await document.fonts.ready
+    await nextFrame()
+    await nextFrame()
+  }
+
+  function tabNamed(wrapper: VueWrapper, label: string): HTMLElement {
+    const tab = wrapper.findAll<HTMLElement>('[role="tab"]').find((t) => t.text().includes(label))
+    if (!tab) throw new Error(`no tab named ${label}`)
+    return tab.element
+  }
+
+  function expectPillCovers(pill: HTMLElement, tab: HTMLElement) {
+    expect(pill.hidden).toBe(false)
+    expect(pill.style.width).toBe(`${tab.offsetWidth}px`)
+    expect(pill.style.height).toBe(`${tab.offsetHeight}px`)
+    expect(pill.style.transform).toBe(`translate(${tab.offsetLeft}px, ${tab.offsetTop}px)`)
+  }
+
+  it('puts one pill under the picked modality tab', async () => {
+    const wrapper = mountAttached()
+    await settle()
+
+    const pills = wrapper.findAll<HTMLElement>('[data-testid="sliding-pill"]')
+    expect(pills).toHaveLength(1)
+    expectPillCovers(pills[0]!.element, tabNamed(wrapper, 'Image'))
+  })
+
+  it('moves the same pill to the modality tab the user picks', async () => {
+    const wrapper = mountAttached()
+    await settle()
+    const pill = wrapper.get<HTMLElement>('[data-testid="sliding-pill"]').element
+
+    tabNamed(wrapper, 'Video').click()
+    await settle()
+
+    expect(wrapper.get('[data-testid="sliding-pill"]').element).toBe(pill)
+    expectPillCovers(pill, tabNamed(wrapper, 'Video'))
+  })
+
+  it('paints the picked fill on the pill and keeps the template cards untouched', async () => {
+    const wrapper = mountAttached()
+    await settle()
+    const pill = wrapper.get<HTMLElement>('[data-testid="sliding-pill"]').element
+
+    expect(getComputedStyle(tabNamed(wrapper, 'Image')).backgroundColor).toBe('rgba(0, 0, 0, 0)')
+    expect(getComputedStyle(pill).backgroundColor).not.toBe('rgba(0, 0, 0, 0)')
+    expect(wrapper.get('[role="radiogroup"]').find('[data-testid="sliding-pill"]').exists()).toBe(
+      false
+    )
   })
 })

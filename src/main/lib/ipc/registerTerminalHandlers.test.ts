@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   handlers: new Map<string, IpcHandler>(),
   findEntryByComfySender: vi.fn(),
   isTitlePopupSender: vi.fn(),
+  isPanelSender: vi.fn(),
   findTerminalPopoutInstallationIdBySender: vi.fn(),
   openTerminalPopout: vi.fn(),
   subscribeTerminal: vi.fn(),
@@ -29,7 +30,8 @@ vi.mock('../../popups/titlePopup', () => ({
 }))
 
 vi.mock('../../host/registry', () => ({
-  findEntryByComfySender: mocks.findEntryByComfySender
+  findEntryByComfySender: mocks.findEntryByComfySender,
+  isPanelSender: mocks.isPanelSender
 }))
 
 vi.mock('../terminalPopoutWindow', () => ({
@@ -60,8 +62,18 @@ describe('registerTerminalHandlers', () => {
     mocks.handlers.clear()
     mocks.findEntryByComfySender.mockReturnValue(null)
     mocks.isTitlePopupSender.mockReturnValue(false)
+    mocks.isPanelSender.mockReturnValue(false)
     mocks.findTerminalPopoutInstallationIdBySender.mockReturnValue(null)
     registerTerminalHandlers()
+  })
+
+  it('lets a window panel reach the terminal of the build it names', async () => {
+    mocks.isPanelSender.mockReturnValue(true)
+    const event = { sender: {} }
+
+    await getHandler('terminal-subscribe')(event, 'inst-a')
+
+    expect(mocks.subscribeTerminal).toHaveBeenCalledWith('inst-a', event.sender)
   })
 
   it('rejects PTY access from an untrusted sender with an explicit installation', async () => {
@@ -103,6 +115,17 @@ describe('registerTerminalHandlers', () => {
     await getHandler('desktop2-open-terminal-popout')(event, 'inst-b')
 
     expect(mocks.openTerminalPopout).toHaveBeenCalledWith('inst-a')
+  })
+
+  it('opens no popout for a Remote Connection', async () => {
+    mocks.findEntryByComfySender.mockReturnValue({
+      installationId: 'inst-a',
+      sourceCategory: 'remote'
+    })
+
+    await getHandler('desktop2-open-terminal-popout')({ sender: {} }, 'inst-a')
+
+    expect(mocks.openTerminalPopout).not.toHaveBeenCalled()
   })
 
   it('allows the trusted title popup to operate on its selected installation', async () => {

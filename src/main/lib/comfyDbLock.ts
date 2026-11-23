@@ -1,0 +1,108 @@
+import fs from 'fs'
+import path from 'path'
+import { findLockingProcesses } from './file-lock-info'
+import { holderIsInstall, listRecords } from './comfyProcessRecord'
+import {
+  commandLinesOf,
+  isPidAlive,
+  readStartTimes,
+  runsMainPy,
+  startTokenToEpochMs
+} from './processIdentity'
+
+const DB_LOCK_LINES = [
+  /could not acquire lock on database/i,
+  /already using this database/i,
+  /database lock held by/i
+]
+
+export function isDbLockFailure(stderr: string | undefined): boolean {
+  return !!stderr && DB_LOCK_LINES.some((re) => re.test(stderr))
+}
+
+function argValue(args: readonly string[], flag: string): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (a === flag) return args[i + 1] ?? null
+    if (a.startsWith(`${flag}=`)) return a.slice(flag.length + 1)
+  }
+  return null
+}
+
+export function databaseCandidates(cwd: string, args: readonly string[]): string[] {
+  const url = argValue(args, '--database-url')
+  if (url) {
+    const m = /^sqlite:\/\/\/(.+)$/.exec(url)
+    if (!m || m[1] === ':memory:') return []
+    return [path.resolve(cwd, m[1]!)]
+  }
+  const sIdx = args.indexOf('-s')
+  const mainPy = sIdx >= 0 ? args[sIdx + 1] : undefined
+  const comfyDir = mainPy ? path.dirname(path.resolve(cwd, mainPy)) : null
+  const userDir =
+    argValue(args, '--user-directory') ??
+    (argValue(args, '--base-directory')
+      ? path.join(argValue(args, '--base-directory')!, 'user')
+      : comfyDir && path.join(comfyDir, 'user'))
+  const out = [userDir && path.join(path.resolve(cwd, userDir), 'comfyui.db')]
+  if (comfyDir) out.push(path.join(comfyDir, 'user', 'comfyui.db'))
+  return [...new Set(out.filter((p): p is string => !!p))]
+}
+
+export interface DbLockHolder {
+  pid: number
+  source: 'desktop_record' | 'restart_manager' | 'lsof'
+  sameInstall: boolean
+  name: string | null
+  runsMainPy: boolean | null
+  ageS: number | null
+}
+
+export { runsMainPy }
+
+export async function identifyDbLockHolder(input: {
+  sessionKey: string
+  installationId: string
+  installPath: string
+  cwd: string
+  args: readonly string[]
+  probeTimeoutMs?: number
+}): Promise<DbLockHolder | null> {
+  const recorded = listRecords().find(
+    (r) =>
+      r.sessionKey !== input.sessionKey &&
+      r.installationId === input.installationId &&
+      isPidAlive(r.childPid)
+  )
+  if (recorded) {
+    return {
+      pid: recorded.childPid,
+      source: 'desktop_record',
+      sameInstall: true,
+      name: null,
+      runsMainPy: true,
+      ageS: Math.max(0, Math.round((Date.now() - recorded.spawnedAt) / 1000))
+    }
+  }
+
+  for (const db of databaseCandidates(input.cwd, input.args)) {
+    const lockFile = `${db}.lock`
+    if (!fs.existsSync(lockFile)) continue
+    const probe = await findLockingProcesses(lockFile, input.probeTimeoutMs)
+    if (!probe.ok) continue
+    const holder = probe.processes.find((p) => p.pid !== process.pid)
+    if (!holder) continue
+    const [ownLine] = await commandLinesOf(holder.pid).catch(() => [] as string[])
+    const started = (await readStartTimes([holder.pid]).catch(() => null))?.get(holder.pid)
+    const startedMs = started ? startTokenToEpochMs(started) : null
+    return {
+      pid: holder.pid,
+      source: process.platform === 'win32' ? 'restart_manager' : 'lsof',
+      sameInstall: await holderIsInstall(holder.pid, input.installPath).catch(() => false),
+      name: path.basename(holder.name.replace(/\\/g, '/')) || null,
+      runsMainPy: ownLine === undefined ? null : runsMainPy(ownLine),
+      ageS: startedMs === null ? null : Math.max(0, Math.round((Date.now() - startedMs) / 1000))
+    }
+  }
+  return null
+}

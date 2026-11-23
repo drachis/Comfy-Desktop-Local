@@ -5,15 +5,29 @@ import fs from 'fs'
 import path from 'path'
 import net from 'net'
 import { stateDir } from './paths'
+import {
+  groupHasLiveMembers,
+  groupMembers,
+  isPidAlive,
+  processGroupOf,
+  readStartTimes,
+  snapshotWindowsTree
+} from './processIdentity'
 
-/** Default timeout for waiting for ComfyUI to boot (5 minutes). */
-export const COMFY_BOOT_TIMEOUT_MS = 300_000
+export const COMFY_BOOT_TIMEOUT_MS = 1_800_000
+export const COMFY_BOOT_QUIET_MS = 300_000
 
 export interface WaitOptions {
   timeoutMs?: number
   intervalMs?: number
   onPoll?: (info: { attempt: number; elapsedMs: number }) => void
   signal?: AbortSignal
+  requestTimeoutMs?: number
+}
+
+export interface WaitForPortOptions extends WaitOptions {
+  quietMs?: number
+  lastOutputAt?: () => number
 }
 
 export interface ProcessInfo {
@@ -48,12 +62,6 @@ export function spawnProcess(
   })
 }
 
-/**
- * Fire-and-forget process tree kill. On Windows, uses taskkill /T /F to
- * terminate the entire process tree. On Unix, sends SIGTERM to the process.
- * Does not wait for the process to exit — use killProcessTree when you need
- * to wait.
- */
 export function killProcTree(proc: ChildProcess): void {
   if (proc.killed || proc.pid == null) return
   if (process.platform === 'win32') {
@@ -67,48 +75,182 @@ export function killProcTree(proc: ChildProcess): void {
   }
 }
 
-export function killProcessTree(proc: ChildProcess | null): Promise<void> {
-  const pid = proc?.pid
-  if (!proc || !pid) return Promise.resolve()
-  return new Promise<void>((resolve) => {
-    const done = (): void => {
-      proc.stdout?.destroy()
-      proc.stderr?.destroy()
-      resolve()
-    }
-    if (process.platform === 'win32') {
-      execFile('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true }, done)
-      return
-    }
+const monotonicNow = (): number => performance.now()
 
-    const processGroup = -pid
-    try {
-      process.kill(processGroup, 'SIGKILL')
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return done()
-    }
+let ownPgid: Promise<number | null> | null = null
+function ownProcessGroup(): Promise<number | null> {
+  if (!ownPgid) ownPgid = processGroupOf(process.pid)
+  return ownPgid
+}
 
-    // Bounded: a group member stuck in uninterruptible sleep (or persistently
-    // EPERM) would otherwise trap this poll forever and hang every caller that
-    // awaits the kill (launch cancel, relaunch). Resolving on the cap is the
-    // lesser evil - the caller proceeds against a possibly-lingering process
-    // instead of deadlocking the lifecycle.
-    const killDeadline = Date.now() + 5000
-    const waitForGroupExit = (): void => {
-      if (Date.now() > killDeadline) return done()
-      try {
-        process.kill(processGroup, 0)
-        setTimeout(waitForGroupExit, 25).unref()
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'EPERM') {
-          setTimeout(waitForGroupExit, 25).unref()
-        } else {
-          done()
-        }
+export async function isSafeToSignal(pid: number): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false
+  if (process.platform === 'win32') return pid !== 4
+  const own = await ownProcessGroup()
+  return own === null || pid !== own
+}
+
+export interface KillResult {
+  exited: boolean
+  waitMs: number
+}
+
+export type VerifiedKillResult = KillResult &
+  (
+    | {
+        killed: true
+        members?: number[]
       }
+    | { killed: false; reason: 'mismatch' | 'probe_failed' | 'unsafe' }
+  )
+
+export const KILL_WAIT_MS = process.platform === 'win32' ? 10_000 : 5_000
+const KILL_POLL_MS = process.platform === 'win32' ? 100 : 25
+
+function waitUntil(
+  gone: () => boolean,
+  startedAt: number,
+  boundMs: number,
+  goneOnTimeout?: () => Promise<boolean>
+): Promise<KillResult> {
+  return new Promise((resolve) => {
+    const deadline = monotonicNow() + boundMs
+    const poll = (): void => {
+      if (gone()) return resolve({ exited: true, waitMs: monotonicNow() - startedAt })
+      if (monotonicNow() >= deadline) {
+        void (goneOnTimeout ? goneOnTimeout().catch(() => false) : Promise.resolve(false)).then(
+          (exited) => resolve({ exited, waitMs: monotonicNow() - startedAt })
+        )
+        return
+      }
+      setTimeout(poll, KILL_POLL_MS).unref()
     }
-    waitForGroupExit()
+    poll()
   })
+}
+
+function posixGroupGone(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0)
+    return false
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'EPERM'
+  }
+}
+
+function taskkillTree(pid: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    execFile('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true }, () => resolve())
+  })
+}
+
+async function killWindowsTree(pid: number, startedAt: number): Promise<KillResult> {
+  const killing = taskkillTree(pid)
+  const snapshot = await snapshotWindowsTree(pid)
+  await killing
+  const pids = snapshot && snapshot.pids.length > 0 ? snapshot.pids : [pid]
+  return waitUntil(() => !pids.some(isPidAlive), startedAt, KILL_WAIT_MS)
+}
+
+async function killWindowsTreeVerified(
+  pid: number,
+  startedAt: number,
+  expectedRoot: string
+): Promise<VerifiedKillResult> {
+  const snapshot = await snapshotWindowsTree(pid)
+  if (!snapshot) {
+    return {
+      killed: false,
+      reason: 'probe_failed',
+      exited: false,
+      waitMs: monotonicNow() - startedAt
+    }
+  }
+  if (snapshot.rootCreated !== expectedRoot) {
+    return {
+      killed: false,
+      reason: 'mismatch',
+      exited: !isPidAlive(pid),
+      waitMs: monotonicNow() - startedAt
+    }
+  }
+  await taskkillTree(pid)
+  const pids = snapshot.pids.length > 0 ? snapshot.pids : [pid]
+  const result = await waitUntil(() => !pids.some(isPidAlive), startedAt, KILL_WAIT_MS)
+  return { killed: true, members: pids, ...result }
+}
+
+export function killProcessTree(proc: ChildProcess | null): Promise<KillResult> {
+  const pid = proc?.pid
+  if (!proc || !pid) return Promise.resolve({ exited: true, waitMs: 0 })
+  const startedAt = monotonicNow()
+  const done = (result: KillResult): KillResult => {
+    proc.stdout?.destroy()
+    proc.stderr?.destroy()
+    return result
+  }
+  if (process.platform === 'win32') {
+    return killWindowsTree(pid, startedAt).then(({ exited, waitMs }) => done({ exited, waitMs }))
+  }
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
+      return Promise.resolve(done({ exited: true, waitMs: 0 }))
+    }
+  }
+  return waitUntil(
+    () => posixGroupGone(pid),
+    startedAt,
+    KILL_WAIT_MS,
+    async () => !(await groupHasLiveMembers(pid))
+  ).then(done)
+}
+
+export async function killPidTree(pid: number, expectedStart: string): Promise<VerifiedKillResult> {
+  const startedAt = monotonicNow()
+  if (!(await isSafeToSignal(pid))) {
+    return { killed: false, reason: 'unsafe', exited: false, waitMs: 0 }
+  }
+  if (process.platform === 'win32') return killWindowsTreeVerified(pid, startedAt, expectedStart)
+  const members =
+    (await processGroupOf(pid).catch(() => null)) === pid
+      ? await groupMembers(pid).catch(() => [] as number[])
+      : []
+  const now = await readStartTimes([pid])
+  if (!now) {
+    return {
+      killed: false,
+      reason: 'probe_failed',
+      exited: false,
+      waitMs: monotonicNow() - startedAt
+    }
+  }
+  if (now.get(pid) !== expectedStart) {
+    return {
+      killed: false,
+      reason: 'mismatch',
+      exited: !isPidAlive(pid),
+      waitMs: monotonicNow() - startedAt
+    }
+  }
+  let group = true
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch {
+    group = false
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {}
+  }
+  const gone = group ? () => posixGroupGone(pid) : () => !isPidAlive(pid)
+  const result = await waitUntil(
+    gone,
+    startedAt,
+    KILL_WAIT_MS,
+    group ? async () => !(await groupHasLiveMembers(pid)) : undefined
+  )
+  return { killed: true, members: group ? [pid, ...members] : [pid], ...result }
 }
 
 export function findPidsByPort(port: number): Promise<number[]> {
@@ -120,10 +262,8 @@ export function findPidsByPort(port: number): Promise<number[]> {
         const target = `:${port}`
         for (const line of stdout.split('\n')) {
           const parts = line.trim().split(/\s+/)
-          // Format: Proto  LocalAddress  ForeignAddress  State  PID
           if (parts.length >= 5 && parts[3] === 'LISTENING') {
             const addr = parts[1]
-            // Match exactly :port at the end of the address (e.g. 0.0.0.0:8188 or 127.0.0.1:8188)
             if (addr && addr.endsWith(target)) {
               const pid = parseInt(parts[4]!, 10)
               if (pid > 0) pids.add(pid)
@@ -169,10 +309,23 @@ export function killByPort(port: number): Promise<void> {
   })
 }
 
+function probeTimeout(requested: number, remainingMs: number): number {
+  const wanted = Number.isFinite(requested) && requested > 0 ? requested : 2000
+  return Math.max(1, Math.min(wanted, Math.ceil(remainingMs)))
+}
+
 export function waitForPort(
   port: number,
   host: string = '127.0.0.1',
-  { timeoutMs = 60000, intervalMs = 500, onPoll, signal }: WaitOptions = {}
+  {
+    timeoutMs = 60000,
+    intervalMs = 500,
+    onPoll,
+    signal,
+    requestTimeoutMs = 2000,
+    quietMs = Number.POSITIVE_INFINITY,
+    lastOutputAt
+  }: WaitForPortOptions = {}
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now()
@@ -181,9 +334,6 @@ export function waitForPort(
     let activeReq: http.ClientRequest | undefined
     let retryTimer: ReturnType<typeof setTimeout> | undefined
 
-    // Settle the outer promise exactly once: tear down the abort listener,
-    // any pending retry, and the in-flight request so a late response can't
-    // resolve after cancellation.
     const settle = (fn: () => void): void => {
       if (done) return
       done = true
@@ -204,11 +354,16 @@ export function waitForPort(
 
     const poll = (): void => {
       if (done) return
-      const elapsed = Date.now() - start
-      if (elapsed > timeoutMs) {
+      const now = Date.now()
+      const elapsed = now - start
+      const quietFor = lastOutputAt ? now - lastOutputAt() : 0
+      if (elapsed > timeoutMs || quietFor > quietMs) {
+        const quiet = elapsed > timeoutMs ? '' : ` (no output for ${Math.round(quietFor / 1000)}s)`
         settle(() =>
           reject(
-            new Error(`Timed out waiting for port ${port} after ${Math.round(elapsed / 1000)}s`)
+            new Error(
+              `Timed out waiting for port ${port} after ${Math.round(elapsed / 1000)}s${quiet}`
+            )
           )
         )
         return
@@ -217,21 +372,21 @@ export function waitForPort(
       attempt++
       if (onPoll) onPoll({ attempt, elapsedMs: elapsed })
 
-      // Idempotency guard: `req.destroy()` on timeout synchronously emits
-      // 'error', so without it each timed-out attempt schedules TWO retry
-      // polls and the pollers multiply.
       let attemptSettled = false
       const retry = (): void => {
         if (attemptSettled || done) return
         attemptSettled = true
         retryTimer = setTimeout(poll, intervalMs)
       }
-      const req = http.get({ host, port, path: '/', timeout: 2000 }, (res) => {
-        res.resume()
-        if (attemptSettled || done) return
-        attemptSettled = true
-        settle(resolve)
-      })
+      const req = http.get(
+        { host, port, path: '/', timeout: probeTimeout(requestTimeoutMs, timeoutMs - elapsed) },
+        (res) => {
+          res.resume()
+          if (attemptSettled || done) return
+          attemptSettled = true
+          settle(resolve)
+        }
+      )
       activeReq = req
 
       req.on('error', retry)
@@ -247,7 +402,7 @@ export function waitForPort(
 
 export function waitForUrl(
   url: string,
-  { timeoutMs = 60000, intervalMs = 500, onPoll, signal }: WaitOptions = {}
+  { timeoutMs = 60000, intervalMs = 500, onPoll, signal, requestTimeoutMs = 2000 }: WaitOptions = {}
 ): Promise<void> {
   const client = url.startsWith('https') ? https : http
   return new Promise((resolve, reject) => {
@@ -257,9 +412,6 @@ export function waitForUrl(
     let activeReq: http.ClientRequest | undefined
     let retryTimer: ReturnType<typeof setTimeout> | undefined
 
-    // Same single-settlement teardown as waitForPort: an abort must cancel
-    // the in-flight request and pending retries so a late response can't
-    // resolve after cancellation.
     const settle = (fn: () => void): void => {
       if (done) return
       done = true
@@ -291,20 +443,22 @@ export function waitForUrl(
       attempt++
       if (onPoll) onPoll({ attempt, elapsedMs: elapsed })
 
-      // Same idempotency guard as waitForPort: destroy-on-timeout emits
-      // 'error', which must not schedule a second retry poll.
       let attemptSettled = false
       const retry = (): void => {
         if (attemptSettled || done) return
         attemptSettled = true
         retryTimer = setTimeout(poll, intervalMs)
       }
-      const req = client.get(url, { timeout: 2000 }, (res) => {
-        res.resume()
-        if (attemptSettled || done) return
-        attemptSettled = true
-        settle(resolve)
-      })
+      const req = client.get(
+        url,
+        { timeout: probeTimeout(requestTimeoutMs, timeoutMs - elapsed) },
+        (res) => {
+          res.resume()
+          if (attemptSettled || done) return
+          attemptSettled = true
+          settle(resolve)
+        }
+      )
       activeReq = req
 
       req.on('error', retry)
@@ -322,7 +476,6 @@ export function getProcessInfo(pid: number): Promise<ProcessInfo | null> {
   if (!Number.isInteger(pid) || pid <= 0) return Promise.resolve(null)
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
-      // Use PowerShell Get-CimInstance with JSON output (wmic is deprecated/removed on modern Windows)
       const cmd = `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object Name,CommandLine | ConvertTo-Json`
       execFile(
         'powershell',
@@ -359,7 +512,6 @@ export function getProcessInfo(pid: number): Promise<ProcessInfo | null> {
 export function looksLikeComfyUI(info: ProcessInfo | null): boolean {
   if (!info) return false
   const cmd = (info.commandLine || '').toLowerCase()
-  // Match ComfyUI's main.py entry point and any path containing "comfyui"
   return cmd.includes('main.py') && cmd.includes('comfyui')
 }
 
@@ -373,16 +525,6 @@ export function setPortArg(launchCmd: LaunchCmd, port: number): void {
   launchCmd.port = port
 }
 
-/**
- * Whether a TCP connect to `host:port` succeeds within `timeoutMs`. Used as
- * positive proof that something is listening — bind probes alone aren't
- * reliable on Windows because Winsock can let a `127.0.0.1` bind succeed
- * while another process owns the same port via `0.0.0.0` / `::`.
- *
- * Loopback only: never connect to a non-loopback address, both because we
- * don't want to touch arbitrary remote hosts and because loopback connects
- * never trigger Windows Defender / macOS firewall prompts.
- */
 function canConnect(port: number, host: string, timeoutMs: number = 250): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket()
@@ -405,19 +547,6 @@ function canConnect(port: number, host: string, timeoutMs: number = 250): Promis
   })
 }
 
-/**
- * Whether a server can bind `host:port`. Resolves `true` on successful
- * bind, `false` on `EADDRINUSE` / `EACCES`. Other errors (address family
- * unavailable, etc.) resolve `false` too — the caller treats "couldn't
- * bind for any reason" as "don't try to launch here."
- *
- * Never binds a non-loopback / non-requested address: a bind on `0.0.0.0`
- * or `::` would trigger the OS firewall ("allow incoming connections?")
- * prompt the first time the app runs, which is a poor first-launch
- * experience just to probe a port. The loopback connect probe in
- * `isPortListening` already catches the wildcard-peer case we'd otherwise
- * want this for.
- */
 function canBind(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer()
@@ -433,28 +562,26 @@ function canBind(port: number, host: string): Promise<boolean> {
   })
 }
 
-/**
- * Check whether a port is already in use. Combines two probes so we don't
- * miss listeners on Windows, where a `127.0.0.1` bind test can succeed
- * even when another process owns the same port via `0.0.0.0` / `::`:
- *
- *  1. TCP connect to loopback (`127.0.0.1`, `::1`) — positive proof that
- *     a listener is reachable, regardless of which interface it bound.
- *     A peer on `0.0.0.0:N` or `[::]:N` answers loopback connects too, so
- *     we don't need to bind-probe the wildcard ourselves (which would
- *     trigger the OS firewall prompt).
- *  2. Bind probe on the requested host — catches non-listening
- *     reservations and ports owned by other users that
- *     `lsof` / `findPidsByPort` can't see on Linux.
- *
- * Either probe reporting "busy" wins.
- */
 export async function isPortListening(port: number, host: string = '127.0.0.1'): Promise<boolean> {
   const connectHosts = ['127.0.0.1', '::1']
   const connectResults = await Promise.all(connectHosts.map((h) => canConnect(port, h)))
   if (connectResults.some(Boolean)) return true
 
   return !(await canBind(port, host))
+}
+
+export async function waitForPortFree(
+  port: number,
+  host: string = '127.0.0.1',
+  timeoutMs: number = 2_000,
+  intervalMs: number = 50
+): Promise<boolean> {
+  const deadline = monotonicNow() + timeoutMs
+  for (;;) {
+    if (!(await isPortListening(port, host))) return true
+    if (monotonicNow() >= deadline) return false
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
 }
 
 export async function findAvailablePort(
@@ -469,10 +596,6 @@ export async function findAvailablePort(
   }
   throw new Error(`No available ports found between ${startPort} and ${endPort}`)
 }
-
-// --- Port lock files ---
-// When the launcher spawns ComfyUI on a port, it writes a lock file so other
-// launcher instances can identify the owner without inspecting process trees.
 
 function portLockDir(): string {
   return path.join(stateDir(), 'port-locks')
@@ -510,7 +633,6 @@ export function readPortLock(port: number): PortLock | null {
     const raw = fs.readFileSync(portLockPath(port), 'utf-8')
     const lock = JSON.parse(raw) as PortLock | null
     if (!lock || !lock.pid || !isProcessAlive(lock.pid)) {
-      // Stale lock — clean it up
       removePortLock(port)
       return null
     }

@@ -1,15 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, inject, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Settings } from 'lucide-vue-next'
+import InputGroupButton from '@comfyorg/design-system/input-group/InputGroupButton'
+import { Settings } from '@lucide/vue'
 import ArgsRawInput from './ArgsRawInput.vue'
+import BetaArgsPill from './BetaArgsPill.vue'
+import { SETTINGS_REOPEN_EPOCH } from './settingsReopenEpoch'
 import type { ComfyArgDef, DetailField } from '../../types/ipc'
-
-/**
- * Compact summary row for the `launchArgs` field. Shows the current
- * arg string with inline autocomplete and a gear icon that opens the
- * full `ArgsBuilderPage` sub-page.
- */
 
 interface Props {
   field: DetailField
@@ -32,24 +29,26 @@ watch(stringValue, (v) => {
 })
 
 const schema = ref<ComfyArgDef[]>([])
+const schemaVersion = ref(0)
+let schemaSeq = 0
 
 async function loadSchema(id: string | undefined): Promise<void> {
+  const seq = ++schemaSeq
   if (!id) {
     schema.value = []
     return
   }
-  try {
-    const result = await window.api.getComfyArgs(id)
-    schema.value = result?.args ?? []
-  } catch {
-    schema.value = []
-  }
+  const result = await window.api.getComfyArgs(id).catch(() => null)
+  if (seq !== schemaSeq) return
+  schema.value = result?.args ?? []
+  schemaVersion.value++
 }
 
-onMounted(() => void loadSchema(props.installationId))
+const reopenEpoch = inject(SETTINGS_REOPEN_EPOCH, null)
 watch(
-  () => props.installationId,
-  (id) => void loadSchema(id)
+  () => [props.installationId, reopenEpoch?.value] as const,
+  ([id]) => void loadSchema(id),
+  { immediate: true }
 )
 
 function handleEdit(): void {
@@ -69,19 +68,25 @@ function handleChange(value: string): void {
   <ArgsRawInput
     :model-value="localValue"
     :schema="schema"
-    :placeholder="t('comfyUISettings.argsPlaceholder', 'No arguments set')"
+    :placeholder="t('comfyUISettings.argsPlaceholder')"
     :aria-label="field.label"
     @update:model-value="handleInput"
     @change="handleChange"
   >
     <template #trailing>
-      <button
-        type="button"
-        :aria-label="t('comfyUISettings.configureArgs', 'Configure arguments')"
+      <BetaArgsPill
+        v-if="installationId"
+        :installation-id="installationId"
+        :args-value="stringValue"
+        :schema-version="schemaVersion"
+      />
+      <InputGroupButton
+        size="icon-sm"
+        :aria-label="t('comfyUISettings.configureArgs')"
         @click="handleEdit"
       >
         <Settings :size="14" />
-      </button>
+      </InputGroupButton>
     </template>
   </ArgsRawInput>
 </template>

@@ -1,21 +1,17 @@
-/** Test-only helpers on `globalThis.__e2eRenderer` so Playwright can drive
- *  UI state normally produced by long-running code paths. PanelApp binds
- *  the callbacks during setup; production never references the global. */
-import { useSessionStore } from '../stores/sessionStore'
+import { useSessionStore, type ErrorInstance } from '../stores/sessionStore'
+import { useProgressStore, type Operation } from '../stores/progressStore'
 import type { ActionResult, ShowProgressOpts } from '../types/ipc'
+import { progressTitle } from '../lib/progressTitle'
 
 export interface InjectProgressErrorOpts {
   installationId: string
   title?: string
-  /** Body of the error block. Long strings exercise the overflow / clamp rules. */
   errorMessage: string
 }
 
 export interface InjectProgressSuccessOpts {
   installationId: string
   title?: string
-  /** When set, ProgressModal's handleDone calls
-   *  `window.api.openInstallWindow(newInstallationId)` after the op finishes. */
   newInstallationId?: string
 }
 
@@ -23,7 +19,6 @@ export interface InjectRetryableProgressErrorOpts {
   installationId: string
   title?: string
   errorMessage: string
-  /** Consecutive failures before the apiCall resolves `{ ok: true }`. Default 1. */
   failuresBeforeSuccess?: number
 }
 
@@ -31,9 +26,7 @@ export interface InjectPortConflictResultOpts {
   installationId: string
   title?: string
   port: number
-  /** When set, ProgressModal renders the "Use port N" CTA. */
   nextPort?: number
-  /** Drives the visibility of the "Stop process and retry" CTA. */
   isComfy?: boolean
   pids?: number[]
 }
@@ -50,11 +43,40 @@ export interface StartInFlightOpOpts {
   opKind?: ShowProgressOpts['opKind']
   destroysInstance?: boolean
   triggersInstanceStart?: boolean
+  cancellable?: boolean
 }
 
 export interface SettleInFlightOpOpts {
   installationId: string
   result: ActionResult
+}
+
+export interface InstanceEventRecord {
+  channel: 'instance-launching' | 'instance-started' | 'instance-crashed'
+  installationId: string
+  atMs: number
+}
+
+export interface ProgressOperationSnapshot {
+  title: string
+  opKind: Operation['opKind']
+  actionId: string | undefined
+  done: boolean
+  finished: boolean
+  error: string | null
+  superseded: boolean
+  result: ActionResult | null
+  startedAtMs: number
+}
+
+export interface LaunchDiagnostics {
+  nowMs: number
+  errorEntry: ErrorInstance | null
+  launching: boolean
+  running: boolean
+  operationInstance: { actionId: string; sessionId?: string } | null
+  progressOperation: ProgressOperationSnapshot | null
+  instanceEvents: InstanceEventRecord[]
 }
 
 interface PanelBindings {
@@ -64,39 +86,32 @@ interface PanelBindings {
 
 let bindings: PanelBindings | null = null
 
-/** Per-installation invocation counter for the injected apiCall. */
 const injectedApiCallCounts = new Map<string, number>()
 
-/** Deferred apiCall resolvers for `startInFlightOp`, keyed by
- *  installationId so `settleInFlightOp` resolves the right one. */
 const inFlightSettlers = new Map<string, (result: ActionResult) => void>()
 
+const instanceEvents: InstanceEventRecord[] = []
+
+function recordInstanceEvent(
+  channel: InstanceEventRecord['channel'],
+  installationId: string
+): void {
+  instanceEvents.push({ channel, installationId, atMs: Date.now() })
+}
+
 export interface E2ERendererHelpers {
-  /** Show-progress with an apiCall that resolves `{ ok: false, message }`
-   *  so ProgressModal paints its post-failure state. */
   injectProgressError(opts: InjectProgressErrorOpts): Promise<void>
-  /** Show-progress with a synthetic successful copy-style result. */
   injectProgressSuccess(opts: InjectProgressSuccessOpts): Promise<void>
-  /** Read renderer-side `sessionStore.isRunning(id)` so tests can poll on
-   *  the stop broadcast having propagated before asserting. */
   isRunning(installationId: string): boolean
-  /** Show-progress with an apiCall that fails `failuresBeforeSuccess`
-   *  times then resolves `{ ok: true }`, to test `handleReboot` re-runs
-   *  the same `op.apiCall`. */
   injectRetryableProgressError(opts: InjectRetryableProgressErrorOpts): Promise<void>
-  /** Show-progress with a port-conflict result. Increments
-   *  `injectedApiCallCounts` so the "Kill Process" re-invocation is observable. */
   injectPortConflictResult(opts: InjectPortConflictResultOpts): Promise<void>
-  /** Seed `sessionStore.errorInstances` directly without failing a real op. */
   seedErrorInstance(opts: SeedErrorInstanceOpts): void
   hasErrorInstance(installationId: string): boolean
   getInjectedApiCallCount(installationId: string): number
-  /** Seed an in-flight op whose `apiCall` stays pending until `settleInFlightOp`. */
   startInFlightOp(opts: StartInFlightOpOpts): Promise<void>
-  /** Resolve a pending in-flight op; `false` if no settler exists. */
   settleInFlightOp(opts: SettleInFlightOpOpts): boolean
-  /** Run `useActionGuard.checkBeforeAction` directly. */
   runActionGuard(opts: { installationId: string; actionLabel: string }): Promise<boolean>
+  getLaunchDiagnostics(installationId: string): LaunchDiagnostics
 }
 
 function ensureBound(): PanelBindings {
@@ -106,19 +121,26 @@ function ensureBound(): PanelBindings {
   return bindings
 }
 
-/** Called from `PanelApp.vue` once `handleShowProgress` is in scope.
- *  Pass `null` on unmount so a stale closure can't keep driving the chain. */
 export function bindE2EPanelHooks(next: PanelBindings | null): void {
   bindings = next
 }
 
 export function registerE2ERendererHooks(): void {
+  window.api.onInstanceLaunching(({ installationId }) =>
+    recordInstanceEvent('instance-launching', installationId)
+  )
+  window.api.onInstanceStarted(({ installationId }) =>
+    recordInstanceEvent('instance-started', installationId)
+  )
+  window.api.onInstanceCrashed(({ installationId }) =>
+    recordInstanceEvent('instance-crashed', installationId)
+  )
   const helpers: E2ERendererHelpers = {
     async injectProgressError({ installationId, title, errorMessage }) {
       const b = ensureBound()
       await b.showProgress({
         installationId,
-        title: title ?? `Failed op — ${installationId}`,
+        title: title ?? progressTitle('Failed op', installationId),
         opKind: 'generic',
         apiCall: () => Promise.resolve({ ok: false, message: errorMessage })
       })
@@ -127,7 +149,7 @@ export function registerE2ERendererHooks(): void {
       const b = ensureBound()
       await b.showProgress({
         installationId,
-        title: title ?? `Copy — ${installationId}`,
+        title: title ?? progressTitle('Copy', installationId),
         opKind: 'generic',
         apiCall: () =>
           Promise.resolve({
@@ -148,11 +170,10 @@ export function registerE2ERendererHooks(): void {
     }) {
       const b = ensureBound()
       const failsRequired = failuresBeforeSuccess ?? 1
-      // Reset so a leaked op from a previous test can't skew the count.
       injectedApiCallCounts.set(installationId, 0)
       await b.showProgress({
         installationId,
-        title: title ?? `Retryable failed op — ${installationId}`,
+        title: title ?? progressTitle('Retryable failed op', installationId),
         opKind: 'generic',
         apiCall: () => {
           const next = (injectedApiCallCounts.get(installationId) ?? 0) + 1
@@ -169,7 +190,7 @@ export function registerE2ERendererHooks(): void {
       await b.showProgress({
         installationId,
         title: title ?? `Launching ComfyUI`,
-        opKind: 'generic',
+        opKind: 'launch',
         triggersInstanceStart: true,
         apiCall: () => {
           const next = (injectedApiCallCounts.get(installationId) ?? 0) + 1
@@ -203,20 +224,21 @@ export function registerE2ERendererHooks(): void {
       title,
       opKind,
       destroysInstance,
-      triggersInstanceStart
+      triggersInstanceStart,
+      cancellable
     }) {
       const b = ensureBound()
-      // Replace any prior settler so a leaked op can't intercept this resolve.
       inFlightSettlers.get(installationId)?.({ ok: false, cancelled: true })
       const pending = new Promise<ActionResult>((resolve) => {
         inFlightSettlers.set(installationId, resolve)
       })
       await b.showProgress({
         installationId,
-        title: title ?? `In-flight — ${installationId}`,
+        title: title ?? progressTitle('In-flight', installationId),
         opKind: opKind ?? 'generic',
         destroysInstance: destroysInstance ?? false,
         triggersInstanceStart: triggersInstanceStart ?? false,
+        cancellable: cancellable ?? false,
         apiCall: () => pending
       })
     },
@@ -229,6 +251,31 @@ export function registerE2ERendererHooks(): void {
     },
     runActionGuard({ installationId, actionLabel }) {
       return ensureBound().actionGuard.checkBeforeAction(installationId, actionLabel)
+    },
+    getLaunchDiagnostics(installationId) {
+      const sessionStore = useSessionStore()
+      const op = useProgressStore().operations.get(installationId)
+      return {
+        nowMs: Date.now(),
+        errorEntry: sessionStore.errorInstances.get(installationId) ?? null,
+        launching: sessionStore.isLaunching(installationId),
+        running: sessionStore.isRunning(installationId),
+        operationInstance: sessionStore.operationInstances.get(installationId) ?? null,
+        progressOperation: op
+          ? {
+              title: op.title,
+              opKind: op.opKind,
+              actionId: op.actionId,
+              done: op.done,
+              finished: op.finished,
+              error: op.error,
+              superseded: op.superseded,
+              result: op.result,
+              startedAtMs: op._startedAtMs
+            }
+          : null,
+        instanceEvents: instanceEvents.filter((e) => e.installationId === installationId)
+      }
     }
   }
   ;(globalThis as unknown as { __e2eRenderer: E2ERendererHelpers }).__e2eRenderer = helpers

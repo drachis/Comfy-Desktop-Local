@@ -1,0 +1,149 @@
+import os from 'node:os'
+import path from 'node:path'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { test, expect } from '@playwright/test'
+import en from '../locales/en.json'
+import { launchApp, type AppContext } from './launchApp'
+import { expectChooserVisible, pickFromBuildsTileMenu } from './support/chooserHelpers'
+import { getIpcInvocations, hasActiveLaunch } from './support/devHooks'
+import { reserveFreePort, writeFakeComfyInstall } from './support/fakeComfyInstall'
+
+const INSTALL_ID = 'inst-assets-startup-failure'
+const INSTALL_NAME = 'Assets Startup Failure Install'
+const DISABLE_HINT = 'Or start ComfyUI without the assets system: --disable-assets'
+const NEW_ERROR_BADGE = '.chooser-tile-error-badge:not([data-earlier-failure])'
+
+let rootDir = ''
+let installPath = ''
+let ctx: AppContext | null = null
+
+test.describe.configure({ mode: 'serial' })
+test.setTimeout(180_000)
+
+function coreRefusal(kind: string, ...message: string[]): string {
+  return (
+    'INFO  [alembic.runtime.migration] Context impl SQLiteImpl.\n' +
+    `\u001b[1m\u001b[31m[ERROR]\u001b[0m ASSETS_STARTUP_FAILED: ${kind}\n` +
+    `${[...message, DISABLE_HINT].join('\n')}\n`
+  )
+}
+
+interface ActiveLaunchPoll {
+  atMs: number
+  active: boolean
+}
+
+async function printWhyNoErrorBadge(
+  launchPickStartedAtMs: number,
+  activeLaunchPolls: ActiveLaunchPoll[]
+): Promise<void> {
+  const runActions = await getIpcInvocations(ctx!.app, 'run-action')
+  const panelState = await ctx!.panel.evaluate<string>(
+    `JSON.stringify(window.__e2eRenderer.getLaunchDiagnostics(${JSON.stringify(INSTALL_ID)}))`
+  )
+  console.log(
+    `[assets-startup-failure] no new error badge: launchPickStartedAtMs=${launchPickStartedAtMs} ` +
+      `activeLaunchPolls=${JSON.stringify(activeLaunchPolls)}\n` +
+      `run-action calls=${JSON.stringify(runActions)}\n` +
+      `panel=${panelState}`
+  )
+}
+
+async function launchAndReadError(stderr: string): Promise<string | null> {
+  await writeFile(path.join(installPath, 'startup-failure'), stderr)
+  await ctx!.panel.evaluate<boolean>(`(() => {
+    document.querySelector('.chooser-tile-error-badge')?.setAttribute('data-earlier-failure', '')
+    return true
+  })()`)
+  const activeLaunchPolls: ActiveLaunchPoll[] = []
+  const launchPickStartedAtMs = Date.now()
+  await pickFromBuildsTileMenu(ctx!.panel, INSTALL_ID, 'launch')
+  await expect
+    .poll(
+      async () => {
+        const active = await hasActiveLaunch(ctx!.app, INSTALL_ID)
+        activeLaunchPolls.push({ atMs: Date.now(), active })
+        return active
+      },
+      { timeout: 60_000 }
+    )
+    .toBe(false)
+  try {
+    await ctx!.panel.waitForVisible(NEW_ERROR_BADGE, { timeout: 30_000 })
+  } catch (err) {
+    await printWhyNoErrorBadge(launchPickStartedAtMs, activeLaunchPolls).catch((error: unknown) =>
+      console.log(`[assets-startup-failure] diagnostics failed: ${(error as Error).message}`)
+    )
+    throw err
+  }
+  await pickFromBuildsTileMenu(ctx!.panel, INSTALL_ID, 'view-error')
+  await ctx!.panel.waitForVisible('[data-testid="build-progress-step-detail"]', {
+    timeout: 10_000
+  })
+  const text = await ctx!.panel.textOf('[data-testid="build-progress-step-detail"]')
+  expect(await ctx!.panel.click('[data-testid="build-progress-close-failed"]')).toBe(true)
+  await expectChooserVisible(ctx!.panel)
+  return text
+}
+
+test.beforeAll(async () => {
+  test.setTimeout(180_000)
+  rootDir = await mkdtemp(path.join(os.tmpdir(), 'comfyui-assets-startup-failure-'))
+  installPath = path.join(rootDir, 'install')
+  const { port } = await writeFakeComfyInstall({ installPath, port: await reserveFreePort() })
+  ctx = await launchApp({
+    profileDir: path.join(rootDir, 'profile'),
+    settings: {
+      firstUseCompleted: true,
+      telemetryEnabled: false,
+      betaFeaturesEnabled: false,
+      hasSeenCentralPillHint: true
+    },
+    installations: [
+      {
+        id: INSTALL_ID,
+        name: INSTALL_NAME,
+        sourceId: 'comfybuilder',
+        sourceLabel: 'ComfyBuilder',
+        installPath,
+        status: 'installed',
+        launchArgs: `--port ${port}`,
+        launchMode: 'window',
+        seen: true,
+        comfyVersion: {
+          commit: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+          baseTag: 'v0.3.99',
+          commitsAhead: 0,
+          baseTagVerified: true
+        }
+      }
+    ]
+  })
+  await expectChooserVisible(ctx.panel)
+})
+
+test.afterAll(async () => {
+  await ctx?.cleanup()
+  if (rootDir) await rm(rootDir, { recursive: true, force: true })
+})
+
+test("shows the core's message for an asset database it cannot open @linux @macos", async () => {
+  const what = "The asset database '/x/user/comfyui.db' is corrupt (file is not a database)."
+  const fix = 'Move that file aside, or delete it, and start again.'
+
+  const text = await launchAndReadError(coreRefusal('corrupt', what, fix))
+
+  expect(text).toBe(`${what}\n${fix}\n${DISABLE_HINT}`)
+})
+
+test('shows the lock message when another ComfyUI holds the database, without --enable-assets @linux @macos', async () => {
+  const text = await launchAndReadError(
+    coreRefusal(
+      'in_use',
+      "Another ComfyUI is already using this database: '/x/user/comfyui.db'.",
+      'Close the other ComfyUI and start this one again.'
+    )
+  )
+
+  expect(text).toBe(en.errors.comfyDbLocked)
+})

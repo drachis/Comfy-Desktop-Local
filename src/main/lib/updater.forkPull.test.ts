@@ -11,7 +11,7 @@ const todesktopMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('electron', () => ({
-  app: { isPackaged: false, getPath: () => '', getVersion: () => '1.0.0' },
+  app: { isPackaged: false, getPath: () => '', getVersion: () => '1.0.0', on: vi.fn() },
   ipcMain: { handle: vi.fn() },
   BrowserWindow: { getAllWindows: () => [] }
 }))

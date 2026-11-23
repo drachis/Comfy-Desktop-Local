@@ -1,10 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, flushPromises } from '@vue/test-utils'
+import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 
 interface MockMenuItem {
   id?: string
   label?: string
-  checked?: boolean
   kind?: 'separator'
 }
 
@@ -44,6 +43,7 @@ interface MockBridgeState {
   closeCalls: number
   readyCalls: number
   notifyRenderedCalls: number
+  renderAckWaiters: (() => void)[]
   openSettingsTabCalls: string[]
   downloadsActionCalls: unknown[]
   pickInstallCalls: string[]
@@ -68,6 +68,7 @@ function installMockBridge(): MockBridgeState {
     closeCalls: 0,
     readyCalls: 0,
     notifyRenderedCalls: 0,
+    renderAckWaiters: [],
     openSettingsTabCalls: [],
     downloadsActionCalls: [],
     pickInstallCalls: [],
@@ -86,6 +87,7 @@ function installMockBridge(): MockBridgeState {
     },
     notifyRendered: () => {
       state.notifyRenderedCalls += 1
+      state.renderAckWaiters.splice(0).forEach((seeAck) => seeAck())
     },
     onConfig: (cb: (cfg: MockPopupConfig) => void) => {
       state.configCallbacks.push(cb)
@@ -143,7 +145,19 @@ function installMockBridge(): MockBridgeState {
   return state
 }
 
-describe('TitlePopupApp', () => {
+function nextRenderAck<Seen>(state: MockBridgeState, seenAtAck: () => Seen): Promise<Seen> {
+  return new Promise((resolve) => state.renderAckWaiters.push(() => resolve(seenAtAck())))
+}
+
+function menuLabels(wrapper: VueWrapper): string[] {
+  return wrapper.findAll('.menu .item').map((item) => item.text())
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+describe('TitlePopupApp', { timeout: 20_000 }, () => {
   let bridgeState: MockBridgeState
 
   beforeEach(() => {
@@ -158,8 +172,6 @@ describe('TitlePopupApp', () => {
     expect(bridgeState.readyCalls).toBe(1)
   })
 
-  // Locale lives at the popup root so every kind tracks main's language live —
-  // not just the instance-picker view once it's clicked open.
   it('pulls main locale on mount and subscribes for live changes', async () => {
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
     mount(TitlePopupApp)
@@ -184,11 +196,7 @@ describe('TitlePopupApp', () => {
     bridgeState.configCallbacks.forEach((cb) =>
       cb({
         kind: 'menu',
-        items: [
-          { id: 'a', label: 'Alpha' },
-          { kind: 'separator' },
-          { id: 'b', label: 'Beta', checked: true }
-        ],
+        items: [{ id: 'a', label: 'Alpha' }, { kind: 'separator' }, { id: 'b', label: 'Beta' }],
         theme: { bg: '#262729', text: '#dddddd' }
       })
     )
@@ -207,7 +215,7 @@ describe('TitlePopupApp', () => {
     bridgeState.configCallbacks.forEach((cb) =>
       cb({
         kind: 'menu',
-        items: [{ id: 'open-feedback', label: 'Send Feedback' }],
+        items: [{ id: 'open-feedback', label: 'Send feedback' }],
         theme: { bg: '#262729', text: '#dddddd' }
       })
     )
@@ -232,12 +240,10 @@ describe('TitlePopupApp', () => {
   })
 
   it('acks via notifyRendered after a config flush so main can show the view', async () => {
-    // The render-ack runs in a rAF; jsdom resolves rAF via a setTimeout
-    // shim, so we wait one macrotask.
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
-    mount(TitlePopupApp)
+    const wrapper = mount(TitlePopupApp)
     await flushPromises()
-    const before = bridgeState.notifyRenderedCalls
+    const menuAtAck = nextRenderAck(bridgeState, () => menuLabels(wrapper))
     bridgeState.configCallbacks.forEach((cb) =>
       cb({
         kind: 'menu',
@@ -245,9 +251,7 @@ describe('TitlePopupApp', () => {
         theme: { bg: '#262729', text: '#dddddd' }
       })
     )
-    await flushPromises()
-    await new Promise((r) => setTimeout(r, 20))
-    expect(bridgeState.notifyRenderedCalls).toBeGreaterThan(before)
+    expect(await menuAtAck).toEqual(['Alpha'])
   })
 
   it('asks main to close on Escape', async () => {
@@ -260,23 +264,54 @@ describe('TitlePopupApp', () => {
     wrapper.unmount()
   })
 
-  it('applies theme colors to the popup card', async () => {
+  it('stays open when Escape only ends an input method composition', async () => {
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
-    const wrapper = mount(TitlePopupApp)
+    const wrapper = mount(TitlePopupApp, { attachTo: document.body })
     await flushPromises()
-    bridgeState.configCallbacks.forEach((cb) =>
-      cb({
-        kind: 'menu',
-        items: [],
-        theme: { bg: '#1f2024', text: '#eeeeee' }
-      })
-    )
+    const composingEscape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      isComposing: true,
+      cancelable: true
+    })
+    window.dispatchEvent(composingEscape)
     await flushPromises()
-    const style = wrapper.find('.popup').attributes('style') ?? ''
-    // Browsers normalize hex to rgb in inline styles.
-    expect(style).toMatch(/background:\s*(#1f2024|rgb\(31,\s*32,\s*36\))/i)
-    expect(style).toMatch(/color:\s*(#eeeeee|rgb\(238,\s*238,\s*238\))/i)
+    expect(bridgeState.closeCalls).toBe(0)
+    expect(composingEscape.defaultPrevented).toBe(false)
+    wrapper.unmount()
   })
+
+  it('stays open when Escape was already handled, as when it cancels a rename', async () => {
+    const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
+    const wrapper = mount(TitlePopupApp, { attachTo: document.body })
+    await flushPromises()
+    const handled = new KeyboardEvent('keydown', { key: 'Escape', cancelable: true })
+    handled.preventDefault()
+    window.dispatchEvent(handled)
+    await flushPromises()
+    expect(bridgeState.closeCalls).toBe(0)
+    wrapper.unmount()
+  })
+
+  it.each(['menu', 'downloads'] as const)(
+    'keeps %s on the Desktop palette when the editor theme changes',
+    async (kind) => {
+      const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
+      const wrapper = mount(TitlePopupApp)
+      await flushPromises()
+      for (const theme of [
+        { bg: '#1f2024', text: '#eeeeee' },
+        { bg: '#f5f5f5', text: '#333333' }
+      ]) {
+        bridgeState.configCallbacks.forEach((cb) => cb({ kind, items: [], theme }))
+        await flushPromises()
+        const popup = wrapper.get('.popup')
+        expect(popup.classes()).not.toContain('is-light')
+        expect(popup.attributes('style')).toBeUndefined()
+        expect(wrapper.find(kind === 'menu' ? '.menu' : '.downloads').exists()).toBe(true)
+      }
+      wrapper.unmount()
+    }
+  )
 
   it('re-keys the popup root when the will-show event fires, resetting per-open transient state', async () => {
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
@@ -301,8 +336,6 @@ describe('TitlePopupApp', () => {
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
     const wrapper = mount(TitlePopupApp)
     await flushPromises()
-    // A snapshot pushed while the menu view is mounted must still be
-    // visible once we flip to 'downloads'.
     bridgeState.downloadsCallbacks.forEach((cb) =>
       cb({
         active: [
@@ -325,12 +358,11 @@ describe('TitlePopupApp', () => {
   })
 
   it('suppresses stale render-acks on rapid back-to-back configs', async () => {
-    // Only the most recent config's ack should fire so main never marks an
-    // older config as synced after the user has moved past it.
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
-    mount(TitlePopupApp)
+    const wrapper = mount(TitlePopupApp)
     await flushPromises()
     const before = bridgeState.notifyRenderedCalls
+    const menuAtFirstAck = nextRenderAck(bridgeState, () => menuLabels(wrapper))
     bridgeState.configCallbacks.forEach((cb) =>
       cb({
         kind: 'menu',
@@ -345,8 +377,8 @@ describe('TitlePopupApp', () => {
         theme: { bg: '#262729', text: '#dddddd' }
       })
     )
-    await flushPromises()
-    await new Promise((r) => setTimeout(r, 30))
+    expect(await menuAtFirstAck).toEqual(['Beta'])
+    await nextFrame()
     expect(bridgeState.notifyRenderedCalls - before).toBe(1)
   })
 
@@ -359,8 +391,6 @@ describe('TitlePopupApp', () => {
     expect(bridgeState.closeCalls).toBe(0)
   })
 
-  // The picker's modal layer must not survive a kind-switch hide; main
-  // fires dismiss-modals before hiding so a half-open confirm isn't stranded.
   it('cancels any open useModal entry when main fires dismiss-modals', async () => {
     const { useModal } = await import('../composables/useModal')
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
@@ -375,11 +405,6 @@ describe('TitlePopupApp', () => {
     expect(modal.state.visible).toBe(false)
   })
 
-  // A reopened picker auto-fires its action confirm right after `set-config`.
-  // Because `will-show` arrives AFTER `set-config`, a `will-show` dismiss would
-  // kill that freshly opened confirm — the exact bug where reopening the SAME
-  // install's pill never re-showed the modal. The picker is dismissed in
-  // `onConfig` instead, so `will-show` must NOT dismiss for the picker.
   it('does NOT dismiss an open modal on will-show for the instance-picker', async () => {
     const { useModal } = await import('../composables/useModal')
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
@@ -395,9 +420,6 @@ describe('TitlePopupApp', () => {
     await expect(pending).resolves.toBe(false)
   })
 
-  // Non-picker kinds still rely on will-show to clear a confirm left pending
-  // when the user blurred the popup (those kinds may hit the fast path and skip
-  // set-config, so onConfig can't own their cleanup).
   it('still dismisses an open modal on will-show for non-picker kinds', async () => {
     const { useModal } = await import('../composables/useModal')
     const { default: TitlePopupApp } = await import('./TitlePopupApp.vue')
@@ -412,11 +434,7 @@ describe('TitlePopupApp', () => {
   })
 })
 
-// The global-settings view is the popup's `v-else` branch, so it renders from
-// an App-level ref rather than from props main controls directly. Both the ref
-// initializer and the live push have to carry `telemetryGranted` or todo 16's
-// toggle reads `undefined` — which is not `false` to a strict entry rule.
-describe('TitlePopupApp global-settings telemetry grant', () => {
+describe('TitlePopupApp global-settings telemetry grant', { timeout: 20_000 }, () => {
   let bridgeState: MockBridgeState
 
   const globalSettingsViewStub = {

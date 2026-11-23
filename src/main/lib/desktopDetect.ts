@@ -4,11 +4,10 @@ import { execFile } from 'child_process'
 import { homedir } from 'os'
 
 import { scanCustomNodes } from './nodes'
+import { parsePipFreeze, uvEnv } from './pip'
 import type { Snapshot } from './snapshots'
 import * as i18n from './i18n'
 
-// On macOS, accessing TCC-protected dirs returns EACCES/EPERM if the user
-// denies the prompt; surface a clear error instead of treating it as missing.
 export function assertReadable(dirPath: string): void {
   try {
     fs.accessSync(dirPath, fs.constants.R_OK)
@@ -21,9 +20,6 @@ export function assertReadable(dirPath: string): void {
   }
 }
 
-// Marker written at the legacy basePath after a successful adoption; when
-// present, detectDesktopInstall() returns null ("already migrated"). Shared
-// with desktopAdopt.ts (re-exported there as MARKER_FILE).
 export const ADOPT_MARKER_FILE = '.comfyui-desktop-2'
 
 export interface DesktopInstallInfo {
@@ -77,14 +73,11 @@ export function detectDesktopInstall(): DesktopInstallInfo | null {
   }
 
   if (!fs.existsSync(basePath)) {
-    // In config but not on disk — distinguish a permission issue.
     assertReadable(path.dirname(basePath))
     return null
   }
   assertReadable(basePath)
 
-  // Adoption marker disqualifies this workspace; check before the models/user
-  // checks so a half-cleaned legacy dir doesn't resurrect as a desktop card.
   if (fs.existsSync(path.join(basePath, ADOPT_MARKER_FILE))) return null
 
   const hasModels = fs.existsSync(path.join(basePath, 'models'))
@@ -115,7 +108,7 @@ export async function pipFreezeDirect(pythonPath: string): Promise<Record<string
     execFile(
       pythonPath,
       ['-m', 'pip', 'freeze', '--local'],
-      { windowsHide: true, timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+      { windowsHide: true, timeout: 60_000, maxBuffer: 10 * 1024 * 1024, env: uvEnv() },
       (err, stdout, stderr) => {
         if (err) {
           const detail = stderr ? stderr.slice(0, 500) : err.message
@@ -126,32 +119,10 @@ export async function pipFreezeDirect(pythonPath: string): Promise<Record<string
     )
   })
 
-  const packages: Record<string, string> = {}
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    if (trimmed.startsWith('-e ')) {
-      const eggMatch = trimmed.match(/#egg=(.+)/)
-      if (eggMatch) packages[eggMatch[1]!] = trimmed
-      continue
-    }
-    const atMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*@\s*(.+)$/)
-    if (atMatch) {
-      packages[atMatch[1]!] = atMatch[2]!.trim()
-      continue
-    }
-    const eqIdx = trimmed.indexOf('==')
-    if (eqIdx > 0) {
-      packages[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 2)
-    }
-  }
-  return packages
+  return parsePipFreeze(output)
 }
 
-// Build a Snapshot from the Legacy Desktop install's on-disk state for the
-// Legacy → Standalone migration via the snapshot restore pipeline.
 export async function captureDesktopSnapshot(info: DesktopInstallInfo): Promise<Snapshot> {
-  // Legacy basePath IS the ComfyUI dir (models/, user/, custom_nodes/ at top).
   const customNodes = await scanCustomNodes(info.basePath)
 
   let pipPackages: Record<string, string> = {}
@@ -159,9 +130,7 @@ export async function captureDesktopSnapshot(info: DesktopInstallInfo): Promise<
   if (venvPython) {
     try {
       pipPackages = await pipFreezeDirect(venvPython)
-    } catch {
-      // Inaccessible venv — nodes get deps via post-install scripts instead.
-    }
+    } catch {}
   }
 
   return {

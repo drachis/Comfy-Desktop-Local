@@ -1,8 +1,20 @@
-import { net } from 'electron'
+import { net, session as electronSession } from 'electron'
 import fs from 'fs'
 import path from 'path'
 import * as settings from '../settings'
 import { r2MirrorUrl } from './r2Mirror'
+import { diskSpaceShortfall } from './modelDownloadSpace'
+import {
+  DEFAULT_SEGMENT_TUNING,
+  planSegments,
+  segmentsFinished,
+  startSegmentedRun,
+  type SegmentRequest,
+  type SegmentRequestHandlers,
+  type SegmentResponse,
+  type SegmentTuning,
+  type SegmentedRun
+} from './modelDownloadSegments'
 import {
   installStagedAtFinal,
   quarantineOrphanStagedBytes,
@@ -12,39 +24,12 @@ import {
   stagingMetaPathFor,
   stagingPathFor,
   writeStagedMeta,
-  type StagedDownloadMeta
+  type StagedDownloadMeta,
+  type StagedSegment
 } from './modelDownloadStaging'
-
-/**
- * Controllable, resumable transport for managed model downloads.
- *
- * One transfer = one attempt to move `url` into `finalPath`, staged at
- * `<finalPath>.part` with a `<finalPath>.part.dl-meta` sidecar (see
- * `modelDownloadStaging.ts`). Unlike Electron's `DownloadItem` this runs
- * headlessly (no BrowserWindow) via `net.request`, can carry an originating
- * `Session`'s cookies (`useSessionCookies`), and survives app restarts:
- * pause/failure preserve the staged bytes + sidecar, and the next transfer
- * resumes with `Range`/`If-Range`.
- *
- * Control semantics:
- *  - pause():  abort network, flush + keep staged bytes and sidecar -> 'paused'
- *  - cancel(): abort network, delete staged bytes and sidecar     -> 'cancelled'
- *  - network failure / stall: keep staged state                   -> 'error'
- *  - completion: byte count verified against the expected size, then an
- *    atomic no-clobber same-volume install onto the final name, sidecar
- *    removed.
- *
- * Terminal ownership: exactly ONE path (stop, failure, or verification) may
- * claim the transfer; every other late callback becomes a no-op. `done`
- * resolves only after the claiming path has finished closing the stream and
- * cleaning up, so a caller that awaits `done` can safely reuse the staging
- * file. The promise always resolves (never rejects) so fire-and-forget
- * dispatch cannot leak unhandled rejections.
- */
 
 export interface ModelTransferProgress {
   receivedBytes: number
-  /** 0 while unknown (no Content-Length and no caller-provided size). */
   totalBytes: number
 }
 
@@ -55,52 +40,48 @@ export type ModelTransferOutcome =
   | { outcome: 'error'; error: string; code?: 'checksum-mismatch' }
 
 export interface ModelTransferOptions {
-  /** ORIGINAL source url - the job's stable identity across redirects. */
   url: string
-  /** Manager job ID, persisted into the sidecar so restart hydration can
-   *  restore the same stable identity. */
   jobId?: string
   finalPath: string
-  /** Models subdirectory, persisted into the sidecar for restart hydration. */
   directory: string
   filename: string
   installationId?: string | null
-  /** Originating session so gated-repo cookies/auth ride along. */
   session?: Electron.Session
-  /** Caller-known total size; conflicts with the server's length fail fast. */
   expectedSize?: number
-  /** Expected lowercase-hex sha256 of the complete file. When present, the
-   *  staged bytes are verified against it before finalization; a mismatch
-   *  discards the staged state and fails with code 'checksum-mismatch'. */
   sha256?: string
-  /** Abort when no bytes arrive for this long (ms). */
   idleTimeoutMs?: number
+  segmentTuning?: Partial<SegmentTuning>
   onProgress?: (p: ModelTransferProgress) => void
 }
 
 export interface ModelTransferHandle {
   done: Promise<ModelTransferOutcome>
-  /** Stop network activity, keep staged bytes + sidecar. Returns false when
-   *  another terminal path already claimed the transfer (the stop had no
-   *  effect). */
   pause(): boolean
-  /** Stop network activity, delete staged bytes + sidecar. Returns false when
-   *  another terminal path already claimed the transfer (the caller must
-   *  clean up staged state). */
   cancel(): boolean
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000
 const MAX_REDIRECTS = 10
+const USER_AGENT = 'ComfyUI-Desktop-2'
+const PART_PARTITION_PREFIX = 'comfy-download-part-'
+
+function partSessionFor(slot: number): Electron.Session {
+  return electronSession.fromPartition(`${PART_PARTITION_PREFIX}${slot}`, { cache: false })
+}
+
+function originOf(value: string): string | null {
+  try {
+    return new URL(value).origin
+  } catch {
+    return null
+  }
+}
 
 function headerString(value: string | string[] | undefined): string | undefined {
   if (value === undefined) return undefined
   return Array.isArray(value) ? value[0] : value
 }
 
-/** Usable as an HTTP header value: printable ASCII (+ tab), bounded length.
- *  Sidecar contents live on disk and must never be able to throw out of
- *  `setHeader` or smuggle header injection. */
 function isSafeHeaderValue(value: string | undefined): value is string {
   return (
     typeof value === 'string' &&
@@ -110,11 +91,8 @@ function isSafeHeaderValue(value: string | undefined): value is string {
   )
 }
 
-/** The validator this transfer may use for byte-identity resume (If-Range).
- *  RFC 9110: a weak ETag (`W/"..."`) never guarantees byte-for-byte equality,
- *  so it must not gate a Range splice - fall back to Last-Modified. */
 function resumeValidatorFor(
-  meta: StagedDownloadMeta
+  meta: Pick<StagedDownloadMeta, 'etag' | 'lastModified'>
 ): { kind: 'etag' | 'last-modified'; value: string } | null {
   if (isSafeHeaderValue(meta.etag) && !meta.etag.startsWith('W/')) {
     return { kind: 'etag', value: meta.etag }
@@ -123,6 +101,15 @@ function resumeValidatorFor(
     return { kind: 'last-modified', value: meta.lastModified }
   }
   return null
+}
+
+function acceptsByteRanges(headers: Record<string, string | string[]>): boolean {
+  const value = headerString(headers['accept-ranges'])
+  if (!value) return false
+  return value
+    .split(',')
+    .map((unit) => unit.trim().toLowerCase())
+    .includes('bytes')
 }
 
 export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHandle {
@@ -139,15 +126,13 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
     idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
     onProgress
   } = opts
+  const tuning: SegmentTuning = { ...DEFAULT_SEGMENT_TUNING, ...opts.segmentTuning }
+  let knownSha256 = sha256
 
   const stagingPath = stagingPathFor(finalPath)
   const metaPath = stagingMetaPathFor(finalPath)
 
-  // Terminal ownership. 'active' -> 'terminating' (one path claimed the
-  // outcome and is closing/cleaning up) -> 'settled' (`done` resolved).
   let phase: 'active' | 'terminating' | 'settled' = 'active'
-  /** Claim the terminal transition. Only the single caller that gets `true`
-   *  may close the stream, mutate staged files, and settle. */
   const claim = (): boolean => {
     if (phase !== 'active') return false
     phase = 'terminating'
@@ -184,8 +169,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
     }
   }
 
-  /** Close the open stream (if any), then `cb`. Only the claiming terminal
-   *  path may call this - it owns the stream from claim onward. */
   const closeStream = (cb: () => void): void => {
     const stream = fileStream
     fileStream = null
@@ -196,33 +179,38 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
     }
   }
 
-  /** Terminal failure that KEEPS the staged bytes (resume/retry continues).
-   *  No-op unless this call wins the terminal claim. */
+  let segmentedRun: SegmentedRun | null = null
+  let segmentsHalting: Promise<void> | null = null
+
+  const shutdown = (cb: () => void, persistSegments = true): void => {
+    clearIdle()
+    abortRequest()
+    const run = segmentedRun
+    segmentedRun = null
+    const halting = run ? run.halt({ persist: persistSegments }) : segmentsHalting
+    if (!halting) {
+      closeStream(cb)
+      return
+    }
+    void halting.then(() => closeStream(cb))
+  }
+
   const failRetaining = (message: string): void => {
     if (!claim()) return
-    clearIdle()
-    abortRequest()
-    closeStream(() => settle({ outcome: 'error', error: message }))
+    shutdown(() => settle({ outcome: 'error', error: message }))
   }
 
-  /** Terminal failure that DISCARDS the staged bytes (unresumable state). */
   const failDiscarding = (message: string): void => {
     if (!claim()) return
-    clearIdle()
-    abortRequest()
-    closeStream(() => {
+    shutdown(() => {
       removeStagedArtifacts(finalPath)
       settle({ outcome: 'error', error: message })
-    })
+    }, false)
   }
 
-  /** Verified completion: atomically install the staged bytes at the final
-   *  name WITHOUT clobbering a file that appeared there independently. */
   const finalize = (finalBytes: number): void => {
     if (!claim()) return
-    clearIdle()
-    abortRequest()
-    closeStream(() => finalizeClaimed(finalBytes))
+    shutdown(() => finalizeClaimed(finalBytes))
   }
 
   const mirrorEnabled = settings.get('useChineseMirrors') === true
@@ -230,8 +218,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
   let mirrorTried = false
   let anyBytesThisTransfer = false
 
-  /** Pre-byte connection/HTTP failure: retry once against the R2 mirror
-   *  (opted-in users only), preserving the ORIGINAL url as the job identity. */
   const maybeTryMirror = (): boolean => {
     if (mirrorTried || !mirror || mirror === url || anyBytesThisTransfer) return false
     mirrorTried = true
@@ -239,74 +225,313 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
     return true
   }
 
-  /** Attempt generation: bumped per issueAttempt so a superseded attempt's
-   *  late events (e.g. the primary erroring after a mirror retry started)
-   *  can't settle or corrupt the live attempt. */
   let attemptGen = 0
+  let segmentsAllowed = true
+  let partSessionsRefused = false
+
+  const openRangeRequest =
+    (sourceUrl: string) =>
+    (
+      range: string,
+      ifRange: string,
+      handlers: SegmentRequestHandlers,
+      slot: number
+    ): SegmentRequest => {
+      const sourceOrigin = originOf(sourceUrl)
+      let redirectsLeft = MAX_REDIRECTS
+      let current: Electron.ClientRequest | null = null
+      let closed = false
+
+      const drop = (request: Electron.ClientRequest): void => {
+        try {
+          request.abort()
+        } catch {}
+      }
+
+      const send = (target: string, onPartSession: boolean): void => {
+        const request = net.request({
+          url: target,
+          ...(onPartSession
+            ? { session: partSessionFor(slot) }
+            : session
+              ? { session, useSessionCookies: true }
+              : {}),
+          redirect: 'manual'
+        })
+        current = request
+        const live = (): boolean => !closed && current === request
+        request.setHeader('User-Agent', USER_AGENT)
+        request.setHeader('Range', range)
+        request.setHeader('If-Range', ifRange)
+        request.on('redirect', (_status, _method, redirectUrl) => {
+          if (!live()) return
+          redirectsLeft--
+          if (redirectsLeft < 0) {
+            handlers.onError(new Error('too many redirects'))
+            return
+          }
+          if (!redirectUrl) {
+            handlers.onError(new Error('empty redirect location'))
+            return
+          }
+          const nextOrigin = originOf(redirectUrl)
+          if (
+            !onPartSession &&
+            !partSessionsRefused &&
+            sourceOrigin &&
+            nextOrigin &&
+            nextOrigin !== sourceOrigin
+          ) {
+            drop(request)
+            send(redirectUrl, true)
+            return
+          }
+          try {
+            request.followRedirect()
+          } catch (err) {
+            handlers.onError(err as Error)
+          }
+        })
+        request.on('response', (response) => {
+          if (!live()) return
+          if (onPartSession && (response.statusCode === 401 || response.statusCode === 403)) {
+            partSessionsRefused = true
+            drop(request)
+            redirectsLeft = MAX_REDIRECTS
+            send(sourceUrl, false)
+            return
+          }
+          handlers.onResponse(response as unknown as SegmentResponse)
+        })
+        request.on('error', (err: Error) => {
+          if (!live()) return
+          handlers.onError(err)
+        })
+        request.end()
+      }
+
+      send(sourceUrl, false)
+      return {
+        abort: () => {
+          closed = true
+          if (current) drop(current)
+        }
+      }
+    }
+
+  const fallBackToSingleStream = (sourceUrl: string): void => {
+    if (phase !== 'active') return
+    segmentsAllowed = false
+    const run = segmentedRun
+    segmentedRun = null
+    if (!run) return
+    const halting = run.halt({ persist: false })
+    segmentsHalting = halting
+    void halting.then(() => {
+      if (segmentsHalting === halting) segmentsHalting = null
+      if (phase !== 'active') return
+      knownSha256 = knownSha256 ?? readStagedMeta(metaPath)?.sha256
+      removeStagedArtifacts(finalPath)
+      issueAttempt(sourceUrl)
+    })
+  }
+
+  const runSegments = (
+    fd: number,
+    meta: StagedDownloadMeta & { segments: StagedSegment[] },
+    validator: { kind: 'etag' | 'last-modified'; value: string },
+    sourceUrl: string
+  ): void => {
+    const run = startSegmentedRun({
+      fd,
+      totalBytes: meta.expectedSize,
+      segments: meta.segments,
+      validator,
+      idleTimeoutMs,
+      tuning,
+      openRange: openRangeRequest(sourceUrl),
+      persist: (segments) => {
+        writeStagedMeta(metaPath, { ...meta, segments })
+      },
+      onProgress: (receivedBytes) => {
+        anyBytesThisTransfer = true
+        onProgress?.({ receivedBytes, totalBytes: meta.expectedSize })
+      },
+      onComplete: () => {
+        if (!claim()) return
+        shutdown(() => {
+          let actualSize = -1
+          try {
+            actualSize = fs.statSync(stagingPath).size
+          } catch {}
+          if (actualSize !== meta.expectedSize) {
+            settle({
+              outcome: 'error',
+              error: `Download incomplete: expected ${meta.expectedSize} bytes but got ${actualSize}`
+            })
+            return
+          }
+          finalizeClaimed(actualSize)
+        })
+      },
+      onFailure: (failure) => {
+        if (failure.kind === 'ranges-ignored') fallBackToSingleStream(sourceUrl)
+        else if (failure.kind === 'discard') failDiscarding(failure.message)
+        else failRetaining(failure.message)
+      }
+    })
+    segmentedRun = run
+    run.start()
+  }
+
+  const openStagingAt = (size: number, truncate: boolean): number | null => {
+    let fd: number
+    try {
+      fd = fs.openSync(stagingPath, truncate ? 'w' : 'r+')
+    } catch (err) {
+      failRetaining(`Download failed: cannot open staging file: ${(err as Error).message}`)
+      return null
+    }
+    if (truncate) {
+      try {
+        fs.ftruncateSync(fd, size)
+      } catch (err) {
+        try {
+          fs.closeSync(fd)
+        } catch {}
+        failRetaining(`Download failed: cannot size staging file: ${(err as Error).message}`)
+        return null
+      }
+    }
+    return fd
+  }
+
+  const segmentedMeta = (
+    base: Omit<StagedDownloadMeta, 'version' | 'segments'>,
+    segments: StagedSegment[],
+    fromMirror: boolean
+  ): StagedDownloadMeta & { segments: StagedSegment[] } => ({
+    ...base,
+    version: 3,
+    jobId,
+    directory,
+    filename,
+    installationId: installationId ?? undefined,
+    sha256: knownSha256 ?? base.sha256,
+    segments,
+    segmentsFromMirror: fromMirror ? true : undefined
+  })
+
+  const beginSegments = (
+    sourceUrl: string,
+    totalBytes: number,
+    segments: StagedSegment[],
+    validatorHeaders: { etag?: string; lastModified?: string },
+    validator: { kind: 'etag' | 'last-modified'; value: string },
+    priorSha256: string | undefined
+  ): void => {
+    const meta = segmentedMeta(
+      {
+        url,
+        expectedSize: totalBytes,
+        etag: validatorHeaders.etag,
+        lastModified: validatorHeaders.lastModified,
+        directory,
+        filename,
+        sha256: priorSha256
+      },
+      segments,
+      sourceUrl !== url
+    )
+    if (!writeStagedMeta(metaPath, meta)) {
+      failRetaining('Download failed: cannot write staging metadata')
+      return
+    }
+    const fd = openStagingAt(totalBytes, true)
+    if (fd === null) return
+    runSegments(fd, meta, validator, sourceUrl)
+  }
+
+  const resumeSegments = (meta: StagedDownloadMeta): boolean => {
+    const segments = meta.segments
+    const validator = resumeValidatorFor(meta)
+    if (!segments || !validator) return false
+    if (meta.segmentsFromMirror && !mirror && !(knownSha256 ?? meta.sha256)) return false
+    if (expectedSize && expectedSize !== meta.expectedSize) return false
+    let stagedSize = -1
+    try {
+      stagedSize = fs.statSync(stagingPath).size
+    } catch {}
+    if (stagedSize !== meta.expectedSize) return false
+    if (segmentsFinished(segments)) {
+      finalize(meta.expectedSize)
+      return true
+    }
+    const shortfall = diskSpaceShortfall(stagingPath, meta.expectedSize)
+    if (shortfall) {
+      failRetaining(shortfall)
+      return true
+    }
+    const sourceUrl = meta.segmentsFromMirror && mirror ? mirror : url
+    const fd = openStagingAt(meta.expectedSize, false)
+    if (fd === null) return true
+    runSegments(fd, segmentedMeta(meta, segments, sourceUrl !== url), validator, sourceUrl)
+    return true
+  }
 
   const issueAttempt = (attemptUrl: string): void => {
     if (phase !== 'active') return
     const gen = ++attemptGen
     const stale = (): boolean => phase !== 'active' || gen !== attemptGen
 
-    // Resume bookkeeping: staged bytes + matching sidecar => Range resume.
     let resumeFrom = 0
     let existingMeta: StagedDownloadMeta | null = readStagedMeta(metaPath)
     let resumeValidator: { kind: 'etag' | 'last-modified'; value: string } | null = null
-    if (existingMeta && sha256 && existingMeta.sha256 && existingMeta.sha256 !== sha256) {
-      // The staged pair was written for DIFFERENT expected content (e.g. a
-      // superseded Build version re-using the destination). Splicing
-      // onto those bytes could only ever fail verification - restart clean.
+    if (existingMeta && knownSha256 && existingMeta.sha256 && existingMeta.sha256 !== knownSha256) {
       removeStagedArtifacts(finalPath)
       existingMeta = null
     }
-    // Staged bytes are resumable when they are provably for the same content:
-    // the same source URL, or a matching persisted sha256 (presigned URLs
-    // rotate between attempts while addressing the same object; the recorded
-    // etag/last-modified validators still guard the actual splice, and the
-    // final hash verification catches anything they miss).
     const stagedContentMatches =
       existingMeta !== null &&
-      (existingMeta.url === url || (sha256 !== undefined && existingMeta.sha256 === sha256))
+      (existingMeta.url === url ||
+        (knownSha256 !== undefined && existingMeta.sha256 === knownSha256))
     if (existingMeta && stagedContentMatches && fs.existsSync(stagingPath)) {
-      resumeValidator = resumeValidatorFor(existingMeta)
-      if (resumeValidator) {
-        try {
-          resumeFrom = fs.statSync(stagingPath).size
-        } catch {
+      if (existingMeta.segments) {
+        if (segmentsAllowed && resumeSegments(existingMeta)) return
+        removeStagedArtifacts(finalPath)
+        existingMeta = null
+      } else {
+        resumeValidator = resumeValidatorFor(existingMeta)
+        if (resumeValidator) {
+          try {
+            resumeFrom = fs.statSync(stagingPath).size
+          } catch {
+            resumeFrom = 0
+          }
+        }
+        if (!resumeValidator || resumeFrom === 0) {
+          removeStagedArtifacts(finalPath)
+          existingMeta = null
+          resumeValidator = null
+          resumeFrom = 0
+        } else if (existingMeta.expectedSize > 0 && resumeFrom >= existingMeta.expectedSize) {
+          if (
+            resumeFrom === existingMeta.expectedSize &&
+            (!expectedSize || expectedSize === existingMeta.expectedSize)
+          ) {
+            finalize(resumeFrom)
+            return
+          }
+          removeStagedArtifacts(finalPath)
+          existingMeta = null
+          resumeValidator = null
           resumeFrom = 0
         }
       }
-      if (!resumeValidator || resumeFrom === 0) {
-        // No validator to guarantee byte identity across attempts - restart.
-        removeStagedArtifacts(finalPath)
-        existingMeta = null
-        resumeValidator = null
-        resumeFrom = 0
-      } else if (existingMeta.expectedSize > 0 && resumeFrom >= existingMeta.expectedSize) {
-        if (
-          resumeFrom === existingMeta.expectedSize &&
-          (!expectedSize || expectedSize === existingMeta.expectedSize)
-        ) {
-          finalize(resumeFrom)
-          return
-        }
-        // Staged bytes EXCEED the expected size, or the caller expects a
-        // DIFFERENT total than the staged pair - stale/corrupt; restart clean.
-        removeStagedArtifacts(finalPath)
-        existingMeta = null
-        resumeValidator = null
-        resumeFrom = 0
-      }
     } else if (existingMeta) {
-      // Sidecar for a different url (superseded launcher staging) or a
-      // sidecar with no staged bytes (stale bookkeeping) - restart clean.
       removeStagedArtifacts(finalPath)
       existingMeta = null
     } else if (fs.existsSync(stagingPath)) {
-      // Orphan `.part` bytes with no sidecar: possibly quarantined migration
-      // data of unknown provenance. Park them aside rather than truncating
-      // them with this transfer's stream; refuse to proceed if that fails.
       if (!quarantineOrphanStagedBytes(finalPath)) {
         failRetaining('Download failed: cannot move unidentified staged bytes aside')
         return
@@ -321,12 +546,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
     }
 
     if (resumeFrom === 0) {
-      // Durable placeholder BEFORE any network activity: a quit/crash from
-      // here on leaves a hydratable pair, so the job reappears (paused) on
-      // the next launch even if no byte ever arrived. If the pair cannot be
-      // durably created (permissions / disk full / a scanner lock), fail NOW:
-      // downloading gigabytes with no resume identity would strand the bytes
-      // as an unmanaged orphan on the next restart.
       try {
         if (!fs.existsSync(stagingPath)) fs.writeFileSync(stagingPath, '')
       } catch (err) {
@@ -341,7 +560,7 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
         directory,
         filename,
         installationId: installationId ?? undefined,
-        sha256: sha256 ?? undefined
+        sha256: knownSha256 ?? undefined
       })
       if (!durable) {
         failRetaining('Download failed: cannot write staging metadata')
@@ -358,7 +577,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
         redirect: 'manual'
       })
     } catch (err) {
-      // e.g. malformed/unsupported URL - staged bytes are still resumable.
       failRetaining(`Download failed: ${(err as Error).message}`)
       return
     }
@@ -372,11 +590,8 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
       }, idleTimeoutMs)
     }
 
-    // Everything from here through `request.end()` is synchronous setup that
-    // may throw (invalid header bytes, a destroyed session, ...). A throw
-    // must settle this transfer instead of escaping to the caller.
     try {
-      request.setHeader('User-Agent', 'ComfyUI-Desktop-2')
+      request.setHeader('User-Agent', USER_AGENT)
       if (resumeFrom > 0 && resumeValidator) {
         request.setHeader('Range', `bytes=${resumeFrom}-`)
         request.setHeader('If-Range', resumeValidator.value)
@@ -393,8 +608,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           failRetaining('Download failed: empty redirect location')
           return
         }
-        // Follow in place: Electron re-issues the same request (headers
-        // intact), while the job identity stays keyed to the ORIGINAL url.
         try {
           request.followRedirect()
         } catch (err) {
@@ -403,10 +616,7 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
       })
 
       request.on('response', (rawResponse) => {
-        if (stale()) return // teardown / a newer attempt owns settling
-        // Electron's IncomingMessage implements the Readable Stream interface
-        // at runtime, but its typings only declare EventEmitter - widen for
-        // pause()/resume() backpressure control.
+        if (stale()) return
         const response = rawResponse as Electron.IncomingMessage & {
           pause(): void
           resume(): void
@@ -415,12 +625,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
         const status = response.statusCode
 
         if (status === 416) {
-          // Server rejected our range. Finalize ONLY on independent proof of
-          // completeness: a well-formed `Content-Range: bytes */<total>`
-          // whose total matches the staged byte count, the sidecar's
-          // recorded size, and (when known) the caller's expected size.
-          // Anything less means the partial cannot be trusted against this
-          // source - discard so retry restarts clean.
           clearIdle()
           let stagedSize = -1
           try {
@@ -459,14 +663,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           return
         }
 
-        // A 206 body is only appendable if it PROVABLY continues our staged
-        // bytes. RFC 9110 requires Content-Range on every 206; a server that
-        // omits or malforms it gives us no proof, and splicing unverified
-        // bytes would corrupt the file (the staged bytes stay for a retry
-        // against a compliant response). The declared range must start at
-        // our staged byte count, be internally consistent, carry a numeric
-        // total, and that total must agree with BOTH the sidecar's recorded
-        // size and the caller's expected size when known.
         const chunkLenHeader = headerString(response.headers['content-length'])
         const chunkLen = chunkLenHeader !== undefined ? parseInt(chunkLenHeader, 10) : 0
         let rangeTotal = 0
@@ -509,9 +705,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
             )
             return
           }
-          // If-Range compliance means a 206 is always the SAME entity we
-          // staged; a response validator that contradicts the one we sent
-          // means a broken server whose bytes must not be mixed into ours.
           const respEtag = headerString(response.headers['etag'])
           const respLastModified = headerString(response.headers['last-modified'])
           if (
@@ -525,9 +718,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           }
         }
 
-        // Requested a range but got 200: full body incoming (If-Range
-        // validator mismatch or no server support) - restart the staged file
-        // from zero.
         let baseBytes = 0
         if (isResumed) {
           baseBytes = resumeFrom
@@ -538,9 +728,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
         }
 
         const totalFromHeaders = isResumed ? rangeTotal : chunkLen > 0 ? chunkLen : 0
-        // Never lose a known total: a resumed chunked response must not
-        // overwrite the sidecar's expected size with zero, or an interrupted
-        // body would later pass verification and finalize incomplete.
         const knownSize = isResumed ? (existingMeta?.expectedSize ?? 0) : 0
         const effectiveSize = expectedSize || totalFromHeaders || knownSize
 
@@ -551,16 +738,43 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           expectedSize !== totalFromHeaders
         ) {
           clearIdle()
-          // The source no longer matches what the caller expects - any
-          // staged bytes are for stale content.
           failDiscarding(
             `Download size mismatch: expected ${expectedSize} bytes but server reported ${totalFromHeaders}`
           )
           return
         }
 
-        // Persist/refresh the sidecar BEFORE bytes land so a crash mid-stream
-        // leaves a resumable pair. On a fresh 200, capture the new validators.
+        const shortfall = diskSpaceShortfall(stagingPath, effectiveSize)
+        if (shortfall) {
+          clearIdle()
+          failRetaining(shortfall)
+          return
+        }
+
+        if (!isResumed && segmentsAllowed && acceptsByteRanges(response.headers)) {
+          const segments = planSegments(totalFromHeaders, tuning)
+          const validatorHeaders = {
+            etag: headerString(response.headers['etag']),
+            lastModified: headerString(response.headers['last-modified'])
+          }
+          const validator = resumeValidatorFor(validatorHeaders)
+          if (segments && validator) {
+            clearIdle()
+            attemptGen++
+            abortRequest()
+            activeRequest = null
+            beginSegments(
+              attemptUrl,
+              totalFromHeaders,
+              segments,
+              validatorHeaders,
+              validator,
+              existingMeta?.sha256
+            )
+            return
+          }
+        }
+
         const meta: StagedDownloadMeta = {
           version: 2,
           jobId,
@@ -573,13 +787,9 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           directory,
           filename,
           installationId: installationId ?? undefined,
-          // Keep a persisted expectation alive across attempts even when a
-          // hydrated resume no longer knows the caller's hash.
-          sha256: sha256 ?? existingMeta?.sha256
+          sha256: knownSha256 ?? existingMeta?.sha256
         }
         if (!writeStagedMeta(metaPath, meta)) {
-          // Accepting body bytes without a durable resume identity would
-          // leave unresumable (or worse, stale-validator) staged data.
           failRetaining('Download failed: cannot write staging metadata')
           return
         }
@@ -598,7 +808,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
           receivedBytes += chunk.length
           const ok = fileStream.write(chunk)
           if (!ok) {
-            // Backpressure: don't let a fast network outrun a slow disk.
             response.pause()
             fileStream.once('drain', () => {
               if (!stale()) response.resume()
@@ -609,10 +818,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
 
         response.on('end', () => {
           if (stale()) return
-          // Claim NOW: from here the outcome belongs to verification, and a
-          // pause/cancel landing mid-flush must not race the finalize rename
-          // (transport.pause()/cancel() return false; the manager handles
-          // the already-settling transport).
           if (!claim()) return
           clearIdle()
           const stream = fileStream
@@ -624,7 +829,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
             } catch {}
             if (effectiveSize > 0 && actualSize !== effectiveSize) {
               if (actualSize >= 0 && actualSize < effectiveSize) {
-                // Interrupted body - keep the staged bytes; retry resumes.
                 settle({
                   outcome: 'error',
                   error: `Download incomplete: expected ${effectiveSize} bytes but got ${actualSize}`
@@ -643,11 +847,6 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
               return
             }
             if (effectiveSize <= 0) {
-              // No caller expectation, no Content-Length, no persisted total:
-              // the bytes cannot be verified complete, and an unverified file
-              // must never land under a model extension (issue #1322). Keep
-              // the staged bytes - a Range retry learns the real total from
-              // the 206 Content-Range and can then verify.
               settle({
                 outcome: 'error',
                 error: 'Download failed: server did not report a size to verify the file'
@@ -672,29 +871,20 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
       request.on('error', (err: Error) => {
         if (stale()) return
         clearIdle()
-        // Pre-response network failure: try the mirror once if no bytes have
-        // landed this transfer (mixing two origins' bytes is never attempted).
         if (resumeFrom === 0 && maybeTryMirror()) return
         failRetaining(`Download failed: ${err.message}`)
       })
 
-      armIdleTimer() // covers a connect that never responds
+      armIdleTimer()
       request.end()
     } catch (err) {
       failRetaining(`Download failed: ${(err as Error).message}`)
     }
   }
 
-  /** `finalize` body for a caller that ALREADY holds the terminal claim and
-   *  has closed the stream (the end/verify path). */
   const finalizeClaimed = (finalBytes: number): void => {
     void (async () => {
-      // Content verification before the bytes can appear under the final
-      // name. The expectation comes from the caller or, for a hydrated job
-      // whose caller is gone, from the persisted sidecar. A mismatch is not
-      // resumable - the bytes are wrong, not short - so discard the staged
-      // state; a retry re-fetches from scratch.
-      const expectedSha256 = sha256 ?? readStagedMeta(metaPath)?.sha256
+      const expectedSha256 = knownSha256 ?? readStagedMeta(metaPath)?.sha256
       if (expectedSha256) {
         let actualSha256: string
         try {
@@ -732,16 +922,11 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
 
   const stop = (mode: 'pause' | 'cancel'): boolean => {
     if (!claim()) return false
-    clearIdle()
-    abortRequest()
-    closeStream(() => {
+    shutdown(() => {
       if (mode === 'cancel') {
         if (removeStagedArtifacts(finalPath)) {
           settle({ outcome: 'cancelled' })
         } else {
-          // The sidecar survived (locked file / permissions): the job WOULD
-          // rehydrate as resumable next launch, so reporting a clean cancel
-          // would lie. Surface it instead.
           settle({
             outcome: 'error',
             error: 'Cancel failed: staged download files could not be removed'
@@ -750,7 +935,7 @@ export function startModelTransfer(opts: ModelTransferOptions): ModelTransferHan
       } else {
         settle({ outcome: 'paused' })
       }
-    })
+    }, mode === 'pause')
     return true
   }
 

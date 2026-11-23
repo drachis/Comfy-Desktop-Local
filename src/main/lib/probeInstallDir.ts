@@ -1,7 +1,5 @@
 import type { SourcePlugin } from '../types/sources'
 
-/** Every way a folder can be tracked: the types whose detection recognized it (`detected: true`),
- *  then the manual-only types it did not match (`detected: false`), so the user can force one. */
 export async function probeInstallDir(
   sources: readonly SourcePlugin[],
   dirPath: string,

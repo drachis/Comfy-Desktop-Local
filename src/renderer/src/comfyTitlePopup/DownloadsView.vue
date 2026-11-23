@@ -1,30 +1,26 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import Button from '@comfyorg/design-system/button/Button'
+import { computed, useTemplateRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
+  Ban,
   CircleAlert,
   CircleCheck,
+  FolderSearch,
   LoaderCircle,
+  Pause,
   PauseCircle,
-  // TODO(brand-cleanup): PlayCircle was the Resume action icon — redesign skips it; restore if Pause/Resume comes back.
-  // PlayCircle,
+  Play,
   RotateCcw,
   X
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { fileLabel, statusKindClass, statusLine } from '../lib/downloadFormatters'
 import { revealInFolderLabel } from '../composables/usePlatform'
 import DownloadThumbnail from '../components/DownloadThumbnail.vue'
 
 const { t } = useI18n()
 
-/**
- * Live downloads tray view. Stateless; `TitlePopupApp` owns the subscription and passes
- * the `DownloadsState` as a prop, and per-entry actions dispatch back over IPC. Entry /
- * state / action shapes are mirrored inline from `comfyTitlePopupPreload.ts`.
- */
-
 interface DownloadEntry {
-  /** Stable per-job identifier; preferred over `url` for actions. */
   id?: string
   url: string
   filename: string
@@ -39,6 +35,7 @@ interface DownloadEntry {
   error?: string
   createdAt?: number
   isImage?: boolean
+  canPause?: boolean
 }
 
 interface DownloadsState {
@@ -79,32 +76,25 @@ function isTerminal(d: DownloadEntry): boolean {
 const fetchThumbnail = (savePath: string): Promise<string | null> =>
   bridge?.getDownloadThumbnail(savePath) ?? Promise.resolve(null)
 
-/** A completed image asset reserves the enlarged rounded preview box (the
- *  thumbnail itself may still fail to load, falling back to the status icon). */
 function isCompletedImage(download: DownloadEntry): boolean {
   return download.isImage === true && download.status === 'completed'
 }
 
-/** Combined list newest-first by `createdAt` so a download staying in place across
- *  active → terminal isn't split across the IPC's active/recent buckets. */
 const orderedEntries = computed<DownloadEntry[]>(() =>
   [...props.state.active, ...props.state.recent].sort(
     (a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)
   )
 )
 
-// Actions address a row by stable job id (`ref`); the URL rides along as a
-// compatibility fallback.
+function pause(d: DownloadEntry): void {
+  bridge?.downloadsAction({ action: 'pause', ref: d.id, url: d.url })
+}
+function resume(d: DownloadEntry): void {
+  bridge?.downloadsAction({ action: 'resume', ref: d.id, url: d.url })
+}
 function cancel(d: DownloadEntry): void {
   bridge?.downloadsAction({ action: 'cancel', ref: d.id, url: d.url })
 }
-// TODO(brand-cleanup): redesign skips pause/resume — keep handlers wired for an easy restore.
-// function pause(d: DownloadEntry): void {
-//   bridge?.downloadsAction({ action: 'pause', ref: d.id, url: d.url })
-// }
-// function resume(d: DownloadEntry): void {
-//   bridge?.downloadsAction({ action: 'resume', ref: d.id, url: d.url })
-// }
 function showInFolder(d: DownloadEntry, savePath: string): void {
   bridge?.downloadsAction({ action: 'show-in-folder', ref: d.id, url: d.url, savePath })
 }
@@ -118,7 +108,6 @@ function viewAllDownloads(): void {
   bridge?.openDownloadsModal()
 }
 
-/** Right-edge X cancels an in-flight entry or removes a terminal row. */
 function handleClose(d: DownloadEntry): void {
   if (isTerminal(d)) dismiss(d)
   else cancel(d)
@@ -128,26 +117,37 @@ function closeLabel(d: DownloadEntry): string {
   return isTerminal(d) ? t('downloadsPopup.remove') : t('downloadsPopup.cancel')
 }
 
-/** Subtitle: full bytes/speed/ETA for active rows; "Show in Finder" for terminal rows with a path. */
 function subtitle(d: DownloadEntry): string {
-  if (d.status === 'downloading' || d.status === 'pending') {
-    return statusLine(d)
-  }
-  if (d.status === 'paused') {
-    return `${t('downloadsPopup.pause')} · ${statusLine(d)}`
-  }
-  if (d.status === 'completed' && d.savePath) {
-    return revealLabel.value
-  }
-  if ((d.status === 'error' || d.status === 'cancelled') && d.savePath) {
-    return revealLabel.value
-  }
-  return statusLine(d)
+  return statusLine(d, { completedShowsSize: true })
 }
 
-/** Whole-row click opens the file location for completed entries with a save path. */
+function keepsActionInView(d: DownloadEntry): boolean {
+  return hasPauseToggle(d) || d.status === 'error'
+}
+
+function canRetry(d: DownloadEntry): boolean {
+  return d.status === 'error' || d.status === 'cancelled'
+}
+
+function canPause(d: DownloadEntry): boolean {
+  return d.status === 'downloading' && d.canPause !== false
+}
+
+function hasPauseToggle(d: DownloadEntry): boolean {
+  return canPause(d) || d.status === 'paused'
+}
+
+function pauseToggleLabel(d: DownloadEntry): string {
+  return d.status === 'paused' ? t('downloadsPopup.resume') : t('downloadsPopup.pause')
+}
+
+function togglePause(d: DownloadEntry): void {
+  if (d.status === 'paused') resume(d)
+  else pause(d)
+}
+
 function handleRowClick(d: DownloadEntry, event: MouseEvent): void {
-  if ((event.target as HTMLElement).closest('.downloads-item-close, .downloads-item-retry')) return
+  if ((event.target as HTMLElement).closest('.downloads-item-action, .downloads-item-close')) return
   if (d.status === 'completed' && d.savePath) showInFolder(d, d.savePath)
 }
 
@@ -155,316 +155,175 @@ function isRowClickable(d: DownloadEntry): boolean {
   return d.status === 'completed' && !!d.savePath
 }
 
-/** Inline progress-fill gradient where the card itself reads as the progress bar. */
+const list = useTemplateRef<HTMLElement>('list')
+
+function onRowKeydown(d: DownloadEntry, event: KeyboardEvent): void {
+  const row = event.currentTarget as HTMLElement
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    const rows = [...(list.value?.querySelectorAll<HTMLElement>('.downloads-item') ?? [])]
+    const next = rows[rows.indexOf(row) + (event.key === 'ArrowDown' ? 1 : -1)]
+    if (!next) return
+    event.preventDefault()
+    next.focus()
+    return
+  }
+  if (event.target !== row || (event.key !== 'Enter' && event.key !== ' ')) return
+  if (!isRowClickable(d) || !d.savePath) return
+  event.preventDefault()
+  showInFolder(d, d.savePath)
+}
+
 function progressStyle(d: DownloadEntry): Record<string, string> | undefined {
   if (d.status !== 'downloading' && d.status !== 'pending') return undefined
   const pct = d.status === 'pending' ? 0 : Math.max(0, Math.min(1, d.progress)) * 100
-  // ~1% transition so the leading edge reads as a crisp line; collapses to solid at 100%.
   const next = Math.min(100, pct + 0.91)
   return {
     background: `linear-gradient(90deg, var(--downloads-card) 0%, var(--downloads-card) ${pct}%, var(--downloads-bar-rest) ${next}%)`
   }
 }
-
-// TODO(brand-cleanup): redesign skips Pause/Resume in the popover. The
-// bridge handlers + i18n strings remain so re-introducing them is just
-// reinstating the buttons below.
 </script>
 
 <template>
-  <div class="downloads">
-    <header class="downloads-head">
-      <h2 class="downloads-title">{{ t('downloadsPopup.title') }}</h2>
+  <div
+    class="downloads flex size-full flex-col bg-neutral-800 [--downloads-bar-rest:var(--color-card)] [--downloads-card:var(--color-card-hover)] [--downloads-row-hover:var(--color-card-hover)]"
+  >
+    <header
+      class="downloads-head flex flex-none items-baseline justify-between gap-2 px-4 pt-4 pb-3"
+    >
+      <h2
+        class="downloads-title m-0 text-[11px] font-semibold tracking-[0.04em] text-text-muted uppercase"
+      >
+        {{ t('downloadsPopup.title') }}
+      </h2>
+      <Button
+        type="button"
+        variant="link"
+        size="unset"
+        class="downloads-link rounded-sm text-[12px] font-normal"
+        :aria-label="t('downloadsPopup.viewAllLabel')"
+        @click="viewAllDownloads"
+      >
+        {{ t('downloadsPopup.viewAll') }}
+      </Button>
     </header>
 
-    <div v-if="orderedEntries.length === 0" class="downloads-empty">
+    <div
+      v-if="orderedEntries.length === 0"
+      class="downloads-empty px-4 pt-4 pb-6 text-center text-[12px] text-text-muted"
+    >
       {{ t('downloadsPopup.empty') }}
     </div>
 
-    <ul v-else class="downloads-list">
+    <ul
+      v-else
+      ref="list"
+      class="downloads-list mx-4 mt-0 mb-4 flex min-h-0 flex-auto list-none flex-col overflow-y-auto rounded-[14px] bg-card p-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    >
       <li
         v-for="d in orderedEntries"
         :key="d.id ?? d.url"
-        class="downloads-item"
+        class="downloads-item group relative flex flex-none items-center gap-2 border-t border-solid border-[var(--chooser-surface-border)] py-3 pr-2.5 pl-[18px] outline-none first:rounded-t-[14px] first:border-t-0 last:rounded-b-[14px] focus-within:bg-[var(--downloads-row-hover)] hover:bg-[var(--downloads-row-hover)] focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
         :class="[
           statusKindClass(d),
           {
             'is-finished': isTerminal(d),
-            'is-clickable': isRowClickable(d)
+            'is-clickable cursor-pointer': isRowClickable(d)
           }
         ]"
         :style="progressStyle(d)"
+        tabindex="0"
+        :aria-description="isRowClickable(d) ? revealLabel : undefined"
+        :aria-keyshortcuts="isRowClickable(d) ? 'Enter Space' : undefined"
         @click="(e) => handleRowClick(d, e)"
+        @keydown="(e) => onRowKeydown(d, e)"
       >
-        <span class="downloads-item-icon" :class="{ 'is-image': isCompletedImage(d) }">
+        <span
+          class="downloads-item-icon inline-flex shrink-0 grow-0 items-center justify-center text-neutral-100"
+          :class="
+            isCompletedImage(d)
+              ? 'is-image size-9 basis-9 self-center overflow-hidden rounded-md bg-[color-mix(in_srgb,var(--downloads-bar-rest)_60%,transparent)]'
+              : 'mt-0.5 size-4 basis-4 self-start'
+          "
+        >
           <DownloadThumbnail :entry="d" :fetcher="fetchThumbnail">
             <template #fallback>
-              <CircleCheck v-if="d.status === 'completed'" :size="16" class="ok" />
-              <CircleAlert
-                v-else-if="d.status === 'error' || d.status === 'cancelled'"
-                :size="16"
-                class="bad"
-              />
+              <CircleCheck v-if="d.status === 'completed'" :size="16" class="ok text-neutral-100" />
+              <CircleAlert v-else-if="d.status === 'error'" :size="16" class="bad text-[#ff5454]" />
+              <Ban v-else-if="d.status === 'cancelled'" :size="16" class="muted text-text-muted" />
               <PauseCircle v-else-if="d.status === 'paused'" :size="16" />
-              <LoaderCircle v-else :size="16" class="spin" />
+              <LoaderCircle
+                v-else
+                :size="16"
+                class="spin animate-spin [animation-duration:900ms] motion-reduce:animate-none"
+              />
             </template>
           </DownloadThumbnail>
         </span>
-        <div class="downloads-item-text">
-          <span class="downloads-item-name" :title="fileLabel(d)">{{ fileLabel(d) }}</span>
-          <span class="downloads-item-sub">{{ subtitle(d) }}</span>
+        <div class="downloads-item-text flex min-w-0 flex-auto flex-col gap-0">
+          <span
+            class="downloads-item-name truncate text-[14px] leading-5 text-neutral-100"
+            :title="fileLabel(d)"
+            >{{ fileLabel(d) }}</span
+          >
+          <span class="downloads-item-sub truncate text-[12px] leading-[1.2] text-text-muted">{{
+            subtitle(d)
+          }}</span>
         </div>
-        <!-- TODO(brand-cleanup): redesign skips Pause/Resume — restore here if needed.
-        <button
-          v-if="d.status === 'downloading'"
-          type="button"
-          :aria-label="t('downloadsPopup.pause')"
-          @click.stop="pause(d)"
-        ><PauseCircle :size="14" /></button>
-        <button
-          v-if="d.status === 'paused'"
-          type="button"
-          :aria-label="t('downloadsPopup.resume')"
-          @click.stop="resume(d)"
-        ><PlayCircle :size="14" /></button>
-        -->
-        <button
-          v-if="d.status === 'error' || d.status === 'cancelled'"
-          type="button"
-          class="downloads-item-retry"
-          :title="t('downloadsPopup.retry')"
-          :aria-label="t('downloadsPopup.retry')"
-          @click.stop="retry(d)"
+        <div
+          v-if="hasPauseToggle(d) || canRetry(d) || isRowClickable(d)"
+          class="downloads-item-action shrink-0 items-center"
+          :class="keepsActionInView(d) ? 'flex' : 'hidden group-focus-within:flex group-hover:flex'"
         >
-          <RotateCcw :size="16" />
-        </button>
-        <button
+          <Button
+            v-if="hasPauseToggle(d)"
+            type="button"
+            variant="secondary"
+            size="icon"
+            :class="d.status === 'paused' ? 'downloads-item-resume' : 'downloads-item-pause'"
+            :title="pauseToggleLabel(d)"
+            :aria-label="pauseToggleLabel(d)"
+            @click.stop="togglePause(d)"
+          >
+            <Play v-if="d.status === 'paused'" :size="16" aria-hidden="true" />
+            <Pause v-else :size="16" aria-hidden="true" />
+          </Button>
+          <Button
+            v-else-if="canRetry(d)"
+            type="button"
+            variant="secondary"
+            size="icon"
+            class="downloads-item-retry"
+            :title="t('downloadsPopup.retry')"
+            :aria-label="t('downloadsPopup.retry')"
+            @click.stop="retry(d)"
+          >
+            <RotateCcw :size="16" aria-hidden="true" />
+          </Button>
+          <Button
+            v-else-if="d.savePath"
+            type="button"
+            variant="secondary"
+            size="icon"
+            class="downloads-item-reveal"
+            :title="revealLabel"
+            :aria-label="revealLabel"
+            @click.stop="showInFolder(d, d.savePath)"
+          >
+            <FolderSearch :size="16" aria-hidden="true" />
+          </Button>
+        </div>
+        <Button
           type="button"
-          class="downloads-item-close"
+          variant="muted-textonly"
+          size="icon"
+          class="downloads-item-close shrink-0"
           :title="closeLabel(d)"
           :aria-label="closeLabel(d)"
           @click.stop="handleClose(d)"
         >
           <X :size="16" />
-        </button>
+        </Button>
       </li>
     </ul>
-
-    <footer class="downloads-foot">
-      <button type="button" class="downloads-link" @click="viewAllDownloads">
-        {{ t('downloadsPopup.viewAllInSettings') }}
-      </button>
-    </footer>
   </div>
 </template>
-
-<style scoped>
-.downloads {
-  /* Local design tokens, only consumed by this view. */
-  --downloads-card: #322c3d;
-  --downloads-bar-rest: #2a2332;
-  --downloads-border: rgba(255, 255, 255, 0.1);
-  --downloads-text: var(--neutral-100);
-  --downloads-text-muted: var(--text-muted);
-  --downloads-danger: #ff5454;
-
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  width: 100%;
-  background: var(--neutral-800);
-}
-
-.downloads-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--downloads-border);
-  flex: 0 0 auto;
-}
-
-.downloads-title {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--neutral-100);
-}
-
-.downloads-empty {
-  padding: 24px 16px;
-  color: var(--downloads-text-muted);
-  text-align: center;
-  font-size: 12px;
-}
-
-/* The list flexes to fill below the head/footer and scrolls internally. */
-.downloads-list {
-  list-style: none;
-  margin: 0;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  overflow-y: auto;
-  flex: 1 1 auto;
-  min-height: 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-.downloads-list::-webkit-scrollbar {
-  display: none;
-}
-
-.downloads-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
-  border-radius: 8px;
-  background: var(--downloads-card);
-  transition: background 220ms ease;
-}
-.downloads-item.is-finished {
-  background: var(--downloads-card);
-}
-.downloads-item.is-error,
-.downloads-item.is-cancelled {
-  background: color-mix(in srgb, var(--downloads-card) 50%, transparent);
-}
-.downloads-item.is-clickable {
-  cursor: pointer;
-}
-.downloads-item.is-clickable:hover {
-  background: color-mix(in srgb, var(--downloads-card) 85%, var(--neutral-500));
-}
-
-.downloads-item-icon {
-  flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--downloads-text);
-  margin-top: 2px;
-  align-self: flex-start;
-}
-/* A completed image asset grows the leading box into a rounded preview; the
- * status-icon fallback (file moved/deleted) centers in the same box. */
-.downloads-item-icon.is-image {
-  flex-basis: 36px;
-  width: 36px;
-  height: 36px;
-  margin-top: 0;
-  align-self: center;
-  border-radius: 6px;
-  overflow: hidden;
-  background: color-mix(in srgb, var(--downloads-bar-rest) 60%, transparent);
-}
-.downloads-item-icon .ok {
-  color: var(--downloads-text);
-}
-.downloads-item-icon .bad {
-  color: var(--downloads-danger);
-}
-.downloads-item-icon .spin {
-  animation: downloads-spin 0.9s linear infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .downloads-item-icon .spin {
-    animation: none;
-  }
-}
-@keyframes downloads-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.downloads-item-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-
-.downloads-item-name {
-  font-size: 14px;
-  line-height: 20px;
-  color: var(--downloads-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.downloads-item-sub {
-  font-size: 12px;
-  line-height: 1.2;
-  color: var(--downloads-text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.downloads-item-close,
-.downloads-item-retry {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  margin-left: 4px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--downloads-text-muted);
-  cursor: pointer;
-  transition:
-    background-color 120ms ease,
-    color 120ms ease;
-}
-.downloads-item-close:hover,
-.downloads-item-retry:hover {
-  background: color-mix(in srgb, var(--neutral-500) 35%, transparent);
-  color: var(--downloads-text);
-}
-.downloads-item-close:focus-visible,
-.downloads-item-retry:focus-visible {
-  outline: 2px solid var(--neutral-50);
-  outline-offset: 1px;
-}
-
-.downloads-foot {
-  display: flex;
-  align-items: center;
-  padding: 8px;
-  border-top: 1px solid var(--downloads-border);
-  flex: 0 0 auto;
-}
-.downloads-link {
-  display: flex;
-  flex: 1 1 auto;
-  align-items: center;
-  background: transparent;
-  border: none;
-  color: var(--neutral-100);
-  font-size: 14px;
-  text-align: left;
-  cursor: pointer;
-  padding: 8px;
-  border-radius: 6px;
-  transition: background-color 120ms ease;
-}
-.downloads-link:hover {
-  background: color-mix(in srgb, var(--neutral-500) 25%, transparent);
-}
-.downloads-link:focus-visible {
-  outline: 2px solid var(--neutral-50);
-  outline-offset: 1px;
-}
-</style>

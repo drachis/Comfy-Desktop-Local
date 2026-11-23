@@ -1,32 +1,26 @@
+import type { CoachmarkBeakPayload } from '../types/ipc'
 import { contextBridge, ipcRenderer } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 
-/**
- * Title-tooltip popup bridge. Hover tooltips render in a transparent WebContentsView
- * so they escape the title-bar view's clip; macOS Chromium doesn't reliably surface
- * native `title` tooltips for unfocused sibling chrome views. The view is reused
- * across hovers, driven by `comfy-titletooltip:set-config` pushes.
- */
 export interface TitleTooltipConfig {
-  /** `'tooltip'` (default) for the hover bubble; `'coachmark'` for the onboarding card. */
   variant?: 'tooltip' | 'coachmark'
+  kind?: string
   text?: string
   title?: string
   body?: string
   dismissLabel?: string
+  actionLabel?: string
   theme: { bg: string; text: string; border: string; accent?: string }
-  /** Echoed back in `notifyRendered` so main can discard stale render-acks. */
   configToken: string
 }
 
 export interface ComfyTitleTooltipBridge {
-  /** Renderer is mounted; main flushes any config queued before ready. */
   ready(): void
-  /** Renderer painted the latest config. Main waits for this before showing. */
   notifyRendered(payload: { width: number; height: number; configToken: string }): void
   onConfig(cb: (config: TitleTooltipConfig) => void): () => void
-  /** Coachmark dismiss button; no-op for the tooltip variant. */
-  dismissCoachmark(): void
+  onBeak(cb: (payload: CoachmarkBeakPayload) => void): () => void
+  dismissCoachmark(configToken: string): void
+  actionCoachmark(configToken: string): void
 }
 
 function isTooltipConfig(value: unknown): value is TitleTooltipConfig {
@@ -37,7 +31,6 @@ function isTooltipConfig(value: unknown): value is TitleTooltipConfig {
   if (typeof v.theme.bg !== 'string') return false
   if (typeof v.theme.text !== 'string') return false
   if (typeof v.theme.border !== 'string') return false
-  // Coachmark needs title/body; tooltip needs text. One channel serves both.
   if (v.variant === 'coachmark') {
     if (typeof v.title !== 'string' && typeof v.body !== 'string') return false
   } else if (typeof v.text !== 'string') {
@@ -60,8 +53,27 @@ const bridge: ComfyTitleTooltipBridge = {
     ipcRenderer.on('comfy-titletooltip:set-config', handler)
     return () => ipcRenderer.removeListener('comfy-titletooltip:set-config', handler)
   },
-  dismissCoachmark: () => {
-    ipcRenderer.send('comfy-titlecoachmark:dismiss')
+  onBeak: (cb) => {
+    const handler = (_event: IpcRendererEvent, data: unknown): void => {
+      const payload = data as { beakFraction?: unknown; cardCentreInView?: unknown } | undefined
+      const raw = payload?.beakFraction
+      const centre = payload?.cardCentreInView
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        cb({
+          beakFraction: raw,
+          cardCentreInView:
+            typeof centre === 'number' && Number.isFinite(centre) && centre >= 0 ? centre : null
+        })
+      }
+    }
+    ipcRenderer.on('comfy-titletooltip:set-beak', handler)
+    return () => ipcRenderer.removeListener('comfy-titletooltip:set-beak', handler)
+  },
+  dismissCoachmark: (configToken) => {
+    ipcRenderer.send('comfy-titlecoachmark:dismiss', { configToken })
+  },
+  actionCoachmark: (configToken) => {
+    ipcRenderer.send('comfy-titlecoachmark:action', { configToken })
   }
 }
 

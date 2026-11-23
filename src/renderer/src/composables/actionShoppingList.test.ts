@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { runPromptChain } from './actionShoppingList'
+import { runConfirmChain, runPromptChain } from './actionShoppingList'
 import type { ActionDef } from '../types/ipc'
 
-// Minimal driver stub: runPromptChain only ever touches `.prompt`.
 function makeDriver(returnValue: string | null) {
   const prompt = vi.fn().mockResolvedValue(returnValue)
   return { driver: { prompt } as unknown as Parameters<typeof runPromptChain>[1], prompt }
@@ -33,7 +32,6 @@ describe('runPromptChain — uniquifyDefault', () => {
     const result = await runPromptChain(copyAction({ uniquifyDefault: true }), driver)
 
     expect(window.api.getUniqueName).toHaveBeenCalledWith('ComfyUI (2)')
-    // The prompt is pre-filled with the resolved unique name, not the raw source name.
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({ defaultValue: 'ComfyUI (8)' }))
     expect(result?.data?.name).toBe('ComfyUI (8)')
   })
@@ -58,5 +56,77 @@ describe('runPromptChain — uniquifyDefault', () => {
     const { driver } = makeDriver(null)
     const result = await runPromptChain(copyAction({ uniquifyDefault: true }), driver)
     expect(result).toBeNull()
+  })
+})
+
+describe('runConfirmChain confirm colour', () => {
+  type ConfirmModal = Parameters<typeof runConfirmChain>[1]
+  type ConfirmDialogs = NonNullable<Parameters<typeof runConfirmChain>[2]>
+
+  function confirmAction(style: string | undefined, extra: Partial<ActionDef['confirm']> = {}) {
+    return {
+      id: 'some-action',
+      label: 'Do it',
+      style,
+      confirm: { title: 'Sure?', message: 'Really?', ...extra }
+    } as ActionDef
+  }
+
+  function makeModal() {
+    const confirm = vi.fn().mockResolvedValue(false)
+    const confirmWithOptions = vi.fn().mockResolvedValue(null)
+    return {
+      modal: { confirm, confirmWithOptions } as unknown as ConfirmModal,
+      confirm,
+      confirmWithOptions
+    }
+  }
+
+  it.each([
+    ['danger', 'danger'],
+    ['primary', 'primary'],
+    ['accent', 'primary'],
+    ['default', 'primary'],
+    [undefined, 'primary']
+  ])('a %s action confirms in the panel with the %s button', async (style, tone) => {
+    const confirm = vi.fn().mockResolvedValue(false)
+    await runConfirmChain(confirmAction(style), makeModal().modal, {
+      confirm
+    } as unknown as ConfirmDialogs)
+    expect(confirm.mock.calls[0]![0].tone).toBe(tone)
+  })
+
+  it('asks to Forget a build with a white Forget button, since its files stay', async () => {
+    const forget = {
+      id: 'remove',
+      label: 'Forget',
+      style: 'default',
+      confirm: { title: 'Forget build', message: 'Its folder stays on your computer.' }
+    } as unknown as ActionDef
+    const confirm = vi.fn().mockResolvedValue('primary')
+    await runConfirmChain(forget, makeModal().modal, { confirm } as unknown as ConfirmDialogs)
+    expect(confirm.mock.calls[0]![0]).toMatchObject({ confirmLabel: 'Forget', tone: 'primary' })
+  })
+
+  it.each([
+    ['danger', 'danger'],
+    ['default', 'primary'],
+    [undefined, 'primary']
+  ])('a %s action confirms in the modal with the %s button', async (style, confirmStyle) => {
+    const { modal, confirm } = makeModal()
+    await runConfirmChain(confirmAction(style), modal)
+    expect(confirm.mock.calls[0]![0].confirmStyle).toBe(confirmStyle)
+  })
+
+  it.each([
+    ['danger', 'danger'],
+    [undefined, 'primary']
+  ])('a %s action with options confirms with the %s button', async (style, confirmStyle) => {
+    const { modal, confirmWithOptions } = makeModal()
+    await runConfirmChain(
+      confirmAction(style, { options: [{ id: 'a', label: 'A', checked: true }] }),
+      modal
+    )
+    expect(confirmWithOptions.mock.calls[0]![0].confirmStyle).toBe(confirmStyle)
   })
 })

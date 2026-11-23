@@ -1,6 +1,7 @@
 import { ipcMain } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
-import { findEntryByComfySender } from '../../host/registry'
+import { isLocalInstall } from '../../host/localInstall'
+import { findEntryByComfySender, isPanelSender } from '../../host/registry'
 import { isTitlePopupSender } from '../../popups/titlePopup'
 import {
   subscribeTerminal,
@@ -16,13 +17,6 @@ import {
   openTerminalPopout
 } from '../terminalPopoutWindow'
 
-/**
- * IPC for the interactive per-installation console.
- *
- * Only bundled Desktop terminal renderers may use these channels. The served
- * ComfyUI renderer has a separate navigation-only bridge.
- */
-
 const EMPTY_RESTORE: TerminalRestore = {
   buffer: [],
   size: { cols: 80, rows: 30 },
@@ -34,7 +28,7 @@ function resolveInstallationId(
   explicit: string | null | undefined
 ): string | null {
   const requestedId = typeof explicit === 'string' && explicit.length > 0 ? explicit : null
-  if (isTitlePopupSender(event.sender)) return requestedId
+  if (isTitlePopupSender(event.sender) || isPanelSender(event.sender)) return requestedId
   const popoutId = findTerminalPopoutInstallationIdBySender(event.sender)
   if (!popoutId || (requestedId && requestedId !== popoutId)) return null
   return popoutId
@@ -43,7 +37,7 @@ function resolveInstallationId(
 export function registerTerminalHandlers(): void {
   ipcMain.handle('desktop2-open-terminal-popout', async (event): Promise<void> => {
     const entry = findEntryByComfySender(event.sender)
-    if (!entry?.installationId || entry.sourceCategory !== 'local') return
+    if (!isLocalInstall(entry)) return
     await openTerminalPopout(entry.installationId)
   })
 

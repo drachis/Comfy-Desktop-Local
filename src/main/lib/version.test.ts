@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import semver from 'semver'
+import { selectCoreBetaGrantArgs } from './coreBetaGrants'
 import {
+  coreGateVersion,
   coreRecordCurrent,
   coreSemver,
   coreSemverExact,
@@ -70,7 +72,6 @@ describe('formatComfyVersion', () => {
   })
 })
 
-/** Minimal install record; every case below varies only the version fields. */
 function record(fields: Partial<InstallationRecord>): InstallationRecord {
   return {
     id: 'inst-1',
@@ -98,8 +99,6 @@ describe('coreSemverExact', () => {
   })
 
   it('is not exact when the commit comparison failed', () => {
-    // undefined = the GitHub comparison API failed, so how far past the tag we are is UNKNOWN.
-    // `formatComfyVersion` already refuses to imply exactness here; the version gate must too.
     expect(coreSemverExact(record({ comfyVersion: { commit, baseTag: 'v0.3.80' } }))).toBe(false)
   })
 
@@ -126,8 +125,6 @@ describe('coreSemverVerified', () => {
   })
 
   it('is not verified for a record persisted before the field existed', () => {
-    // The whole persisted shape an older Desktop wrote: a tag with no provenance recorded.
-    // Reading that as verified would restore exactly the gap this field closes.
     const legacy = JSON.parse(
       `{"commit":"${commit}","baseTag":"v0.3.80","commitsAhead":0}`
     ) as ComfyVersion
@@ -137,6 +134,71 @@ describe('coreSemverVerified', () => {
 
   it('is not verified for a legacy install carrying no comfyVersion', () => {
     expect(coreSemverVerified(record({ version: 'v0.3.80' }))).toBe(false)
+  })
+})
+
+describe('coreGateVersion', () => {
+  const commit = 'b0f4b7b294ce1b2c3d4e5f6a1b2c3d4e5f6a1b2c'
+  const grants = [{ arg: '--enable-assets', minCoreVersion: '0.36.0' }]
+  const select = (inst: InstallationRecord) =>
+    selectCoreBetaGrantArgs(grants, { ...coreGateVersion(inst), current: true }, true, [])
+
+  it('measures a verified base as itself', () => {
+    const inst = record({
+      comfyVersion: { commit, baseTag: 'v0.37.0', commitsAhead: 0, baseTagVerified: true }
+    })
+    expect(coreGateVersion(inst)).toEqual({ semver: '0.37.0', exact: true, verified: true })
+  })
+
+  it('floors an unverified upgrade at the ancestor it displaced, and still grants', () => {
+    const inst = record({
+      comfyVersion: {
+        commit,
+        baseTag: 'v0.37.1',
+        commitsAhead: 5,
+        baseTagVerified: false,
+        ancestorTag: 'v0.37.0'
+      }
+    })
+    expect(coreGateVersion(inst)).toEqual({ semver: '0.37.0', exact: false, verified: true })
+    expect(select(inst)).toEqual(grants)
+  })
+
+  it('never measures the unverified label, so it cannot satisfy a minimum the floor misses', () => {
+    const inst = record({
+      comfyVersion: {
+        commit,
+        baseTag: 'v0.37.1',
+        commitsAhead: 5,
+        baseTagVerified: false,
+        ancestorTag: 'v0.37.0'
+      }
+    })
+    const gated = [{ arg: '--enable-assets', minCoreVersion: '0.37.1' }]
+    expect(
+      selectCoreBetaGrantArgs(gated, { ...coreGateVersion(inst), current: true }, true, [])
+    ).toEqual([])
+  })
+
+  it('is not exact on an unverified label even when its distance reads 0', () => {
+    const inst = record({
+      comfyVersion: {
+        commit,
+        baseTag: 'v0.37.1',
+        commitsAhead: 0,
+        baseTagVerified: false,
+        ancestorTag: 'v0.37.0'
+      }
+    })
+    expect(coreGateVersion(inst).exact).toBe(false)
+  })
+
+  it('refuses an unverified label with no ancestor recorded', () => {
+    const inst = record({
+      comfyVersion: { commit, baseTag: 'v0.37.1', commitsAhead: 5, baseTagVerified: false }
+    })
+    expect(coreGateVersion(inst)).toEqual({ semver: '0.37.1', exact: false, verified: false })
+    expect(select(inst)).toEqual([])
   })
 })
 
@@ -150,8 +212,6 @@ describe('coreRecordCurrent', () => {
   })
 
   it('is not current once a pull has moved the checkout off the recorded commit', () => {
-    // `commitsAhead: 0` above stays true of the SUPERSEDED commit, so every other reader still
-    // reports an exact, on-tag install. This is the only one that notices.
     expect(coreSemverExact(git)).toBe(true)
     expect(coreRecordCurrent(git, { kind: 'head', commit: pulled })).toBe(false)
   })
@@ -162,16 +222,10 @@ describe('coreRecordCurrent', () => {
   })
 
   it('is not current when the install is git-managed but its HEAD could not be read', () => {
-    // The state this distinction exists for. "No git" and "HEAD unreadable" are both absences
-    // of a comparable SHA, but only the first means nothing can contradict the record; the
-    // second is a checkout we failed to inspect, and an unreadable HEAD most often means one is
-    // being rewritten under us. Granting on it would fail open in a gate that must fail closed.
     expect(coreRecordCurrent(git, { kind: 'unreadable' })).toBe(false)
   })
 
   it('is not current on an unreadable HEAD however complete the record is', () => {
-    // Nothing the record can say earns a grant here: the refusal is a property of not having
-    // established the checkout, so a fully-populated verified record must not buy past it.
     const complete = record({
       comfyVersion: { commit, baseTag: 'v0.3.80', commitsAhead: 0, baseTagVerified: true }
     })
@@ -184,8 +238,6 @@ describe('coreRecordCurrent', () => {
   })
 
   it('is not current when HEAD is readable but the recorded commit is not a string', () => {
-    // Records are persisted JSON and reach this reader unvalidated, so the type is a claim
-    // rather than a guarantee; a non-string cannot be compared and must not pass as a match.
     const malformed = JSON.parse(`{"commit":61,"baseTag":"v0.3.80"}`) as ComfyVersion
     expect(coreRecordCurrent(record({ comfyVersion: malformed }), { kind: 'head', commit })).toBe(
       false
@@ -197,8 +249,6 @@ describe('coreRecordCurrent', () => {
   })
 
   it('rejects an abbreviation of the recorded commit rather than prefix-matching it', () => {
-    // Whole-token on purpose: a prefix match would accept a record that merely starts the same
-    // way, which is the assurance this check exists to provide.
     expect(coreRecordCurrent(git, { kind: 'head', commit: commit.slice(0, 8) })).toBe(false)
   })
 })
@@ -238,13 +288,10 @@ describe('coreSemver', () => {
 
   it('keeps a prerelease a prerelease so range checks order it correctly', () => {
     expect(coreSemver(record({ version: 'v0.3.80-rc.1' }))).toBe('0.3.80-rc.1')
-    // The whole point of not coercing: an rc must NOT satisfy a >= 0.3.80 gate.
     expect(semver.gte('0.3.80-rc.1', '0.3.80')).toBe(false)
   })
 
   it('returns null for a git install falling back to its commit SHA', () => {
-    // src/main/sources/git.ts stores the first 8 commit chars in `version`.
-    // Coercion would launder 61e5e3b5 into 61.0.0 and satisfy any minimum.
     expect(coreSemver(record({ version: '61e5e3b5' }))).toBeNull()
     expect(coreSemver(record({ version: 'abc12345' }))).toBeNull()
   })
