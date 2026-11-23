@@ -18,6 +18,7 @@ import {
   removeLinuxDevEntry
 } from './dev-app/linuxEntry.mjs'
 import { splitLocalOnlyArg } from './dev-app/localOnlyArg.mjs'
+import { devUserDataDir, withUserDataDirArg } from './dev-app/devUserDataArg.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const { localOnly: LOCAL_ONLY, rest: ELECTRON_VITE_ARGS } = splitLocalOnlyArg(process.argv.slice(2))
@@ -77,7 +78,11 @@ function electronViteCli() {
   return path.join(path.dirname(packageJson), bin['electron-vite'])
 }
 
-const child = spawn(process.execPath, [electronViteCli(), 'dev', ...ELECTRON_VITE_ARGS], {
+const VITE_ARGS = withUserDataDirArg(
+  ELECTRON_VITE_ARGS,
+  devUserDataDir(process.platform, process.env)
+)
+const child = spawn(process.execPath, [electronViteCli(), 'dev', ...VITE_ARGS], {
   cwd: ROOT,
   stdio: 'inherit',
   env: {
