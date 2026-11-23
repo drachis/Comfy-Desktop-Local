@@ -12,6 +12,7 @@ import {
 } from 'electron'
 import type { MessageBoxOptions, Tray, WebContentsView } from 'electron'
 import './lib/devUserData'
+import { registerLocalOnlyIpc } from './lib/localOnlyIpc'
 import path from 'path'
 import fs from 'fs'
 import { normaliseFirstUseMode } from '../shared/firstUseMode'
@@ -217,6 +218,8 @@ import {
   sendToPanelDeferred,
   setActivePanel
 } from './host/panelView'
+
+registerLocalOnlyIpc()
 
 export type { ComfyPanelKey } from './host/registry'
 

@@ -123,6 +123,7 @@ const { installationId = '', focusName = null } = defineProps<{
 const emit = defineEmits<{ 'focus-used': [] }>()
 
 const { t } = useI18n()
+const localOnly = window.api?.localOnly === true
 const modal = useModal()
 const authStore = useAuthStore()
 const installationStore = useInstallationStore()
@@ -236,7 +237,7 @@ const assetBuilds = computed<AssetBuild[]>(() => {
   const local = localBuilds.value
   const dedicated = local.filter((build) => !savesToSharedFolder(build))
   return [
-    placeOption(CLOUD, t('assets.cloud'), true),
+    ...(localOnly ? [] : [placeOption(CLOUD, t('assets.cloud'), true)]),
     ...(!hasLocalBuild.value || local.some(savesToSharedFolder)
       ? [placeOption(SHARED, t('assets.sharedFolder'), false)]
       : []),

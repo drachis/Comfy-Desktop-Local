@@ -1197,6 +1197,7 @@ export interface HomeTourReplayState {
 
 export interface ElectronApi {
   platform: NodeJS.Platform
+  localOnly: boolean
 
   getSources(): Promise<Source[]>
   getFieldOptions(

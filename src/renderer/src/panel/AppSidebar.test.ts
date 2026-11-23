@@ -131,6 +131,22 @@ function tooltipOf(
 }
 
 describe('AppSidebar', () => {
+  it('leaves out the log-in card in local-only mode', async () => {
+    const api = window.api as unknown as { localOnly?: boolean }
+    api.localOnly = true
+    try {
+      const wrapper = await mountSidebar()
+      expect(wrapper.find('[data-testid="sidebar-signin-card"]').exists()).toBe(false)
+    } finally {
+      api.localOnly = false
+    }
+  })
+
+  it('shows the log-in card while signed out when local-only mode is off', async () => {
+    const wrapper = await mountSidebar()
+    expect(wrapper.find('[data-testid="sidebar-signin-card"]').exists()).toBe(true)
+  })
+
   it('lists Home, Assets, then the Builds group, with the tools left to the menu', async () => {
     const wrapper = await mountSidebar()
 

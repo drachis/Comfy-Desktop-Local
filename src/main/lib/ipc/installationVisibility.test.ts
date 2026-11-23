@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { _setLocalOnlyForTests } from '../localOnly'
 import type { InstallationRecord } from '../../installations'
 import {
   isInstallationVisibleToRenderer,
@@ -19,6 +20,21 @@ function installation(overrides: Partial<InstallationRecord>): InstallationRecor
 }
 
 describe('isInstallationVisibleToRenderer', () => {
+  afterEach(() => {
+    _setLocalOnlyForTests(undefined)
+  })
+
+  it('hides the Cloud build in local-only mode and keeps local builds', () => {
+    _setLocalOnlyForTests(true)
+    expect(isInstallationVisibleToRenderer(installation({ sourceId: 'cloud' }))).toBe(false)
+    expect(isInstallationVisibleToRenderer(installation({ sourceId: 'git' }))).toBe(true)
+  })
+
+  it('shows the Cloud build when local-only mode is off', () => {
+    _setLocalOnlyForTests(false)
+    expect(isInstallationVisibleToRenderer(installation({ sourceId: 'cloud' }))).toBe(true)
+  })
+
   it('shows ready installations', () => {
     expect(isInstallationVisibleToRenderer(installation({}))).toBe(true)
   })

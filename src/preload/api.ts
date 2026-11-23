@@ -11,10 +11,12 @@ import type {
   ResolvedTheme,
   AdoptPromptRequest
 } from '../types/ipc'
+import { LOCAL_ONLY_SYNC_CHANNEL } from '../shared/localOnly'
 
 export function buildElectronApi(): ElectronApi {
   return {
     platform: process.platform,
+    localOnly: ipcRenderer.sendSync(LOCAL_ONLY_SYNC_CHANNEL) === true,
 
     getSources: () => ipcRenderer.invoke('get-sources'),
     getFieldOptions: (sourceId, fieldId, selections, context) =>

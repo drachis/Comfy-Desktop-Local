@@ -934,6 +934,23 @@ describe('AssetsView', () => {
     })
   })
 
+  it('leaves Comfy Cloud out of the places in local-only mode', async () => {
+    const api = window.api as unknown as { localOnly?: boolean }
+    api.localOnly = true
+    try {
+      const wrapper = await mountAssets([asset('/out/forest.png', 'forest.png', 'image')], {
+        builds: [sharedBuild('a', 'Shared A'), localBuild('lab', 'Video Lab')]
+      })
+      await openBuildPicker(wrapper)
+      expect(buildRows()).toEqual([
+        'Shared folder ~/ComfyUI/output',
+        'Video Lab /Volumes/Work/Video Lab/output'
+      ])
+    } finally {
+      api.localOnly = false
+    }
+  })
+
   it('lists Shared folder after Comfy Cloud when a build saves there, and opens on it', async () => {
     const wrapper = await mountAssets([asset('/out/forest.png', 'forest.png', 'image')], {
       builds: [sharedBuild('a', 'Shared A'), localBuild('lab', 'Video Lab'), cloudBuild('cloud')]

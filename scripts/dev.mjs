@@ -17,9 +17,10 @@ import {
   ensureLinuxDevEntry,
   removeLinuxDevEntry
 } from './dev-app/linuxEntry.mjs'
+import { splitLocalOnlyArg } from './dev-app/localOnlyArg.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const ELECTRON_VITE_ARGS = process.argv.slice(2)
+const { localOnly: LOCAL_ONLY, rest: ELECTRON_VITE_ARGS } = splitLocalOnlyArg(process.argv.slice(2))
 const SANDBOX_OFF = await devSandboxOff(process.env, ELECTRON_VITE_ARGS, ROOT)
 
 function warn(message) {
@@ -79,7 +80,12 @@ function electronViteCli() {
 const child = spawn(process.execPath, [electronViteCli(), 'dev', ...ELECTRON_VITE_ARGS], {
   cwd: ROOT,
   stdio: 'inherit',
-  env: { ...process.env, ...(SANDBOX_OFF ? { NO_SANDBOX: '1' } : {}), ...devAppEnv() }
+  env: {
+    ...process.env,
+    ...(SANDBOX_OFF ? { NO_SANDBOX: '1' } : {}),
+    ...(LOCAL_ONLY ? { COMFY_LOCAL_ONLY: '1' } : {}),
+    ...devAppEnv()
+  }
 })
 const FORWARDED_SIGNALS =
   process.platform === 'win32' ? ['SIGINT', 'SIGTERM'] : ['SIGINT', 'SIGTERM', 'SIGHUP']

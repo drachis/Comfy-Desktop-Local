@@ -1,4 +1,5 @@
 import type { InstallationRecord } from '../../installations'
+import { isHiddenByLocalOnly } from '../localOnly'
 
 const runningInstalls = new Map<string, number>()
 
@@ -13,6 +14,7 @@ export function markInstallSettled(installationId: string): void {
 }
 
 export function isInstallationVisibleToRenderer(installation: InstallationRecord): boolean {
+  if (isHiddenByLocalOnly(installation)) return false
   return installation.status !== 'installing' || runningInstalls.has(installation.id)
 }
 

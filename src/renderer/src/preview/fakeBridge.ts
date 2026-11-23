@@ -29,7 +29,7 @@ type ListenerOf<K extends BridgeEvent> = ElectronApi[K] extends (
   ? Callback
   : never
 
-type BridgeCalls = Omit<ElectronApi, BridgeEvent | 'platform' | 'comfybuilder'>
+type BridgeCalls = Omit<ElectronApi, BridgeEvent | 'platform' | 'localOnly' | 'comfybuilder'>
 
 export interface BridgeSeed {
   platform?: PreviewPlatform
@@ -461,6 +461,7 @@ export function createFakeBridge(seed: BridgeSeed = {}): FakeBridge {
 
   const api: ElectronApi = noteCallsTo({
     platform: machine.platform,
+    localOnly: false,
     comfybuilder: noteCallsTo(cloud),
     ...defaults,
     ...seed.replies,

@@ -81,6 +81,7 @@ interface SidebarRow {
 }
 
 const { t } = useI18n()
+const localOnly = window.api?.localOnly === true
 provide(TOOLTIP_GATE, () => !appPageShown.value)
 
 const collapsedByChoice = useLocalStorage('comfy.desktop.sidebar.collapsed', false)
@@ -620,7 +621,7 @@ function openSettings(): void {
         </Tooltip>
       </Button>
       <SidebarCredits :collapsed="collapsed" />
-      <SidebarAccount :collapsed="collapsed" />
+      <SidebarAccount v-if="!localOnly" :collapsed="collapsed" />
     </div>
 
     <BuildMenu

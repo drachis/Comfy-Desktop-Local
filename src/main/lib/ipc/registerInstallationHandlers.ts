@@ -53,6 +53,7 @@ import {
   markInstallRunning,
   markInstallSettled
 } from './installationVisibility'
+import { isHiddenByLocalOnly } from '../localOnly'
 import { answerCoreBetaArgs } from '../coreBetaPreview'
 import { startFirstBuildWithDesktop } from '../firstBuildAutoStart'
 import { seedNewInstallComfySettings } from '../newInstallSettings'
@@ -163,7 +164,7 @@ export function registerInstallationHandlers(): void {
 
   ipcMain.handle('get-installations-summary', async () => {
     const all = await installations.list()
-    const visible = all.filter((i) => i.status !== 'installing')
+    const visible = all.filter((i) => i.status !== 'installing' && !isHiddenByLocalOnly(i))
     return {
       localCount: visible.filter((i) => i.sourceId !== 'cloud').length,
       hasLaunchedCloud: visible.some((i) => i.sourceId === 'cloud' && !!i.lastLaunchedAt),
