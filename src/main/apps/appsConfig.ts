@@ -3,6 +3,7 @@ import { app } from 'electron'
 import { resolveAppsLocation } from '../../shared/appsLocation'
 import type { AppsLocation } from '../../shared/appsLocation'
 import { isAppsFlagOn, savedAppsFlag } from './appsFlag'
+import { isLocalOnly } from '../lib/localOnly'
 
 function developerAppsUrl(): string | null {
   if (app.isPackaged) return null
@@ -14,6 +15,7 @@ export function currentAppsLocation(): AppsLocation {
 }
 
 export async function areAppsEnabled(): Promise<boolean> {
+  if (isLocalOnly()) return false
   return developerAppsUrl() !== null || (await isAppsFlagOn())
 }
 
