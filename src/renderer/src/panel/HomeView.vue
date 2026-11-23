@@ -49,6 +49,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const localOnly = window.api?.localOnly === true
 const installationStore = useInstallationStore()
 const sessionStore = useSessionStore()
 
@@ -172,7 +173,7 @@ function openWorkflow(workflow: CatalogWorkflow): void {
 }
 
 watch(appsState, (now) => {
-  if (now === 'off') void loadWorkflows()
+  if (now === 'off' && !localOnly) void loadWorkflows()
 })
 
 onMounted(() => {
@@ -204,6 +205,7 @@ onMounted(() => {
       </h1>
 
       <section
+        v-if="!localOnly"
         class="mt-[74px]"
         :aria-label="appsState === 'off' ? t('home.exampleWorkflows') : t('sidebar.apps')"
       >

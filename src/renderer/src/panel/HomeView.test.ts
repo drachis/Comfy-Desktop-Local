@@ -137,6 +137,16 @@ function buildOptions(): HTMLElement[] {
 }
 
 describe('Home example workflows', () => {
+  it('shows no example workflows and asks for none in local-only mode', async () => {
+    ;(window.api as unknown as { localOnly: boolean }).localOnly = true
+    listHomeWorkflows.mockResolvedValue(SEVEN_WORKFLOWS)
+    const wrapper = await openHome()
+
+    expect(listHomeWorkflows).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="home-workflows-unavailable"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Workflow 0')
+  })
+
   it('puts the first catalog workflow in front with its neighbours on either side', async () => {
     listHomeWorkflows.mockResolvedValue(SEVEN_WORKFLOWS)
     const wrapper = await openHome()
